@@ -1,63 +1,80 @@
-# Polymarket Intelligent Trading Bot
+# Polymarket Trading Bot V2
 
-**Advanced arbitrage and volatility trading system for Polymarket prediction markets.**
+## Enterprise-Grade Automated Trading System
 
-## Features
+### Features
+- **Volatility Arbitrage**: Exploit panic-priced markets during BTC/ETH/SOL volatility spikes
+- **Threshold Arbitrage**: Guaranteed wins when exchange prices already decided outcomes
+- **Real-Time WebSocket**: Millisecond-latency price feeds from Binance
+- **Adaptive Kelly Sizing**: Dynamic position sizing based on win streaks and market volatility
+- **Circuit Breaker**: Automatic trading halt on drawdown/loss limits
+- **Parallel Market Scanning**: Check 50+ markets in <3 seconds
 
-- **Volatility Arbitrage**: Exploit panic selling during BTC/ETH volatility spikes
-- **News Lag Trading**: React to breaking news before market prices update
-- **Whale Tracking**: Copy trades from top performing wallets
-- **Fast Market Scanner**: Parallel scanning of 50+ markets in <3 seconds
-- **Adaptive Kelly Sizing**: Dynamic position sizing based on performance
-- **Real-time WebSocket Feeds**: Millisecond-precision price updates
+### Setup
 
-## Setup
-
+1. **Install Dependencies**
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-python -m textblob.download_corpora
+```
 
-# Configure environment
+2. **Configure Environment**
+```bash
 cp .env.example .env
 # Edit .env with your API keys
+```
 
-# Initialize database
-python -m utils.db init
+3. **Required API Keys**
+- Polymarket Private Key (for trading)
+- Optional: NewsAPI, Twitter (for sentiment strategies)
 
-# Run bot
+4. **Run Bot**
+```bash
+# Paper trading (recommended first)
+python main.py
+
+# Live trading (after testing)
+# Set PAPER_TRADING=false in .env
 python main.py
 ```
 
-## API Keys Required
-
-1. **NewsAPI** (Free): https://newsapi.org/register
-2. **Polymarket**: https://docs.polymarket.com/
-3. **Twitter/X** (Optional): https://developer.twitter.com/
-
-## Risk Warning
-
-**Trading involves substantial risk of loss. Start with paper trading mode.**
-
-- Never risk more than you can afford to lose
-- Past performance does not guarantee future results
-- This bot is for educational purposes
-
-## Architecture
-
+### Architecture
 ```
-polymarket_bot/
-├── data_feeds/        # Real-time data sources
-├── intelligence/      # Sentiment & edge detection
-├── strategy/          # Trading strategies
-├── risk/              # Position & risk management
-├── execution/         # Order execution
-└── backtest/          # Performance validation
+config/          - Settings and market definitions
+data_feeds/      - Binance WebSocket + Polymarket CLOB client
+strategy/        - Trading strategies (volatility, threshold, etc)
+risk/            - Position sizing, circuit breaker, position manager
+utils/           - Logging, database, performance tracking
 ```
 
-## Performance Targets
+### Safety
+- **Default: Paper Trading** - Test without risking capital
+- **Position Limits**: Max 20% per trade, 3 simultaneous positions
+- **Circuit Breaker**: Auto-stop at 15% drawdown
+- **Consecutive Loss Protection**: Halt after 3 losses
+- **Daily Trade Limit**: Max 50 trades/day
 
-- **Conservative**: 15-25% monthly returns
-- **Aggressive**: 50-100% monthly returns (higher risk)
-- **Win Rate Target**: 58-65%
-- **Max Drawdown**: <25%
+### Performance Monitoring
+- All trades logged to SQLite database
+- Real-time P&L tracking
+- Win rate and Sharpe ratio calculation
+- Performance reports every 5 minutes
+
+### Strategies
+
+#### 1. Volatility Arbitrage
+- Monitors BTC/ETH/SOL for >3% moves in 60 seconds
+- Scans Polymarket for panic-priced positions (<$0.05)
+- Buys discounted side, sells when volatility normalizes
+- Target: 6x-12x returns per trade
+
+#### 2. Threshold Arbitrage  
+- Checks if Binance price already decided market outcome
+- Example: BTC at $96K, market "BTC above $95K" still 60% YES
+- Bet YES at underpriced odds before market updates
+- Target: 95%+ win rate on clear outcomes
+
+### Support
+For issues or questions, open a GitHub issue.
+
+### License
+MIT

@@ -1,279 +1,166 @@
-#!/usr/bin/env python3
-"""
-Polymarket Volatility Arbitrage Bot V2.0
-Production orchestrator
-"""
 import asyncio
 import signal
 import sys
 from decimal import Decimal
 import logging
+from datetime import datetime
 
 from config.settings import settings
-from utils.logger import setup_logging
-from utils.db import Database
+from utils.logger import setup_logger, performance_logger
+from utils.db import db
 
 from data_feeds.binance_websocket import BinanceWebSocketFeed
-from data_feeds.news_scanner import NewsScanner
 from data_feeds.polymarket_client import PolymarketClient
 
-from intelligence.sentiment_scorer import SentimentScorer
-from intelligence.prediction_engine import PredictionEngine
+from risk.kelly_sizer import AdaptiveKellySizer
+from risk.position_manager import PositionManager
+from risk.circuit_breaker import CircuitBreaker
 
 from strategy.volatility_arbitrage import VolatilityArbitrageEngine
+from strategy.threshold_arbitrage import ThresholdArbitrageEngine
 
-from risk.adaptive_kelly import AdaptiveKellySizer
-from risk.circuit_breaker import CircuitBreaker
-from risk.position_manager import PositionManager
-from risk.bankroll_tracker import BankrollTracker
+logger = setup_logger()
 
-logger = logging.getLogger(__name__)
-
-class PolymarketBot:
-    """Main bot orchestrator"""
-    
+class PolymarketTradingBot:
     def __init__(self):
-        # Validate config
-        if not settings.validate():
-            logger.critical("❌ Configuration validation failed")
-            sys.exit(1)
+        self.running = False
         
-        settings.print_config()
-        
-        # Initialize database
-        self.db = Database(settings.DATABASE_PATH)
-        
-        # Initialize components
-        self.binance_feed = BinanceWebSocketFeed()
-        self.news_scanner = NewsScanner()
+        self.binance = BinanceWebSocketFeed()
         self.polymarket = PolymarketClient()
         
-        self.sentiment = SentimentScorer()
-        self.prediction_engine = PredictionEngine(
-            self.news_scanner,
-            self.sentiment,
-            self.binance_feed
-        )
+        self.kelly_sizer = AdaptiveKellySizer()
+        self.position_manager = PositionManager()
+        self.circuit_breaker = CircuitBreaker(settings.INITIAL_CAPITAL)
         
-        # Risk management
-        self.bankroll = BankrollTracker(settings.INITIAL_CAPITAL)
-        self.kelly = AdaptiveKellySizer(settings.INITIAL_CAPITAL)
-        self.circuit_breaker = CircuitBreaker()
-        self.position_manager = PositionManager(settings.MAX_OPEN_POSITIONS)
-        
-        # Strategy engines
-        self.volatility_arb = VolatilityArbitrageEngine(
-            self.binance_feed,
+        self.volatility_engine = VolatilityArbitrageEngine(
+            self.binance,
             self.polymarket,
-            self.bankroll
+            self.position_manager,
+            self.kelly_sizer
         )
         
-        # Connect callbacks
-        self.binance_feed.on_volatility_spike = self.volatility_arb.on_volatility_spike
+        self.threshold_engine = ThresholdArbitrageEngine(
+            self.binance,
+            self.polymarket,
+            self.position_manager,
+            self.kelly_sizer
+        )
         
-        self.running = False
+        self.current_capital = settings.INITIAL_CAPITAL
+        self.start_time = datetime.utcnow()
+        
+        self.binance.on_volatility_spike = self.volatility_engine.on_volatility_spike
     
     async def start(self):
-        """Start all bot components"""
-        logger.info("⚡ Starting bot...")
+        if not settings.validate():
+            logger.error("Configuration validation failed")
+            return False
+        
+        settings.log_config()
+        
+        logger.info("Starting Polymarket Trading Bot V2")
+        logger.info(f"Mode: {'PAPER TRADING' if settings.PAPER_TRADING else 'LIVE TRADING'}")
+        
         self.running = True
         
-        # Start background tasks
         tasks = [
-            asyncio.create_task(self.binance_feed.listen()),
-            asyncio.create_task(self.news_monitoring_loop()),
-            asyncio.create_task(self.trading_loop()),
-            asyncio.create_task(self.volatility_arb.monitor_positions()),
-            asyncio.create_task(self.performance_monitoring_loop())
+            asyncio.create_task(self.binance.listen()),
+            asyncio.create_task(self.volatility_engine.monitor_positions()),
+            asyncio.create_task(self.threshold_scan_loop()),
+            asyncio.create_task(self.performance_monitor_loop()),
         ]
-        
-        logger.info("✅ Bot running - Press Ctrl+C to stop")
         
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
-            logger.info("⚠️ Tasks cancelled")
+            logger.info("Bot tasks cancelled")
+        finally:
+            await self.shutdown()
     
-    async def news_monitoring_loop(self):
-        """Background news scanning"""
+    async def threshold_scan_loop(self):
+        await asyncio.sleep(10)
+        
         while self.running:
             try:
-                news = await self.news_scanner.scan()
-                if news:
-                    logger.debug(f"📰 Scanned {len(news)} news items")
-            except Exception as e:
-                logger.error(f"News scan error: {e}")
-            
-            await asyncio.sleep(settings.NEWS_SCAN_INTERVAL)
-    
-    async def trading_loop(self):
-        """Main trading logic"""
-        while self.running:
-            try:
-                # Check circuit breaker
-                breaker_status = self.circuit_breaker.check(
-                    self.bankroll.current_capital,
-                    self.bankroll.initial_capital
-                )
-                
-                if not breaker_status["can_trade"]:
-                    logger.critical(f"⛔ Trading halted: {breaker_status['reason']}")
+                if not self.circuit_breaker.is_trading_allowed():
+                    logger.warning("Trading paused by circuit breaker")
                     await asyncio.sleep(60)
                     continue
                 
-                # Check if we can open positions
-                if not self.position_manager.can_open_position():
-                    await asyncio.sleep(10)
-                    continue
-                
-                # Scan markets
-                markets = await self.polymarket.scan_markets_parallel(["BTC", "ETH", "SOL"])
-                
-                if not markets:
-                    await asyncio.sleep(settings.MARKET_SCAN_INTERVAL)
-                    continue
-                
-                # Analyze opportunities
-                opportunities = await self.prediction_engine.scan_all_opportunities(markets)
+                opportunities = await self.threshold_engine.scan_opportunities()
                 
                 if opportunities:
-                    logger.info(f"✅ Found {len(opportunities)} opportunities")
-                    
-                    # Execute best opportunity
-                    await self.execute_trade(opportunities[0])
+                    logger.info(f"Found {len(opportunities)} threshold arbitrage opportunities")
+                    executed = await self.threshold_engine.execute_opportunities(opportunities)
+                    if executed > 0:
+                        logger.info(f"Executed {executed} threshold arbitrage trades")
+                
+                await asyncio.sleep(settings.PRICE_CHECK_INTERVAL)
                 
             except Exception as e:
-                logger.error(f"Trading loop error: {e}")
-            
-            await asyncio.sleep(settings.MARKET_SCAN_INTERVAL)
+                logger.error(f"Threshold scan error: {e}", exc_info=True)
+                await asyncio.sleep(5)
     
-    async def execute_trade(self, opportunity: dict):
-        """Execute trading opportunity"""
-        market = opportunity["market"]
-        signal = opportunity["signal"]
-        symbol = opportunity["symbol"]
-        
-        # Check if signal is strong enough
-        if signal["confidence"] < settings.MIN_CONFIDENCE:
-            logger.debug(f"Skipping: Low confidence {signal['confidence']:.1%}")
-            return
-        
-        if signal["edge"] < settings.MIN_EDGE_THRESHOLD:
-            logger.debug(f"Skipping: Low edge {signal['edge']:.1%}")
-            return
-        
-        # Check liquidity
-        liquidity_check = self.polymarket.check_liquidity_depth(market)
-        if not liquidity_check["sufficient"]:
-            logger.warning("Skipping: Insufficient liquidity")
-            return
-        
-        # Calculate position size
-        available = self.bankroll.get_available_capital()
-        payout_odds = 1.0 / signal["market_odds"] if signal["market_odds"] > 0 else 2.0
-        
-        bet_size = self.kelly.calculate_bet_size(
-            bankroll=available,
-            win_probability=signal["confidence"],
-            payout_odds=payout_odds,
-            confidence=signal["confidence"]
-        )
-        
-        logger.info(f"🎯 EXECUTING TRADE:")
-        logger.info(f"   Market: {market['question'][:50]}...")
-        logger.info(f"   Signal: {signal['signal']} @ ${signal['market_odds']:.3f}")
-        logger.info(f"   Edge: {signal['edge']:.1%} | Confidence: {signal['confidence']:.1%}")
-        logger.info(f"   Size: ${bet_size:.2f}")
-        
-        # Execute
-        success = await self.polymarket.place_bet(
-            market_id=market["id"],
-            side=signal["side"],
-            amount=float(bet_size),
-            max_price=signal["market_odds"] * 1.05
-        )
-        
-        if success:
-            # Record position
-            self.position_manager.add_position(
-                market_id=market["id"],
-                side=signal["side"],
-                entry_price=signal["market_odds"],
-                size=bet_size,
-                confidence=signal["confidence"],
-                reason=signal.get("reason", "EDGE_DETECTED")
-            )
-            
-            # Log to database
-            self.db.log_trade({
-                "market_id": market["id"],
-                "question": market["question"],
-                "symbol": symbol,
-                "side": signal["side"],
-                "entry_price": signal["market_odds"],
-                "size": bet_size,
-                "confidence": signal["confidence"],
-                "strategy": "EDGE_ARBITRAGE",
-                "reason": signal.get("reason", "EDGE_DETECTED")
-            })
-    
-    async def performance_monitoring_loop(self):
-        """Monitor and log performance"""
+    async def performance_monitor_loop(self):
         while self.running:
+            await asyncio.sleep(300)
+            
             try:
-                stats = self.bankroll.get_stats()
-                kelly_stats = self.kelly.get_stats()
-                position_stats = self.position_manager.get_stats()
+                stats = self.position_manager.get_statistics()
+                breaker_status = self.circuit_breaker.get_status()
                 
-                logger.info("📊 PERFORMANCE UPDATE:")
-                logger.info(f"   Capital: ${stats['current_capital']:.2f} ({stats['total_return_pct']:+.1f}%)")
-                logger.info(f"   Trades: {stats['total_trades']} | Win Rate: {stats['win_rate_pct']:.1f}%")
-                logger.info(f"   Open: {position_stats['open_count']}/{position_stats['max_positions']}")
-                logger.info(f"   Kelly: {kelly_stats['kelly_multiplier']:.2f}x")
+                logger.info("=" * 60)
+                logger.info("PERFORMANCE UPDATE")
+                logger.info(f"Capital: ${self.current_capital:.2f}")
+                logger.info(f"Open Positions: {stats['open_positions']}")
+                logger.info(f"Exposure: ${stats['total_exposure']:.2f}")
+                logger.info(f"Unrealized P&L: ${stats['unrealized_pnl']:+.2f}")
+                logger.info(f"Win Rate: {stats['win_rate']:.1%}")
+                logger.info(f"Drawdown: {breaker_status['current_drawdown']:.2f}%")
+                logger.info(f"Trades Today: {breaker_status['trades_today']}")
+                logger.info("=" * 60)
                 
-                # Save snapshot
-                self.db.log_snapshot({**stats, **position_stats})
+                db.log_performance({
+                    "capital": float(self.current_capital),
+                    "open_positions": stats['open_positions'],
+                    "daily_pnl": 0.0,
+                    "total_pnl": float(self.current_capital - settings.INITIAL_CAPITAL),
+                    "win_rate": stats['win_rate'],
+                    "max_drawdown": breaker_status['current_drawdown']
+                })
                 
             except Exception as e:
-                logger.error(f"Monitoring error: {e}")
-            
-            await asyncio.sleep(300)  # Every 5 minutes
+                logger.error(f"Performance monitor error: {e}")
     
     async def shutdown(self):
-        """Graceful shutdown"""
-        logger.info("⚠️ Shutting down...")
+        logger.info("Shutting down bot...")
         self.running = False
         
-        await self.binance_feed.close()
+        await self.binance.close()
+        await self.polymarket.close()
         
-        self.bankroll.print_summary()
-        self.db.close()
+        logger.info("Bot shutdown complete")
+    
+    def handle_signal(self, sig, frame):
+        logger.info(f"Received signal {sig}")
+        self.running = False
         
-        logger.info("👋 Bot stopped")
+        for task in asyncio.all_tasks():
+            task.cancel()
 
 async def main():
-    """Main entry point"""
-    setup_logging(settings.LOG_LEVEL, "logs/bot.log")
+    bot = PolymarketTradingBot()
     
-    bot = PolymarketBot()
+    signal.signal(signal.SIGINT, bot.handle_signal)
+    signal.signal(signal.SIGTERM, bot.handle_signal)
     
-    # Handle graceful shutdown
-    loop = asyncio.get_running_loop()
-    
-    def signal_handler():
-        asyncio.create_task(bot.shutdown())
-    
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, signal_handler)
-    
-    try:
-        await bot.start()
-    except KeyboardInterrupt:
-        await bot.shutdown()
+    await bot.start()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\n👋 Goodbye!")
-        sys.exit(0)
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.critical(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
