@@ -1,32 +1,54 @@
-CRYPTO_SYMBOLS = {
-    "BTC": {
-        "name": "Bitcoin",
-        "binance_symbol": "BTCUSDT",
-        "keywords": ["bitcoin", "btc"],
-        "volatility_threshold": 3.0
-    },
-    "ETH": {
-        "name": "Ethereum",
-        "binance_symbol": "ETHUSDT",
-        "keywords": ["ethereum", "eth"],
-        "volatility_threshold": 4.0
-    },
-    "SOL": {
-        "name": "Solana",
-        "binance_symbol": "SOLUSDT",
-        "keywords": ["solana", "sol"],
-        "volatility_threshold": 5.0
+"""
+Market Configuration
+Defines target markets and trading parameters
+"""
+from typing import Dict, List
+
+class MarketConfig:
+    """Trading market definitions"""
+    
+    # Supported cryptocurrencies
+    SYMBOLS = ["BTC", "ETH", "SOL"]
+    
+    # Binance trading pairs
+    BINANCE_PAIRS = {
+        "BTC": "BTCUSDT",
+        "ETH": "ETHUSDT",
+        "SOL": "SOLUSDT"
     }
-}
+    
+    # Polymarket category filters
+    POLYMARKET_CATEGORIES = [
+        "crypto",
+        "bitcoin",
+        "ethereum"
+    ]
+    
+    # Market resolution time preferences (hours)
+    PREFERRED_RESOLUTION_MAX_HOURS = 24
+    FAST_RESOLUTION_MAX_HOURS = 6
+    
+    # Minimum liquidity thresholds
+    MIN_MARKET_LIQUIDITY = 100  # USD
+    IDEAL_MARKET_LIQUIDITY = 1000  # USD
+    
+    # Keywords for high-priority markets
+    HIGH_PRIORITY_KEYWORDS = [
+        "bitcoin",
+        "btc",
+        "ethereum",
+        "eth",
+        "price",
+        "above",
+        "below",
+        "today",
+        "tomorrow"
+    ]
+    
+    @classmethod
+    def is_high_priority_market(cls, title: str) -> bool:
+        """Check if market matches high-priority criteria"""
+        title_lower = title.lower()
+        return any(keyword in title_lower for keyword in cls.HIGH_PRIORITY_KEYWORDS)
 
-MARKET_CATEGORIES = {
-    "CRYPTO": ["crypto", "bitcoin", "ethereum"],
-    "POLITICS": ["election", "president", "trump"],
-    "SPORTS": ["nfl", "nba", "soccer"],
-    "FINANCE": ["fed", "rate", "stock"]
-}
-
-WHALE_WALLETS = [
-    "0xb8feafa95644d9c4491333e04da3c0aa2a93c2e0",
-    "0x5c0a28e8bb89e0a4d9c3a4d8f3e9a0b6c7d8e9f0"
-]
+market_config = MarketConfig()

@@ -1,34 +1,16 @@
 # Environment
 .env
-*.env
-
-# Python
+*.pyc
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyo
+*.pyd
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
 
 # Database
 *.db
 *.sqlite
 *.sqlite3
-data/*.db
+data/
 
 # Logs
 *.log
@@ -45,11 +27,22 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Testing
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Distribution
+dist/
+build/
+*.egg-info/
+
+# Test
 .pytest_cache/
 .coverage
 htmlcov/
 
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb
+# Secrets
+secrets/
+keys/
+*.pem
+*.key

@@ -1,4 +1,4 @@
-# Core
+# Core Dependencies
 python-dotenv==1.0.0
 requests==2.31.0
 aiohttp==3.9.1
@@ -12,22 +12,21 @@ numpy==1.26.2
 vaderSentiment==3.3.2
 textblob==0.17.1
 
-# Social Media
+# Twitter
 tweepy==4.14.0
 
-# Crypto APIs
+# Crypto Exchange APIs
 python-binance==1.0.19
 ccxt==4.2.0
 
-# Blockchain
-web3==6.11.3
-eth-account==0.10.0
-
 # Database
 sqlalchemy==2.0.23
-alembic==1.13.1
+
+# Web3 for Polymarket
+web3==6.11.3
+py-clob-client==0.20.0
 
 # Utilities
 python-dateutil==2.8.2
 pytz==2023.3
-click==8.1.7
+rich==13.7.0
