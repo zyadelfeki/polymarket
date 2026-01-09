@@ -1,121 +1,125 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+"""
+Database Layer
+SQLite storage for trade history and performance tracking
+"""
+import sqlite3
+from typing import Dict, List, Optional
 from datetime import datetime
 from pathlib import Path
-from config.settings import settings
+import logging
+import json
 
-Base = declarative_base()
-
-class Trade(Base):
-    __tablename__ = 'trades'
-    
-    id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    market_id = Column(String(100))
-    market_title = Column(Text)
-    side = Column(String(10))
-    entry_price = Column(Float)
-    exit_price = Column(Float, nullable=True)
-    bet_size = Column(Float)
-    shares = Column(Float)
-    status = Column(String(20))
-    strategy = Column(String(50))
-    edge = Column(Float)
-    confidence = Column(Float)
-    pnl = Column(Float, nullable=True)
-    roi = Column(Float, nullable=True)
-    exit_reason = Column(String(100), nullable=True)
-    exit_timestamp = Column(DateTime, nullable=True)
-
-class PerformanceSnapshot(Base):
-    __tablename__ = 'performance'
-    
-    id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    bankroll = Column(Float)
-    open_positions = Column(Integer)
-    total_trades = Column(Integer)
-    winning_trades = Column(Integer)
-    losing_trades = Column(Integer)
-    win_rate = Column(Float)
-    total_pnl = Column(Float)
-    roi = Column(Float)
-    sharpe_ratio = Column(Float, nullable=True)
-    max_drawdown = Column(Float)
+logger = logging.getLogger(__name__)
 
 class Database:
-    def __init__(self, db_path: str = None):
-        if db_path is None:
-            db_path = settings.DATABASE_PATH
-        
+    """SQLite database manager"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.engine = create_engine(f'sqlite:///{db_path}')
-        Base.metadata.create_all(self.engine)
-        self.Session = sessionmaker(bind=self.engine)
+        self.conn = None
+        self.init_db()
     
-    def get_session(self):
-        return self.Session()
+    def init_db(self):
+        """Create tables if not exist"""
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        cursor = self.conn.cursor()
+        
+        # Trades table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                market_id TEXT NOT NULL,
+                question TEXT,
+                symbol TEXT,
+                side TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                exit_price REAL,
+                size REAL NOT NULL,
+                profit REAL,
+                roi REAL,
+                confidence REAL,
+                strategy TEXT,
+                reason TEXT,
+                status TEXT DEFAULT 'OPEN'
+            )
+        ''')
+        
+        # Performance snapshots
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                capital REAL NOT NULL,
+                total_return_pct REAL,
+                win_rate REAL,
+                sharpe_ratio REAL,
+                total_trades INTEGER,
+                open_positions INTEGER
+            )
+        ''')
+        
+        # Volatility events
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS volatility_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                volatility_pct REAL NOT NULL,
+                price REAL NOT NULL,
+                opportunities_found INTEGER
+            )
+        ''')
+        
+        self.conn.commit()
+        logger.info(f"✅ Database initialized: {self.db_path}")
     
-    def log_trade(self, trade_data: dict):
-        session = self.get_session()
-        try:
-            trade = Trade(**trade_data)
-            session.add(trade)
-            session.commit()
-            return trade.id
-        finally:
-            session.close()
+    def log_trade(self, trade: Dict):
+        """Insert trade record"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO trades (
+                timestamp, market_id, question, symbol, side, entry_price,
+                exit_price, size, profit, roi, confidence, strategy, reason, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            trade.get('timestamp', datetime.utcnow().isoformat()),
+            trade['market_id'],
+            trade.get('question'),
+            trade.get('symbol'),
+            trade['side'],
+            trade['entry_price'],
+            trade.get('exit_price'),
+            float(trade['size']),
+            float(trade.get('profit', 0)),
+            trade.get('roi'),
+            trade.get('confidence'),
+            trade.get('strategy'),
+            trade.get('reason'),
+            trade.get('status', 'OPEN')
+        ))
+        self.conn.commit()
     
-    def update_trade(self, trade_id: int, updates: dict):
-        session = self.get_session()
-        try:
-            trade = session.query(Trade).filter(Trade.id == trade_id).first()
-            if trade:
-                for key, value in updates.items():
-                    setattr(trade, key, value)
-                session.commit()
-        finally:
-            session.close()
+    def log_snapshot(self, stats: Dict):
+        """Insert performance snapshot"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO snapshots (
+                timestamp, capital, total_return_pct, win_rate,
+                sharpe_ratio, total_trades, open_positions
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            datetime.utcnow().isoformat(),
+            stats['current_capital'],
+            stats['total_return_pct'],
+            stats['win_rate_pct'],
+            stats['sharpe_ratio'],
+            stats['total_trades'],
+            stats.get('open_positions', 0)
+        ))
+        self.conn.commit()
     
-    def log_performance(self, perf_data: dict):
-        session = self.get_session()
-        try:
-            snapshot = PerformanceSnapshot(**perf_data)
-            session.add(snapshot)
-            session.commit()
-        finally:
-            session.close()
-    
-    def get_open_trades(self):
-        session = self.get_session()
-        try:
-            return session.query(Trade).filter(Trade.status == 'OPEN').all()
-        finally:
-            session.close()
-    
-    def get_performance_stats(self, days: int = 30):
-        session = self.get_session()
-        try:
-            from datetime import timedelta
-            cutoff = datetime.utcnow() - timedelta(days=days)
-            trades = session.query(Trade).filter(Trade.timestamp >= cutoff).all()
-            
-            if not trades:
-                return None
-            
-            total = len(trades)
-            wins = len([t for t in trades if t.pnl and t.pnl > 0])
-            losses = len([t for t in trades if t.pnl and t.pnl < 0])
-            total_pnl = sum(t.pnl for t in trades if t.pnl)
-            
-            return {
-                'total_trades': total,
-                'wins': wins,
-                'losses': losses,
-                'win_rate': wins / total if total > 0 else 0,
-                'total_pnl': total_pnl,
-                'avg_pnl_per_trade': total_pnl / total if total > 0 else 0
-            }
-        finally:
-            session.close()
+    def close(self):
+        if self.conn:
+            self.conn.close()
