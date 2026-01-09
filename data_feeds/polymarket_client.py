@@ -1,269 +1,200 @@
-"""
-Polymarket CLOB API Client
-Production-ready integration with parallel market scanning
-"""
 import asyncio
 import aiohttp
-from typing import List, Dict, Optional
+import time
+import hmac
+import hashlib
+import json
+from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 import logging
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from web3 import Web3
+from eth_account import Account
 from config.settings import settings
-from config.markets import market_config
+from config.markets import CRYPTO_SYMBOLS, PRICE_KEYWORDS
 
 logger = logging.getLogger(__name__)
 
 class PolymarketClient:
-    """High-performance Polymarket trading client"""
-    
-    def __init__(self, private_key: Optional[str] = None):
-        self.private_key = private_key or settings.POLYMARKET_PRIVATE_KEY
-        self.paper_trading = settings.PAPER_TRADING
+    def __init__(self):
+        self.base_url = "https://clob.polymarket.com"
+        self.gamma_url = "https://gamma-api.polymarket.com"
+        self.private_key = settings.POLYMARKET_PRIVATE_KEY
         
-        # Initialize CLOB client if not paper trading
-        if not self.paper_trading and self.private_key:
-            try:
-                self.client = ClobClient(
-                    host="https://clob.polymarket.com",
-                    key=self.private_key,
-                    chain_id=137  # Polygon mainnet
-                )
-                logger.info("✅ Polymarket CLOB client initialized")
-            except Exception as e:
-                logger.error(f"❌ CLOB init failed: {e}")
-                self.client = None
+        if self.private_key:
+            self.account = Account.from_key(self.private_key)
+            self.address = self.account.address
         else:
-            self.client = None
-            logger.info("📝 Paper trading mode - no real execution")
+            self.account = None
+            self.address = None
         
-        # Market cache
+        self.session = None
         self.market_cache = {}
         self.last_market_refresh = None
     
-    async def scan_markets_parallel(self, symbols: List[str] = ["BTC", "ETH", "SOL"]) -> List[Dict]:
-        """
-        Scan multiple markets in parallel
-        Target: 50+ markets in <3 seconds
-        """
-        tasks = []
+    async def _get_session(self):
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        return self.session
+    
+    def _sign_message(self, message: str) -> str:
+        if not self.account:
+            return ""
+        message_hash = Web3.keccak(text=message)
+        signed = self.account.signHash(message_hash)
+        return signed.signature.hex()
+    
+    async def get_markets(self, active: bool = True, closed: bool = False) -> List[Dict]:
+        session = await self._get_session()
         
-        for symbol in symbols:
-            task = self._fetch_markets_for_symbol(symbol)
-            tasks.append(task)
+        params = {
+            "active": str(active).lower(),
+            "closed": str(closed).lower(),
+            "limit": 100
+        }
+        
+        try:
+            async with session.get(f"{self.gamma_url}/markets", params=params, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    markets = data if isinstance(data, list) else data.get("data", [])
+                    self.market_cache = {m.get("condition_id", m.get("id")): m for m in markets}
+                    self.last_market_refresh = datetime.utcnow()
+                    return markets
+                else:
+                    logger.error(f"Failed to fetch markets: {response.status}")
+                    return []
+        except Exception as e:
+            logger.error(f"Error fetching markets: {e}")
+            return []
+    
+    async def scan_crypto_markets_parallel(self, symbols: List[str] = None) -> List[Dict]:
+        if symbols is None:
+            symbols = list(CRYPTO_SYMBOLS.keys())
+        
+        markets = await self.get_markets()
+        
+        crypto_markets = []
+        for market in markets:
+            question = market.get("question", "").lower()
+            description = market.get("description", "").lower()
+            
+            for symbol in symbols:
+                tags = CRYPTO_SYMBOLS[symbol]["polymarket_tags"]
+                if any(tag in question or tag in description for tag in tags):
+                    if any(keyword in question for keyword in PRICE_KEYWORDS):
+                        crypto_markets.append(market)
+                        break
+        
+        logger.info(f"Found {len(crypto_markets)} active crypto price markets")
+        return crypto_markets
+    
+    async def get_market_orderbook(self, token_id: str) -> Dict:
+        session = await self._get_session()
+        
+        try:
+            async with session.get(f"{self.base_url}/book", params={"token_id": token_id}, timeout=5) as response:
+                if response.status == 200:
+                    return await response.json()
+                return {"bids": [], "asks": []}
+        except Exception as e:
+            logger.error(f"Error fetching orderbook for {token_id}: {e}")
+            return {"bids": [], "asks": []}
+    
+    async def get_market_prices_parallel(self, markets: List[Dict]) -> Dict[str, Dict]:
+        tasks = []
+        for market in markets:
+            condition_id = market.get("condition_id", market.get("id"))
+            tokens = market.get("tokens", [])
+            
+            if len(tokens) >= 2:
+                yes_token = tokens[0].get("token_id")
+                no_token = tokens[1].get("token_id")
+                
+                if yes_token and no_token:
+                    tasks.append(self._fetch_market_price(condition_id, yes_token, no_token, market))
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        all_markets = []
+        price_map = {}
         for result in results:
-            if isinstance(result, list):
-                all_markets.extend(result)
-            elif isinstance(result, Exception):
-                logger.error(f"Market scan error: {result}")
+            if isinstance(result, dict) and "condition_id" in result:
+                price_map[result["condition_id"]] = result
         
-        # Filter and rank
-        filtered = self._filter_markets(all_markets)
-        return filtered
+        return price_map
     
-    async def _fetch_markets_for_symbol(self, symbol: str) -> List[Dict]:
-        """Fetch all markets for a cryptocurrency"""
-        try:
-            # Public API endpoint for market data
-            async with aiohttp.ClientSession() as session:
-                url = "https://clob.polymarket.com/markets"
-                params = {"active": "true", "closed": "false"}
-                
-                async with session.get(url, params=params, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        
-                        # Filter for crypto markets
-                        crypto_markets = []
-                        for market in data:
-                            question = market.get("question", "").lower()
-                            if symbol.lower() in question:
-                                crypto_markets.append(self._parse_market(market))
-                        
-                        logger.debug(f"✅ {symbol}: {len(crypto_markets)} markets")
-                        return crypto_markets
-                    else:
-                        return []
-        except Exception as e:
-            logger.error(f"Fetch error {symbol}: {e}")
-            return []
-    
-    def _parse_market(self, raw_market: Dict) -> Dict:
-        """Parse raw market data into standardized format"""
-        try:
-            # Extract key fields
-            market_id = raw_market.get("condition_id", "")
-            question = raw_market.get("question", "")
-            end_date = raw_market.get("end_date_iso", "")
-            
-            # Calculate time to resolution
-            hours_to_resolve = None
-            if end_date:
-                try:
-                    end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                    hours_to_resolve = (end_dt - datetime.utcnow()).total_seconds() / 3600
-                except:
-                    pass
-            
-            # Get current odds
-            tokens = raw_market.get("tokens", [])
-            yes_price = 0.5
-            no_price = 0.5
-            
-            if len(tokens) >= 2:
-                # Typically tokens[0] is YES, tokens[1] is NO
-                for token in tokens:
-                    outcome = token.get("outcome", "").lower()
-                    price = float(token.get("price", 0.5))
-                    
-                    if "yes" in outcome:
-                        yes_price = price
-                    elif "no" in outcome:
-                        no_price = price
-            
-            # Liquidity
-            liquidity = float(raw_market.get("liquidity", 0))
-            volume = float(raw_market.get("volume", 0))
-            
-            return {
-                "id": market_id,
-                "question": question,
-                "yes_price": yes_price,
-                "no_price": no_price,
-                "liquidity": liquidity,
-                "volume": volume,
-                "hours_to_resolve": hours_to_resolve,
-                "end_date": end_date,
-                "raw": raw_market
-            }
-        except Exception as e:
-            logger.error(f"Parse error: {e}")
-            return {}
-    
-    def _filter_markets(self, markets: List[Dict]) -> List[Dict]:
-        """
-        Filter markets by quality criteria:
-        - Minimum liquidity
-        - Fast resolution preferred
-        - High priority keywords
-        """
-        filtered = []
-        
-        for market in markets:
-            # Skip if no data
-            if not market or "id" not in market:
-                continue
-            
-            # Liquidity check
-            if market.get("liquidity", 0) < market_config.MIN_MARKET_LIQUIDITY:
-                continue
-            
-            # Resolution time preference
-            hours = market.get("hours_to_resolve")
-            if hours and hours > market_config.PREFERRED_RESOLUTION_MAX_HOURS:
-                continue
-            
-            # Add priority score
-            question = market.get("question", "")
-            is_priority = market_config.is_high_priority_market(question)
-            market["is_priority"] = is_priority
-            
-            # Add edge indicators
-            yes_price = market.get("yes_price", 0.5)
-            no_price = market.get("no_price", 0.5)
-            
-            # Check for mispricings (YES + NO should equal ~1.0)
-            total_prob = yes_price + no_price
-            market["mispricing"] = abs(total_prob - 1.0)
-            
-            filtered.append(market)
-        
-        # Sort by priority and liquidity
-        filtered.sort(
-            key=lambda m: (m["is_priority"], m["liquidity"], -m.get("hours_to_resolve", 999)),
-            reverse=True
+    async def _fetch_market_price(self, condition_id: str, yes_token: str, no_token: str, market: Dict) -> Dict:
+        yes_book, no_book = await asyncio.gather(
+            self.get_market_orderbook(yes_token),
+            self.get_market_orderbook(no_token),
+            return_exceptions=True
         )
         
-        return filtered
-    
-    def check_liquidity_depth(self, market: Dict) -> Dict[str, bool]:
-        """
-        Analyze order book depth
-        Returns: {"sufficient": bool, "can_fill": bool, "slippage_risk": float}
-        """
-        liquidity = market.get("liquidity", 0)
-        volume = market.get("volume", 0)
+        yes_price = self._get_best_price(yes_book, "ask") if isinstance(yes_book, dict) else 0.50
+        no_price = self._get_best_price(no_book, "ask") if isinstance(no_book, dict) else 0.50
         
-        # Simple heuristics
-        sufficient = liquidity >= market_config.MIN_MARKET_LIQUIDITY
-        can_fill = volume > 0 and liquidity > 100
-        
-        # Estimate slippage risk (0.0 = low, 1.0 = high)
-        if liquidity >= market_config.IDEAL_MARKET_LIQUIDITY:
-            slippage_risk = 0.1  # Low risk
-        elif liquidity >= market_config.MIN_MARKET_LIQUIDITY:
-            slippage_risk = 0.3  # Medium risk
-        else:
-            slippage_risk = 0.8  # High risk
+        yes_liquidity = self._calculate_liquidity(yes_book) if isinstance(yes_book, dict) else 0
+        no_liquidity = self._calculate_liquidity(no_book) if isinstance(no_book, dict) else 0
         
         return {
-            "sufficient": sufficient,
-            "can_fill": can_fill,
-            "slippage_risk": slippage_risk
+            "condition_id": condition_id,
+            "market_title": market.get("question", ""),
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "yes_token": yes_token,
+            "no_token": no_token,
+            "total_liquidity": yes_liquidity + no_liquidity,
+            "yes_liquidity": yes_liquidity,
+            "no_liquidity": no_liquidity,
+            "end_date": market.get("end_date_iso"),
+            "market_data": market
         }
     
-    async def place_bet(self, market_id: str, side: str, amount: float, max_price: float) -> bool:
-        """
-        Execute trade
-        Returns: True if successful, False otherwise
-        """
-        if self.paper_trading:
-            logger.info(f"📝 PAPER: {side} ${amount:.2f} @ ${max_price:.3f} on {market_id}")
-            return True
-        
-        if not self.client:
-            logger.error("❌ No CLOB client")
-            return False
-        
-        try:
-            # Build order
-            order = OrderArgs(
-                market=market_id,
-                side=side.upper(),
-                size=str(amount),
-                price=str(max_price),
-                order_type=OrderType.FOK  # Fill or kill
-            )
-            
-            # Execute
-            result = self.client.create_order(order)
-            
-            logger.info(f"✅ Order placed: {result}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Order failed: {e}")
-            return False
+    def _get_best_price(self, orderbook: Dict, side: str) -> float:
+        orders = orderbook.get("asks" if side == "ask" else "bids", [])
+        if orders:
+            return float(orders[0].get("price", 0.50))
+        return 0.50
     
-    async def get_position_value(self, market_id: str, side: str) -> Optional[float]:
-        """
-        Get current value of position
-        Used for exit price monitoring
-        """
+    def _calculate_liquidity(self, orderbook: Dict) -> float:
+        total = 0.0
+        for side in ["asks", "bids"]:
+            for order in orderbook.get(side, [])[:10]:
+                total += float(order.get("size", 0)) * float(order.get("price", 0))
+        return total
+    
+    async def place_order(self, token_id: str, side: str, amount: float, price: float) -> Optional[Dict]:
+        if settings.PAPER_TRADING:
+            logger.info(f"[PAPER] Order: {side} {amount:.2f} shares @ ${price:.3f}")
+            return {"success": True, "order_id": f"paper_{int(time.time())}", "paper": True}
+        
+        if not self.account:
+            logger.error("No private key configured for real trading")
+            return None
+        
+        session = await self._get_session()
+        
+        order_data = {
+            "token_id": token_id,
+            "price": str(price),
+            "size": str(amount),
+            "side": side.upper(),
+            "maker": self.address
+        }
+        
         try:
-            markets = await self._fetch_markets_for_symbol("BTC")  # Refresh
-            
-            for market in markets:
-                if market.get("id") == market_id:
-                    if side.upper() == "YES":
-                        return market.get("yes_price")
-                    else:
-                        return market.get("no_price")
-            
+            async with session.post(f"{self.base_url}/order", json=order_data, timeout=settings.EXECUTION_TIMEOUT_SEC) as response:
+                if response.status in [200, 201]:
+                    result = await response.json()
+                    logger.info(f"Order placed: {result.get('order_id')}")
+                    return result
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Order failed: {response.status} - {error_text}")
+                    return None
+        except Exception as e:
+            logger.error(f"Order execution error: {e}")
             return None
-        except:
-            return None
+    
+    async def close(self):
+        if self.session:
+            await self.session.close()
