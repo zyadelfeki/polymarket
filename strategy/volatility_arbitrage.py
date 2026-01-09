@@ -1,174 +1,183 @@
+"""
+Volatility Arbitrage Engine
+$131K bot strategy: Buy panic-sold positions, sell on recovery
+"""
 import asyncio
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 import logging
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 class VolatilityArbitrageEngine:
+    """Exploit volatility-induced mispricings"""
+    
     def __init__(self, binance_feed, polymarket_client, bankroll_tracker):
         self.binance = binance_feed
         self.polymarket = polymarket_client
         self.bankroll = bankroll_tracker
-        self.EXTREME_DISCOUNT_THRESHOLD = 0.05
-        self.GOOD_DISCOUNT_THRESHOLD = 0.10
-        self.PROFIT_TARGET_MIN = 0.30
-        self.PROFIT_TARGET_IDEAL = 0.60
-        self.MAX_PANIC_BET_PCT = 0.15
-        self.MAX_SIMULTANEOUS_PANIC_POSITIONS = 2
-        self.active_panic_positions = []
+        
+        # Thresholds
+        self.PANIC_PRICE_THRESHOLD = settings.PANIC_BUY_MAX_PRICE
+        self.PROFIT_TARGET = settings.PANIC_SELL_TARGET
+        self.MAX_POSITIONS = settings.MAX_PANIC_POSITIONS
+        
+        # Tracking
+        self.active_positions = []
         self.volatility_events = []
     
-    async def on_volatility_spike_detected(self, symbol: str, volatility_pct: float, current_price: float):
-        logger.warning(f"🚨 VOLATILITY SPIKE: {symbol} moved {volatility_pct:.2f}%")
+    async def on_volatility_spike(self, symbol: str, volatility_pct: float, price: float):
+        """Triggered when >3% move detected"""
+        logger.warning(f"🚨 SPIKE: {symbol} moved {volatility_pct:.2f}%")
+        
         event = {
             "symbol": symbol,
             "volatility": volatility_pct,
-            "price": current_price,
-            "timestamp": datetime.utcnow(),
-            "direction": "UP" if volatility_pct > 0 else "DOWN"
+            "price": price,
+            "timestamp": datetime.utcnow()
         }
         self.volatility_events.append(event)
-        opportunities = await self._scan_for_panic_prices(symbol, event)
+        
+        # Scan for panic-priced markets
+        opportunities = await self._scan_panic_markets(symbol, price)
+        
         if opportunities:
-            logger.info(f"💎 Found {len(opportunities)} panic-priced opportunities!")
+            logger.info(f"💎 {len(opportunities)} panic opportunities")
             await self._execute_panic_buys(opportunities)
-        else:
-            logger.info("No panic-priced markets found")
     
-    async def _scan_for_panic_prices(self, symbol: str, event: Dict) -> List[Dict]:
+    async def _scan_panic_markets(self, symbol: str, current_price: float) -> List[Dict]:
+        """Find markets with crashed odds"""
+        markets = await self.polymarket.scan_markets_parallel([symbol])
         opportunities = []
-        markets = await self.polymarket.get_active_crypto_markets()
         
         for market in markets:
-            question = market.get('question', '').lower()
-            if symbol.lower() not in question:
-                continue
+            yes_price = market.get("yes_price", 0.5)
+            no_price = market.get("no_price", 0.5)
+            liquidity = market.get("liquidity", 0)
             
-            tokens = market.get('tokens', [])
-            if len(tokens) < 2:
-                continue
-            
-            yes_price = float(tokens[0].get('price', 1.0))
-            no_price = float(tokens[1].get('price', 1.0))
-            
-            if yes_price <= self.EXTREME_DISCOUNT_THRESHOLD:
+            # Find panic-sold side
+            if yes_price <= self.PANIC_PRICE_THRESHOLD and liquidity >= 100:
+                potential_gain = (self.PROFIT_TARGET / yes_price) if yes_price > 0 else 0
+                
                 opportunities.append({
-                    "market_id": market.get('condition_id'),
-                    "market_title": market.get('question'),
+                    "market_id": market["id"],
+                    "question": market["question"],
                     "side": "YES",
-                    "current_price": yes_price,
-                    "expected_recovery_price": self.PROFIT_TARGET_IDEAL,
-                    "potential_multiple": self.PROFIT_TARGET_IDEAL / yes_price if yes_price > 0 else 0,
-                    "confidence": 0.90,
-                    "liquidity": market.get('liquidity', 0)
+                    "entry_price": yes_price,
+                    "target_price": self.PROFIT_TARGET,
+                    "potential_multiple": potential_gain,
+                    "liquidity": liquidity,
+                    "confidence": 0.85
                 })
-            elif no_price <= self.EXTREME_DISCOUNT_THRESHOLD:
+            
+            elif no_price <= self.PANIC_PRICE_THRESHOLD and liquidity >= 100:
+                potential_gain = (self.PROFIT_TARGET / no_price) if no_price > 0 else 0
+                
                 opportunities.append({
-                    "market_id": market.get('condition_id'),
-                    "market_title": market.get('question'),
+                    "market_id": market["id"],
+                    "question": market["question"],
                     "side": "NO",
-                    "current_price": no_price,
-                    "expected_recovery_price": self.PROFIT_TARGET_IDEAL,
-                    "potential_multiple": self.PROFIT_TARGET_IDEAL / no_price if no_price > 0 else 0,
-                    "confidence": 0.90,
-                    "liquidity": market.get('liquidity', 0)
-                })
-            elif yes_price <= self.GOOD_DISCOUNT_THRESHOLD:
-                opportunities.append({
-                    "market_id": market.get('condition_id'),
-                    "market_title": market.get('question'),
-                    "side": "YES",
-                    "current_price": yes_price,
-                    "expected_recovery_price": self.PROFIT_TARGET_MIN,
-                    "potential_multiple": self.PROFIT_TARGET_MIN / yes_price if yes_price > 0 else 0,
-                    "confidence": 0.75,
-                    "liquidity": market.get('liquidity', 0)
+                    "entry_price": no_price,
+                    "target_price": self.PROFIT_TARGET,
+                    "potential_multiple": potential_gain,
+                    "liquidity": liquidity,
+                    "confidence": 0.85
                 })
         
-        opportunities.sort(key=lambda x: x['potential_multiple'], reverse=True)
-        return opportunities[:5]
+        # Sort by potential gain
+        opportunities.sort(key=lambda x: x["potential_multiple"], reverse=True)
+        return opportunities[:3]
     
     async def _execute_panic_buys(self, opportunities: List[Dict]):
-        if len(self.active_panic_positions) >= self.MAX_SIMULTANEOUS_PANIC_POSITIONS:
-            logger.warning("⚠️  Max panic positions reached")
+        """Execute panic buy orders"""
+        if len(self.active_positions) >= self.MAX_POSITIONS:
             return
         
-        available_capital = self.bankroll.get_available_capital()
-        max_bet_size = available_capital * self.MAX_PANIC_BET_PCT
-        executed = 0
+        available = self.bankroll.get_available_capital()
+        max_bet = available * 0.15  # 15% per panic position
         
-        for opp in opportunities:
-            if executed >= (self.MAX_SIMULTANEOUS_PANIC_POSITIONS - len(self.active_panic_positions)):
-                break
-            if opp["liquidity"] < 100:
+        for opp in opportunities[:self.MAX_POSITIONS - len(self.active_positions)]:
+            # Check liquidity depth
+            depth = self.polymarket.check_liquidity_depth({"liquidity": opp["liquidity"]})
+            if not depth["sufficient"]:
                 continue
             
-            bet_multiplier = min(opp["potential_multiple"] / 10, 1.5)
-            bet_size = min(max_bet_size * bet_multiplier, max_bet_size)
+            # Size position
+            bet_size = min(max_bet, available * 0.15)
             bet_size = max(bet_size, 0.50)
             
-            logger.info(f"💰 PANIC BUY: {opp['market_title']}")
-            logger.info(f"   Side: {opp['side']} at ${opp['current_price']:.3f}")
-            logger.info(f"   Bet: ${bet_size:.2f} | Potential: {opp['potential_multiple']:.1f}x")
+            logger.info(f"💰 PANIC BUY: {opp['question'][:50]}...")
+            logger.info(f"   {opp['side']} @ ${opp['entry_price']:.3f} | Target: {opp['potential_multiple']:.1f}x")
             
+            # Execute
             success = await self.polymarket.place_bet(
                 market_id=opp["market_id"],
                 side=opp["side"],
                 amount=bet_size,
-                max_price=opp["current_price"] * 1.1
+                max_price=opp["entry_price"] * 1.1
             )
             
             if success:
-                position = {**opp, "bet_size": bet_size, "entry_time": datetime.utcnow(), "status": "OPEN"}
-                self.active_panic_positions.append(position)
-                executed += 1
-                logger.info(f"✅ Executed panic buy #{executed}")
+                position = {
+                    **opp,
+                    "bet_size": bet_size,
+                    "entry_time": datetime.utcnow(),
+                    "status": "OPEN"
+                }
+                self.active_positions.append(position)
     
-    async def monitor_panic_positions(self):
+    async def monitor_positions(self):
+        """Background task: Monitor and exit positions"""
         while True:
-            if not self.active_panic_positions:
-                await asyncio.sleep(10)
-                continue
-            
-            for position in self.active_panic_positions[:]:
-                current_price = await self.polymarket.get_market_price(position["market_id"], position["side"])
-                if current_price is None:
+            for position in self.active_positions[:]:
+                current_price = await self.polymarket.get_position_value(
+                    position["market_id"],
+                    position["side"]
+                )
+                
+                if not current_price:
+                    await asyncio.sleep(10)
                     continue
                 
+                # Exit conditions
                 should_exit = False
-                exit_reason = ""
+                reason = ""
                 
-                if current_price >= position["expected_recovery_price"]:
+                # Profit target hit
+                if current_price >= position["target_price"]:
                     should_exit = True
-                    exit_reason = f"PROFIT TARGET (${current_price:.3f})"
-                elif current_price < position["current_price"] * 0.5:
+                    reason = "PROFIT TARGET"
+                
+                # Stop loss
+                elif current_price < position["entry_price"] * 0.5:
                     should_exit = True
-                    exit_reason = f"STOP LOSS (${current_price:.3f})"
+                    reason = "STOP LOSS"
+                
+                # Time stop (6 hours)
                 elif (datetime.utcnow() - position["entry_time"]) > timedelta(hours=6):
-                    if current_price > position["current_price"]:
+                    if current_price > position["entry_price"]:
                         should_exit = True
-                        exit_reason = f"TIME STOP - PROFITABLE (${current_price:.3f})"
+                        reason = "TIME STOP (PROFITABLE)"
                 
                 if should_exit:
-                    success = await self.polymarket.sell_position(
-                        market_id=position["market_id"],
-                        side=position["side"],
-                        amount=position["bet_size"] / position["current_price"],
-                        min_price=current_price * 0.95
-                    )
+                    # Calculate P&L
+                    shares = position["bet_size"] / position["entry_price"]
+                    exit_value = shares * current_price
+                    profit = exit_value - position["bet_size"]
+                    roi = (profit / position["bet_size"]) * 100
                     
-                    if success:
-                        profit = (current_price - position["current_price"]) * (position["bet_size"] / position["current_price"])
-                        roi = (profit / position["bet_size"]) * 100
-                        logger.info(f"🎯 PANIC POSITION CLOSED: {exit_reason}")
-                        logger.info(f"   P&L: ${profit:+.2f} ({roi:+.1f}%)")
-                        self.active_panic_positions.remove(position)
+                    logger.info(f"🎯 EXIT: {reason}")
+                    logger.info(f"   {position['question'][:40]}...")
+                    logger.info(f"   ${position['entry_price']:.3f} → ${current_price:.3f}")
+                    logger.info(f"   P&L: ${profit:+.2f} ({roi:+.1f}%)")
+                    
+                    self.active_positions.remove(position)
             
             await asyncio.sleep(30)
     
     def get_stats(self) -> Dict:
         return {
-            "active_positions": len(self.active_panic_positions),
-            "total_volatility_events": len(self.volatility_events)
+            "active_positions": len(self.active_positions),
+            "total_events": len(self.volatility_events)
         }
