@@ -1,58 +1,56 @@
-"""
-Structured Logging System
-"""
 import logging
 import sys
 from datetime import datetime
 from pathlib import Path
+from config.settings import settings
 
-class ColoredFormatter(logging.Formatter):
-    """Add colors to log levels"""
+class PerformanceLogger:
+    def __init__(self):
+        self.trade_count = 0
+        self.win_count = 0
+        self.loss_count = 0
+        self.total_profit = 0.0
+        self.start_time = datetime.utcnow()
     
-    COLORS = {
-        'DEBUG': '\033[36m',    # Cyan
-        'INFO': '\033[32m',     # Green
-        'WARNING': '\033[33m',  # Yellow
-        'ERROR': '\033[31m',    # Red
-        'CRITICAL': '\033[35m', # Magenta
-        'RESET': '\033[0m'
-    }
+    def log_trade(self, profit: float, win: bool):
+        self.trade_count += 1
+        if win:
+            self.win_count += 1
+        else:
+            self.loss_count += 1
+        self.total_profit += profit
     
-    def format(self, record):
-        log_color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
-        record.levelname = f"{log_color}{record.levelname}{self.COLORS['RESET']}"
-        return super().format(record)
+    def get_stats(self):
+        win_rate = (self.win_count / self.trade_count * 100) if self.trade_count > 0 else 0
+        avg_profit = self.total_profit / self.trade_count if self.trade_count > 0 else 0
+        return {
+            "trades": self.trade_count,
+            "wins": self.win_count,
+            "losses": self.loss_count,
+            "win_rate": win_rate,
+            "total_profit": self.total_profit,
+            "avg_profit": avg_profit,
+            "runtime_hours": (datetime.utcnow() - self.start_time).total_seconds() / 3600
+        }
 
-def setup_logging(log_level: str = "INFO", log_file: str = None):
-    """Configure logging"""
+def setup_logger():
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
     
-    # Create logs directory
-    if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"bot_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.log"
     
-    # Root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, log_level.upper()))
-    
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.DEBUG)
-    console_formatter = ColoredFormatter(
-        '%(asctime)s | %(levelname)s | %(name)s | %(message)s',
-        datefmt='%H:%M:%S'
+    logging.basicConfig(
+        level=getattr(logging, settings.LOG_LEVEL),
+        format='%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
     )
-    console_handler.setFormatter(console_formatter)
-    root_logger.addHandler(console_handler)
     
-    # File handler
-    if log_file:
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(logging.DEBUG)
-        file_formatter = logging.Formatter(
-            '%(asctime)s | %(levelname)s | %(name)s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        file_handler.setFormatter(file_formatter)
-        root_logger.addHandler(file_handler)
-    
-    return root_logger
+    logger = logging.getLogger(__name__)
+    logger.info(f"Logging initialized: {log_file}")
+    return logger
+
+performance_logger = PerformanceLogger()

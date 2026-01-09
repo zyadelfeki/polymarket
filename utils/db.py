@@ -1,125 +1,159 @@
-"""
-Database Layer
-SQLite storage for trade history and performance tracking
-"""
-import sqlite3
-from typing import Dict, List, Optional
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 from pathlib import Path
-import logging
-import json
+from config.settings import settings
 
-logger = logging.getLogger(__name__)
+Base = declarative_base()
+
+class Trade(Base):
+    __tablename__ = 'trades'
+    
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    strategy = Column(String(50))
+    market_id = Column(String(100))
+    market_title = Column(Text)
+    side = Column(String(10))
+    entry_price = Column(Float)
+    exit_price = Column(Float, nullable=True)
+    amount = Column(Float)
+    profit = Column(Float, nullable=True)
+    roi = Column(Float, nullable=True)
+    confidence = Column(Float)
+    edge = Column(Float)
+    status = Column(String(20))
+    exit_timestamp = Column(DateTime, nullable=True)
+    exit_reason = Column(String(100), nullable=True)
+
+class VolatilityEvent(Base):
+    __tablename__ = 'volatility_events'
+    
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    symbol = Column(String(10))
+    volatility_pct = Column(Float)
+    price = Column(Float)
+    direction = Column(String(10))
+    opportunities_found = Column(Integer)
+    trades_executed = Column(Integer)
+
+class WhaleActivity(Base):
+    __tablename__ = 'whale_activity'
+    
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    wallet_address = Column(String(100))
+    market_id = Column(String(100))
+    side = Column(String(10))
+    amount = Column(Float)
+    copied = Column(Boolean, default=False)
+    copy_amount = Column(Float, nullable=True)
+
+class PerformanceMetric(Base):
+    __tablename__ = 'performance_metrics'
+    
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    capital = Column(Float)
+    open_positions = Column(Integer)
+    daily_pnl = Column(Float)
+    total_pnl = Column(Float)
+    win_rate = Column(Float)
+    sharpe_ratio = Column(Float, nullable=True)
+    max_drawdown = Column(Float)
 
 class Database:
-    """SQLite database manager"""
-    
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = None
-        self.init_db()
-    
-    def init_db(self):
-        """Create tables if not exist"""
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = self.conn.cursor()
+    def __init__(self):
+        db_path = Path(settings.DATABASE_PATH)
+        db_path.parent.mkdir(exist_ok=True)
         
-        # Trades table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                market_id TEXT NOT NULL,
-                question TEXT,
-                symbol TEXT,
-                side TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                exit_price REAL,
-                size REAL NOT NULL,
-                profit REAL,
-                roi REAL,
-                confidence REAL,
-                strategy TEXT,
-                reason TEXT,
-                status TEXT DEFAULT 'OPEN'
-            )
-        ''')
-        
-        # Performance snapshots
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                capital REAL NOT NULL,
-                total_return_pct REAL,
-                win_rate REAL,
-                sharpe_ratio REAL,
-                total_trades INTEGER,
-                open_positions INTEGER
-            )
-        ''')
-        
-        # Volatility events
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS volatility_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                volatility_pct REAL NOT NULL,
-                price REAL NOT NULL,
-                opportunities_found INTEGER
-            )
-        ''')
-        
-        self.conn.commit()
-        logger.info(f"✅ Database initialized: {self.db_path}")
+        self.engine = create_engine(f'sqlite:///{db_path}', echo=False)
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine)
     
-    def log_trade(self, trade: Dict):
-        """Insert trade record"""
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            INSERT INTO trades (
-                timestamp, market_id, question, symbol, side, entry_price,
-                exit_price, size, profit, roi, confidence, strategy, reason, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            trade.get('timestamp', datetime.utcnow().isoformat()),
-            trade['market_id'],
-            trade.get('question'),
-            trade.get('symbol'),
-            trade['side'],
-            trade['entry_price'],
-            trade.get('exit_price'),
-            float(trade['size']),
-            float(trade.get('profit', 0)),
-            trade.get('roi'),
-            trade.get('confidence'),
-            trade.get('strategy'),
-            trade.get('reason'),
-            trade.get('status', 'OPEN')
-        ))
-        self.conn.commit()
+    def get_session(self):
+        return self.Session()
     
-    def log_snapshot(self, stats: Dict):
-        """Insert performance snapshot"""
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            INSERT INTO snapshots (
-                timestamp, capital, total_return_pct, win_rate,
-                sharpe_ratio, total_trades, open_positions
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            datetime.utcnow().isoformat(),
-            stats['current_capital'],
-            stats['total_return_pct'],
-            stats['win_rate_pct'],
-            stats['sharpe_ratio'],
-            stats['total_trades'],
-            stats.get('open_positions', 0)
-        ))
-        self.conn.commit()
+    def log_trade(self, trade_data: dict):
+        session = self.get_session()
+        try:
+            trade = Trade(**trade_data)
+            session.add(trade)
+            session.commit()
+            return trade.id
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
     
-    def close(self):
-        if self.conn:
-            self.conn.close()
+    def update_trade(self, trade_id: int, updates: dict):
+        session = self.get_session()
+        try:
+            trade = session.query(Trade).filter_by(id=trade_id).first()
+            if trade:
+                for key, value in updates.items():
+                    setattr(trade, key, value)
+                session.commit()
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
+    
+    def log_volatility_event(self, event_data: dict):
+        session = self.get_session()
+        try:
+            event = VolatilityEvent(**event_data)
+            session.add(event)
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
+    
+    def log_whale_activity(self, whale_data: dict):
+        session = self.get_session()
+        try:
+            activity = WhaleActivity(**whale_data)
+            session.add(activity)
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
+    
+    def log_performance(self, metrics: dict):
+        session = self.get_session()
+        try:
+            perf = PerformanceMetric(**metrics)
+            session.add(perf)
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
+    
+    def get_open_trades(self):
+        session = self.get_session()
+        try:
+            return session.query(Trade).filter_by(status='OPEN').all()
+        finally:
+            session.close()
+    
+    def get_performance_history(self, days: int = 7):
+        session = self.get_session()
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            return session.query(PerformanceMetric).filter(
+                PerformanceMetric.timestamp >= cutoff
+            ).all()
+        finally:
+            session.close()
+
+db = Database()
