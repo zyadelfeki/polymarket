@@ -1,14 +1,10 @@
 import asyncio
-import aiohttp
-import time
-import hmac
-import hashlib
-import json
 from typing import Dict, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
-from web3 import Web3
-from eth_account import Account
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
 from config.settings import settings
 from config.markets import CRYPTO_SYMBOLS, PRICE_KEYWORDS
 
@@ -16,53 +12,57 @@ logger = logging.getLogger(__name__)
 
 class PolymarketClient:
     def __init__(self):
-        self.base_url = "https://clob.polymarket.com"
+        self.host = "https://clob.polymarket.com"
         self.gamma_url = "https://gamma-api.polymarket.com"
+        self.chain_id = 137
         self.private_key = settings.POLYMARKET_PRIVATE_KEY
         
-        if self.private_key:
-            self.account = Account.from_key(self.private_key)
-            self.address = self.account.address
-        else:
-            self.account = None
+        if not self.private_key or self.private_key == "":
+            logger.warning("No private key configured - read-only mode")
+            self.client = ClobClient(self.host)
             self.address = None
+            self.can_trade = False
+        else:
+            try:
+                self.client = ClobClient(
+                    self.host,
+                    key=self.private_key,
+                    chain_id=self.chain_id
+                )
+                
+                if not settings.PAPER_TRADING:
+                    api_creds = self.client.create_or_derive_api_creds()
+                    self.client.set_api_creds(api_creds)
+                    logger.info("API credentials configured")
+                
+                from eth_account import Account
+                account = Account.from_key(self.private_key)
+                self.address = account.address
+                self.can_trade = True
+                logger.info(f"Polymarket client initialized: {self.address}")
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize Polymarket client: {e}")
+                self.client = ClobClient(self.host)
+                self.address = None
+                self.can_trade = False
         
-        self.session = None
         self.market_cache = {}
         self.last_market_refresh = None
     
-    async def _get_session(self):
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-        return self.session
-    
-    def _sign_message(self, message: str) -> str:
-        if not self.account:
-            return ""
-        message_hash = Web3.keccak(text=message)
-        signed = self.account.signHash(message_hash)
-        return signed.signature.hex()
-    
-    async def get_markets(self, active: bool = True, closed: bool = False) -> List[Dict]:
-        session = await self._get_session()
-        
-        params = {
-            "active": str(active).lower(),
-            "closed": str(closed).lower(),
-            "limit": 100
-        }
-        
+    async def get_markets(self, active: bool = True, limit: int = 100) -> List[Dict]:
         try:
-            async with session.get(f"{self.gamma_url}/markets", params=params, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    markets = data if isinstance(data, list) else data.get("data", [])
-                    self.market_cache = {m.get("condition_id", m.get("id")): m for m in markets}
-                    self.last_market_refresh = datetime.utcnow()
-                    return markets
-                else:
-                    logger.error(f"Failed to fetch markets: {response.status}")
-                    return []
+            markets = self.client.get_markets()
+            
+            if active:
+                markets = [m for m in markets if not m.get("closed", False) and m.get("active", True)]
+            
+            markets = markets[:limit]
+            
+            self.market_cache = {m.get("condition_id", m.get("id")): m for m in markets}
+            self.last_market_refresh = datetime.utcnow()
+            
+            return markets
         except Exception as e:
             logger.error(f"Error fetching markets: {e}")
             return []
@@ -89,13 +89,9 @@ class PolymarketClient:
         return crypto_markets
     
     async def get_market_orderbook(self, token_id: str) -> Dict:
-        session = await self._get_session()
-        
         try:
-            async with session.get(f"{self.base_url}/book", params={"token_id": token_id}, timeout=5) as response:
-                if response.status == 200:
-                    return await response.json()
-                return {"bids": [], "asks": []}
+            orderbook = self.client.get_order_book(token_id)
+            return orderbook
         except Exception as e:
             logger.error(f"Error fetching orderbook for {token_id}: {e}")
             return {"bids": [], "asks": []}
@@ -151,7 +147,7 @@ class PolymarketClient:
     
     def _get_best_price(self, orderbook: Dict, side: str) -> float:
         orders = orderbook.get("asks" if side == "ask" else "bids", [])
-        if orders:
+        if orders and len(orders) > 0:
             return float(orders[0].get("price", 0.50))
         return 0.50
     
@@ -165,36 +161,32 @@ class PolymarketClient:
     async def place_order(self, token_id: str, side: str, amount: float, price: float) -> Optional[Dict]:
         if settings.PAPER_TRADING:
             logger.info(f"[PAPER] Order: {side} {amount:.2f} shares @ ${price:.3f}")
+            import time
             return {"success": True, "order_id": f"paper_{int(time.time())}", "paper": True}
         
-        if not self.account:
-            logger.error("No private key configured for real trading")
+        if not self.can_trade:
+            logger.error("Cannot trade - no private key or initialization failed")
             return None
-        
-        session = await self._get_session()
-        
-        order_data = {
-            "token_id": token_id,
-            "price": str(price),
-            "size": str(amount),
-            "side": side.upper(),
-            "maker": self.address
-        }
         
         try:
-            async with session.post(f"{self.base_url}/order", json=order_data, timeout=settings.EXECUTION_TIMEOUT_SEC) as response:
-                if response.status in [200, 201]:
-                    result = await response.json()
-                    logger.info(f"Order placed: {result.get('order_id')}")
-                    return result
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Order failed: {response.status} - {error_text}")
-                    return None
+            order_side = BUY if side.upper() == "BUY" else SELL
+            
+            order = OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=amount,
+                side=order_side
+            )
+            
+            signed_order = self.client.create_order(order)
+            response = self.client.post_order(signed_order, OrderType.GTC)
+            
+            logger.info(f"Order placed: {response.get('orderID', 'unknown')}")
+            return {"success": True, "order_id": response.get('orderID'), "response": response}
+            
         except Exception as e:
-            logger.error(f"Order execution error: {e}")
+            logger.error(f"Order execution error: {e}", exc_info=True)
             return None
     
-    async def close(self):
-        if self.session:
-            await self.session.close()
+    def close(self):
+        pass

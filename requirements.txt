@@ -12,6 +12,6 @@ ccxt==4.2.0
 sqlalchemy==2.0.23
 python-dateutil==2.8.2
 pytz==2023.3
-py-clob-client==0.20.0
+py-clob-client==0.25.0
 web3==6.11.3
 eth-account==0.10.0
