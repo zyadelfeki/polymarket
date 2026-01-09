@@ -1,106 +1,112 @@
-from decimal import Decimal
+"""
+Bankroll Tracker
+Real-time capital and performance tracking
+"""
 from typing import Dict, List
+from decimal import Decimal
+from datetime import datetime
 import logging
-from config.settings import settings
-from utils.db import Database
 
 logger = logging.getLogger(__name__)
 
 class BankrollTracker:
-    def __init__(self, db: Database):
-        self.db = db
-        self.initial_capital = settings.INITIAL_CAPITAL
-        self.current_capital = self.initial_capital
-        self.peak_capital = self.initial_capital
-        self.open_positions = []
-        self.trade_history = []
-        self.consecutive_wins = 0
-        self.consecutive_losses = 0
+    """Performance and capital tracking"""
     
-    def get_current_capital(self) -> float:
-        return float(self.current_capital)
+    def __init__(self, initial_capital: Decimal):
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.peak_capital = initial_capital
+        
+        self.trade_history: List[Dict] = []
+        self.daily_snapshots: List[Dict] = []
+        
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_profit = Decimal("0")
     
-    def get_available_capital(self) -> float:
-        locked_capital = sum(pos.get('bet_size', 0) for pos in self.open_positions)
-        available = float(self.current_capital) - locked_capital
-        reserve = float(self.current_capital) * (settings.CASH_RESERVE_PCT / 100)
-        return max(available - reserve, 0)
-    
-    def add_trade(self, trade: Dict):
-        self.open_positions.append(trade)
-        logger.info(f"📊 Position opened: ${trade.get('bet_size', 0):.2f} | Open: {len(self.open_positions)}")
-    
-    def close_trade(self, trade_id: str, exit_price: float, exit_reason: str):
-        for i, pos in enumerate(self.open_positions):
-            if pos.get('trade_id') == trade_id:
-                entry_price = pos['entry_price']
-                bet_size = pos['bet_size']
-                shares = bet_size / entry_price if entry_price > 0 else 0
-                pnl = (exit_price - entry_price) * shares
-                roi = (pnl / bet_size) * 100 if bet_size > 0 else 0
-                
-                self.current_capital = Decimal(str(float(self.current_capital) + bet_size + pnl))
-                
-                if pnl > 0:
-                    self.consecutive_wins += 1
-                    self.consecutive_losses = 0
-                else:
-                    self.consecutive_losses += 1
-                    self.consecutive_wins = 0
-                
-                if self.current_capital > self.peak_capital:
-                    self.peak_capital = self.current_capital
-                
-                trade_record = {
-                    **pos,
-                    'exit_price': exit_price,
-                    'exit_reason': exit_reason,
-                    'pnl': pnl,
-                    'roi': roi,
-                    'status': 'CLOSED'
-                }
-                self.trade_history.append(trade_record)
-                self.open_positions.pop(i)
-                
-                self.db.update_trade(pos.get('db_id'), {
-                    'exit_price': exit_price,
-                    'exit_reason': exit_reason,
-                    'pnl': pnl,
-                    'roi': roi,
-                    'status': 'CLOSED'
-                })
-                
-                logger.info(f"💰 Position closed: P&L ${pnl:+.2f} ({roi:+.1f}%) | Capital: ${self.current_capital:.2f}")
-                return
-    
-    def get_consecutive_streak(self) -> Dict:
-        return {
-            'wins': self.consecutive_wins,
-            'losses': self.consecutive_losses
+    def record_trade(self, profit: Decimal, trade_details: Dict):
+        """Record completed trade"""
+        self.current_capital += profit
+        self.total_profit += profit
+        self.total_trades += 1
+        
+        if profit > 0:
+            self.winning_trades += 1
+        else:
+            self.losing_trades += 1
+        
+        if self.current_capital > self.peak_capital:
+            self.peak_capital = self.current_capital
+        
+        trade_record = {
+            "timestamp": datetime.utcnow(),
+            "profit": profit,
+            "capital_after": self.current_capital,
+            "details": trade_details
         }
+        self.trade_history.append(trade_record)
+        
+        logger.info(f"📊 Capital: ${self.current_capital:.2f} ({self.get_total_return():.1f}%)")
+    
+    def get_available_capital(self) -> Decimal:
+        """Get capital available for trading (excluding reserved)"""
+        # Keep 50% in reserve
+        return self.current_capital * Decimal("0.5")
+    
+    def get_total_return(self) -> float:
+        """Total return percentage"""
+        if self.initial_capital > 0:
+            return float((self.current_capital - self.initial_capital) / self.initial_capital * 100)
+        return 0.0
+    
+    def get_win_rate(self) -> float:
+        """Calculate win rate"""
+        if self.total_trades > 0:
+            return (self.winning_trades / self.total_trades) * 100
+        return 0.0
+    
+    def get_sharpe_ratio(self) -> float:
+        """Calculate Sharpe ratio (simplified)"""
+        if len(self.trade_history) < 2:
+            return 0.0
+        
+        returns = [float(t["profit"]) for t in self.trade_history]
+        avg_return = sum(returns) / len(returns)
+        
+        variance = sum((r - avg_return) ** 2 for r in returns) / len(returns)
+        std_dev = variance ** 0.5
+        
+        if std_dev > 0:
+            return avg_return / std_dev
+        return 0.0
     
     def get_stats(self) -> Dict:
-        total_trades = len(self.trade_history)
-        if total_trades == 0:
-            return {
-                'total_trades': 0,
-                'win_rate': 0,
-                'total_pnl': 0,
-                'roi': 0,
-                'current_capital': float(self.current_capital)
-            }
-        
-        wins = len([t for t in self.trade_history if t.get('pnl', 0) > 0])
-        total_pnl = sum(t.get('pnl', 0) for t in self.trade_history)
-        total_roi = ((float(self.current_capital) - float(self.initial_capital)) / float(self.initial_capital)) * 100
-        drawdown = ((float(self.peak_capital) - float(self.current_capital)) / float(self.peak_capital)) * 100
-        
+        """Comprehensive statistics"""
         return {
-            'total_trades': total_trades,
-            'win_rate': wins / total_trades if total_trades > 0 else 0,
-            'total_pnl': total_pnl,
-            'roi': total_roi,
-            'current_capital': float(self.current_capital),
-            'open_positions': len(self.open_positions),
-            'max_drawdown': drawdown
+            "current_capital": float(self.current_capital),
+            "initial_capital": float(self.initial_capital),
+            "peak_capital": float(self.peak_capital),
+            "total_return_pct": self.get_total_return(),
+            "total_profit": float(self.total_profit),
+            "total_trades": self.total_trades,
+            "winning_trades": self.winning_trades,
+            "losing_trades": self.losing_trades,
+            "win_rate_pct": self.get_win_rate(),
+            "sharpe_ratio": self.get_sharpe_ratio(),
+            "available_capital": float(self.get_available_capital())
         }
+    
+    def print_summary(self):
+        """Print formatted summary"""
+        stats = self.get_stats()
+        
+        print("\n" + "="*60)
+        print("📊 PERFORMANCE SUMMARY")
+        print("="*60)
+        print(f"💵 Capital: ${stats['current_capital']:.2f} (from ${stats['initial_capital']:.2f})")
+        print(f"📈 Total Return: {stats['total_return_pct']:+.1f}%")
+        print(f"🎯 Win Rate: {stats['win_rate_pct']:.1f}% ({stats['winning_trades']}/{stats['total_trades']})")
+        print(f"📊 Sharpe Ratio: {stats['sharpe_ratio']:.2f}")
+        print(f"🔺 Peak: ${stats['peak_capital']:.2f}")
+        print("="*60 + "\n")
