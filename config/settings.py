@@ -1,88 +1,94 @@
-"""
-Configuration Management
-Type-safe environment variable loading with validation
-"""
 import os
 from typing import Optional
 from dotenv import load_dotenv
 from decimal import Decimal
+import logging
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 class Settings:
-    """Centralized configuration with validation"""
-    
-    # API Keys
     NEWS_API_KEY: str = os.getenv("NEWS_API_KEY", "")
     TWITTER_BEARER_TOKEN: str = os.getenv("TWITTER_BEARER_TOKEN", "")
+    POLYMARKET_API_KEY: str = os.getenv("POLYMARKET_API_KEY", "")
+    POLYMARKET_SECRET: str = os.getenv("POLYMARKET_SECRET", "")
     POLYMARKET_PRIVATE_KEY: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
     POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+    ALCHEMY_API_KEY: str = os.getenv("ALCHEMY_API_KEY", "")
     
-    # Capital Management
     INITIAL_CAPITAL: Decimal = Decimal(os.getenv("INITIAL_CAPITAL", "15.00"))
     MAX_POSITION_SIZE_PCT: float = float(os.getenv("MAX_POSITION_SIZE_PCT", "20"))
     MAX_DRAWDOWN_PCT: float = float(os.getenv("MAX_DRAWDOWN_PCT", "15"))
     MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.15"))
     MIN_CONFIDENCE: float = float(os.getenv("MIN_CONFIDENCE", "0.70"))
     
-    # Position Limits
     MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
-    MIN_BET_SIZE: Decimal = Decimal("0.50")
+    MIN_BET_SIZE: Decimal = Decimal("0.10")
     CASH_RESERVE_PCT: float = 50.0
     
-    # Risk Management
     CIRCUIT_BREAKER_ENABLED: bool = os.getenv("CIRCUIT_BREAKER_ENABLED", "true").lower() == "true"
     MAX_CONSECUTIVE_LOSSES: int = 3
     DAILY_LOSS_LIMIT_PCT: float = 10.0
+    MAX_DAILY_TRADES: int = int(os.getenv("MAX_DAILY_TRADES", "50"))
     
-    # Volatility Arbitrage Settings
-    VOLATILITY_SPIKE_THRESHOLD: float = 3.0  # Percent move in 60 seconds
-    PANIC_BUY_MAX_PRICE: float = 0.10  # Buy positions under $0.10
-    PANIC_SELL_TARGET: float = 0.40  # Sell at $0.40+ (4x minimum)
-    MAX_PANIC_POSITIONS: int = 2
-    
-    # Trading Mode
     PAPER_TRADING: bool = os.getenv("PAPER_TRADING", "true").lower() == "true"
     
-    # Data Refresh Intervals (seconds)
-    PRICE_UPDATE_INTERVAL: float = 0.1  # 100ms for WebSocket
-    NEWS_SCAN_INTERVAL: int = 10
-    MARKET_SCAN_INTERVAL: int = 5
-    POSITION_CHECK_INTERVAL: int = 30
+    VOLATILITY_STRATEGY_WEIGHT: float = float(os.getenv("VOLATILITY_STRATEGY_WEIGHT", "0.40"))
+    WHALE_COPY_WEIGHT: float = float(os.getenv("WHALE_COPY_WEIGHT", "0.30"))
+    NEWS_ARBITRAGE_WEIGHT: float = float(os.getenv("NEWS_ARBITRAGE_WEIGHT", "0.20"))
+    BOND_STRATEGY_WEIGHT: float = float(os.getenv("BOND_STRATEGY_WEIGHT", "0.10"))
     
-    # Logging
+    MAX_SLIPPAGE_PCT: float = float(os.getenv("MAX_SLIPPAGE_PCT", "5"))
+    ORDER_SPLIT_THRESHOLD: Decimal = Decimal(os.getenv("ORDER_SPLIT_THRESHOLD", "5.00"))
+    EXECUTION_TIMEOUT_SEC: int = int(os.getenv("EXECUTION_TIMEOUT_SEC", "10"))
+    
+    NEWS_SCAN_INTERVAL: int = 10
+    PRICE_CHECK_INTERVAL: int = 1
+    TWITTER_SCAN_INTERVAL: int = 60
+    MARKET_DISCOVERY_INTERVAL: int = 300
+    WHALE_TRACK_INTERVAL: int = 30
+    
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     DATABASE_PATH: str = os.getenv("DATABASE_PATH", "./data/trades.db")
+    ENABLE_PERFORMANCE_LOGGING: bool = os.getenv("ENABLE_PERFORMANCE_LOGGING", "true").lower() == "true"
+    
+    VOLATILITY_SPIKE_THRESHOLD: float = 3.0
+    EXTREME_DISCOUNT_THRESHOLD: float = 0.05
+    GOOD_DISCOUNT_THRESHOLD: float = 0.10
+    PROFIT_TARGET_MIN: float = 0.30
+    PROFIT_TARGET_IDEAL: float = 0.60
+    
+    WHALE_MIN_BET_SIZE: Decimal = Decimal("1000.00")
+    WHALE_COPY_RATIO: float = 0.0002
+    
+    FAST_RESOLUTION_MAX_HOURS: int = 24
+    MIN_MARKET_LIQUIDITY: Decimal = Decimal("100.00")
     
     @classmethod
     def validate(cls) -> bool:
-        """Validate critical settings"""
-        if cls.PAPER_TRADING:
-            return True  # Allow paper trading without keys
-            
-        required = [
+        critical = [
             ("POLYMARKET_PRIVATE_KEY", cls.POLYMARKET_PRIVATE_KEY),
         ]
         
-        missing = [name for name, value in required if not value]
+        missing = [name for name, value in critical if not value]
         
         if missing:
-            print(f"❌ Missing required: {', '.join(missing)}")
+            logger.error(f"Missing critical config: {', '.join(missing)}")
             return False
             
         return True
     
     @classmethod
-    def print_config(cls):
-        """Display configuration"""
-        print("\n" + "="*60)
-        print("⚡ POLYMARKET VOLATILITY ARBITRAGE BOT V2.0")
-        print("="*60)
-        print(f"💰 Capital: ${cls.INITIAL_CAPITAL}")
-        print(f"📊 Max Position: {cls.MAX_POSITION_SIZE_PCT}%")
-        print(f"🛡️  Max Drawdown: {cls.MAX_DRAWDOWN_PCT}%")
-        print(f"⚠️  Paper Mode: {'YES' if cls.PAPER_TRADING else 'LIVE'}")
-        print(f"🚨 Volatility Threshold: {cls.VOLATILITY_SPIKE_THRESHOLD}%")
-        print("="*60 + "\n")
+    def log_config(cls):
+        logger.info("="*60)
+        logger.info("POLYMARKET BOT V2 - PRODUCTION CONFIG")
+        logger.info("="*60)
+        logger.info(f"Capital: ${cls.INITIAL_CAPITAL}")
+        logger.info(f"Paper Trading: {cls.PAPER_TRADING}")
+        logger.info(f"Max Position: {cls.MAX_POSITION_SIZE_PCT}%")
+        logger.info(f"Max Drawdown: {cls.MAX_DRAWDOWN_PCT}%")
+        logger.info(f"Strategy Weights: VOL={cls.VOLATILITY_STRATEGY_WEIGHT} WHALE={cls.WHALE_COPY_WEIGHT} NEWS={cls.NEWS_ARBITRAGE_WEIGHT} BOND={cls.BOND_STRATEGY_WEIGHT}")
+        logger.info("="*60)
 
 settings = Settings()

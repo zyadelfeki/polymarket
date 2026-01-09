@@ -1,16 +1,38 @@
 # Environment
 .env
-*.pyc
+*.env
+.env.local
+
+# Python
 __pycache__/
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+PIPFILE.lock
 
 # Database
 *.db
 *.sqlite
 *.sqlite3
-data/
+data/*.db
 
 # Logs
 *.log
@@ -22,27 +44,18 @@ logs/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
-Thumbs.db
 
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb
-
-# Distribution
-dist/
-build/
-*.egg-info/
-
-# Test
+# Testing
 .pytest_cache/
 .coverage
 htmlcov/
 
-# Secrets
-secrets/
-keys/
-*.pem
-*.key
+# Backtest results
+backtest_results/
+*.csv
+
+# Credentials
+credentials.json
+keys.json
+secrets.json

@@ -1,54 +1,59 @@
-"""
-Market Configuration
-Defines target markets and trading parameters
-"""
-from typing import Dict, List
-
-class MarketConfig:
-    """Trading market definitions"""
-    
-    # Supported cryptocurrencies
-    SYMBOLS = ["BTC", "ETH", "SOL"]
-    
-    # Binance trading pairs
-    BINANCE_PAIRS = {
-        "BTC": "BTCUSDT",
-        "ETH": "ETHUSDT",
-        "SOL": "SOLUSDT"
+CRYPTO_SYMBOLS = {
+    "BTC": {
+        "name": "Bitcoin",
+        "binance_symbol": "BTCUSDT",
+        "polymarket_tags": ["bitcoin", "btc", "crypto"],
+        "volatility_threshold": 3.0,
+        "min_liquidity": 500
+    },
+    "ETH": {
+        "name": "Ethereum",
+        "binance_symbol": "ETHUSDT",
+        "polymarket_tags": ["ethereum", "eth", "crypto"],
+        "volatility_threshold": 3.5,
+        "min_liquidity": 300
+    },
+    "SOL": {
+        "name": "Solana",
+        "binance_symbol": "SOLUSDT",
+        "polymarket_tags": ["solana", "sol", "crypto"],
+        "volatility_threshold": 4.0,
+        "min_liquidity": 200
     }
-    
-    # Polymarket category filters
-    POLYMARKET_CATEGORIES = [
-        "crypto",
-        "bitcoin",
-        "ethereum"
-    ]
-    
-    # Market resolution time preferences (hours)
-    PREFERRED_RESOLUTION_MAX_HOURS = 24
-    FAST_RESOLUTION_MAX_HOURS = 6
-    
-    # Minimum liquidity thresholds
-    MIN_MARKET_LIQUIDITY = 100  # USD
-    IDEAL_MARKET_LIQUIDITY = 1000  # USD
-    
-    # Keywords for high-priority markets
-    HIGH_PRIORITY_KEYWORDS = [
-        "bitcoin",
-        "btc",
-        "ethereum",
-        "eth",
-        "price",
-        "above",
-        "below",
-        "today",
-        "tomorrow"
-    ]
-    
-    @classmethod
-    def is_high_priority_market(cls, title: str) -> bool:
-        """Check if market matches high-priority criteria"""
-        title_lower = title.lower()
-        return any(keyword in title_lower for keyword in cls.HIGH_PRIORITY_KEYWORDS)
+}
 
-market_config = MarketConfig()
+WHALE_WALLETS = [
+    "0x0000000000000000000000000000000000000000",
+]
+
+PRICE_KEYWORDS = [
+    "above",
+    "below",
+    "reach",
+    "hit",
+    "close above",
+    "close below",
+    "exceed"
+]
+
+NEWS_KEYWORDS = {
+    "high_priority": [
+        "federal reserve",
+        "fed decision",
+        "rate cut",
+        "rate hike",
+        "sec",
+        "regulation",
+        "hack",
+        "exploit",
+        "emergency"
+    ],
+    "medium_priority": [
+        "bitcoin",
+        "ethereum",
+        "crypto",
+        "whale alert",
+        "exchange",
+        "listing"
+    ]
+}
