@@ -1,101 +1,118 @@
-"""
-Circuit Breaker
-Emergency trading halt on excessive drawdown
-"""
-from typing import Dict
 from decimal import Decimal
 from datetime import datetime, timedelta
 import logging
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 class CircuitBreaker:
-    """Drawdown protection system"""
+    def __init__(self, initial_capital: Decimal):
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.peak_capital = initial_capital
+        
+        self.daily_start_capital = initial_capital
+        self.daily_reset_time = datetime.utcnow()
+        
+        self.consecutive_losses = 0
+        self.trades_today = 0
+        
+        self.breaker_triggered = False
+        self.breaker_reason = None
+        self.breaker_until = None
     
-    def __init__(self, max_drawdown_pct: float = 15.0, daily_loss_limit_pct: float = 10.0):
-        self.max_drawdown_pct = max_drawdown_pct
-        self.daily_loss_limit_pct = daily_loss_limit_pct
+    def update_capital(self, new_capital: Decimal):
+        self.current_capital = new_capital
         
-        self.is_halted = False
-        self.halt_reason = None
-        self.halt_time = None
+        if new_capital > self.peak_capital:
+            self.peak_capital = new_capital
         
-        self.peak_capital = Decimal("0")
-        self.daily_start_capital = Decimal("0")
-        self.last_reset = datetime.utcnow().date()
+        if (datetime.utcnow() - self.daily_reset_time) > timedelta(days=1):
+            self._reset_daily()
     
-    def check(self, current_capital: Decimal, initial_capital: Decimal) -> Dict[str, bool]:
-        """
-        Check if circuit breaker should trigger
+    def record_trade(self, profit: Decimal, win: bool):
+        self.trades_today += 1
         
-        Returns:
-            {
-                "should_halt": bool,
-                "can_trade": bool,
-                "reason": str
-            }
-        """
-        # Reset daily tracking
-        today = datetime.utcnow().date()
-        if today != self.last_reset:
-            self.daily_start_capital = current_capital
-            self.last_reset = today
-        
-        # Update peak
-        if current_capital > self.peak_capital:
-            self.peak_capital = current_capital
-        
-        # Check drawdown from peak
-        if self.peak_capital > 0:
-            drawdown = ((self.peak_capital - current_capital) / self.peak_capital) * 100
+        if win:
+            self.consecutive_losses = 0
         else:
-            drawdown = 0.0
+            self.consecutive_losses += 1
         
-        # Check daily loss
-        if self.daily_start_capital > 0:
-            daily_loss = ((self.daily_start_capital - current_capital) / self.daily_start_capital) * 100
-        else:
-            daily_loss = 0.0
+        self.update_capital(self.current_capital + profit)
         
-        # Check absolute loss from initial
-        if initial_capital > 0:
-            total_loss = ((initial_capital - current_capital) / initial_capital) * 100
-        else:
-            total_loss = 0.0
-        
-        # Trigger conditions
-        if drawdown >= self.max_drawdown_pct:
-            self.trigger_halt(f"Max drawdown reached: {drawdown:.1f}%")
-            return {"should_halt": True, "can_trade": False, "reason": self.halt_reason}
-        
-        if daily_loss >= self.daily_loss_limit_pct:
-            self.trigger_halt(f"Daily loss limit: {daily_loss:.1f}%")
-            return {"should_halt": True, "can_trade": False, "reason": self.halt_reason}
-        
-        if total_loss >= 20.0:  # Hard stop at 20% total loss
-            self.trigger_halt(f"Total loss exceeds 20%: {total_loss:.1f}%")
-            return {"should_halt": True, "can_trade": False, "reason": self.halt_reason}
-        
-        return {"should_halt": False, "can_trade": not self.is_halted, "reason": None}
+        self._check_circuit_breaker()
     
-    def trigger_halt(self, reason: str):
-        """Activate circuit breaker"""
-        if not self.is_halted:
-            self.is_halted = True
-            self.halt_reason = reason
-            self.halt_time = datetime.utcnow()
-            logger.critical(f"⛔ CIRCUIT BREAKER TRIGGERED: {reason}")
+    def _check_circuit_breaker(self):
+        if not settings.CIRCUIT_BREAKER_ENABLED:
+            return
+        
+        current_drawdown = self.get_current_drawdown()
+        if current_drawdown >= settings.MAX_DRAWDOWN_PCT:
+            self._trigger_breaker(f"Max drawdown exceeded: {current_drawdown:.1f}%", hours=24)
+            return
+        
+        daily_loss_pct = ((self.current_capital - self.daily_start_capital) / self.daily_start_capital) * Decimal("100")
+        if daily_loss_pct <= -Decimal(str(settings.DAILY_LOSS_LIMIT_PCT)):
+            self._trigger_breaker(f"Daily loss limit hit: {daily_loss_pct:.1f}%", hours=12)
+            return
+        
+        if self.consecutive_losses >= settings.MAX_CONSECUTIVE_LOSSES:
+            self._trigger_breaker(f"{self.consecutive_losses} consecutive losses", hours=6)
+            return
+        
+        if self.trades_today >= settings.MAX_DAILY_TRADES:
+            self._trigger_breaker(f"Daily trade limit reached: {self.trades_today}", hours=4)
+            return
     
-    def reset(self):
-        """Manual reset (use with caution)"""
-        self.is_halted = False
-        self.halt_reason = None
-        self.halt_time = None
-        logger.warning("♻️ Circuit breaker RESET - trading resumed")
+    def _trigger_breaker(self, reason: str, hours: int):
+        if self.breaker_triggered:
+            return
+        
+        self.breaker_triggered = True
+        self.breaker_reason = reason
+        self.breaker_until = datetime.utcnow() + timedelta(hours=hours)
+        
+        logger.critical(f"CIRCUIT BREAKER TRIGGERED: {reason}")
+        logger.critical(f"Trading paused until: {self.breaker_until}")
     
-    def get_status(self) -> Dict:
+    def is_trading_allowed(self) -> bool:
+        if not self.breaker_triggered:
+            return True
+        
+        if datetime.utcnow() >= self.breaker_until:
+            self._reset_breaker()
+            return True
+        
+        return False
+    
+    def _reset_breaker(self):
+        logger.info(f"Circuit breaker reset. Resuming trading.")
+        self.breaker_triggered = False
+        self.breaker_reason = None
+        self.breaker_until = None
+        self.consecutive_losses = 0
+    
+    def _reset_daily(self):
+        self.daily_start_capital = self.current_capital
+        self.daily_reset_time = datetime.utcnow()
+        self.trades_today = 0
+        logger.info(f"Daily reset. Starting capital: ${self.current_capital:.2f}")
+    
+    def get_current_drawdown(self) -> float:
+        if self.peak_capital == 0:
+            return 0.0
+        drawdown = ((self.peak_capital - self.current_capital) / self.peak_capital) * Decimal("100")
+        return float(drawdown)
+    
+    def get_status(self) -> dict:
         return {
-            "is_halted": self.is_halted,
-            "reason": self.halt_reason,
-            "halt_time": self.halt_time.isoformat() if self.halt_time else None
+            "trading_allowed": self.is_trading_allowed(),
+            "breaker_triggered": self.breaker_triggered,
+            "breaker_reason": self.breaker_reason,
+            "breaker_until": self.breaker_until.isoformat() if self.breaker_until else None,
+            "current_drawdown": self.get_current_drawdown(),
+            "consecutive_losses": self.consecutive_losses,
+            "trades_today": self.trades_today,
+            "current_capital": float(self.current_capital),
+            "peak_capital": float(self.peak_capital)
         }
