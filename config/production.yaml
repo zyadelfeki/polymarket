@@ -1,0 +1,347 @@
+# ==================================================================
+# PRODUCTION CONFIGURATION - PAPER TRADING
+# ==================================================================
+#
+# This configuration file contains all settings for paper trading.
+# All values have been validated and optimized for production use.
+#
+# ==================================================================
+
+# ==================================================================
+# ENVIRONMENT
+# ==================================================================
+environment: paper_trading
+version: 1.0.0
+debug: false
+log_level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# ==================================================================
+# SECRETS MANAGEMENT
+# ==================================================================
+secrets:
+  backend: local  # Options: aws, local, env
+  aws_region: us-east-1
+  local_secrets_path: .secrets.enc
+  # Set SECRETS_ENCRYPTION_KEY in environment
+
+# ==================================================================
+# TRADING CONFIGURATION
+# ==================================================================
+trading:
+  # Paper trading mode
+  paper_trading: true
+  
+  # Initial capital
+  initial_capital: 10000.00
+  
+  # Position sizing
+  max_position_size_pct: 10.0  # Max 10% per position
+  max_total_exposure_pct: 80.0  # Max 80% total exposure
+  min_position_size: 10.00  # Minimum $10 per position
+  
+  # Order limits
+  min_order_size: 1.00
+  max_order_size: 1000.00
+  min_price: 0.01  # 1 cent
+  max_price: 0.99  # 99 cents
+  
+  # Rate limiting
+  max_orders_per_minute: 30
+  max_orders_per_hour: 500
+  max_daily_orders: 5000
+
+# ==================================================================
+# RISK MANAGEMENT
+# ==================================================================
+risk:
+  # Circuit breaker
+  circuit_breaker_enabled: true
+  max_drawdown_pct: 15.0  # Trip at 15% drawdown
+  max_loss_streak: 5  # Trip after 5 consecutive losses
+  daily_loss_limit_pct: 10.0  # Trip at 10% daily loss
+  recovery_threshold_pct: 5.0  # Recover when drawdown improves by 5%
+  cooldown_minutes: 30  # Wait 30min before recovery attempt
+  half_open_max_position_pct: 2.0  # 2% max in half-open state
+  
+  # Position limits
+  max_open_positions: 20
+  max_positions_per_market: 3
+  max_exposure_per_strategy: 30.0  # 30% max per strategy
+
+# ==================================================================
+# API CONFIGURATION
+# ==================================================================
+api:
+  # Polymarket
+  polymarket:
+    base_url: https://clob.polymarket.com
+    rate_limit: 8.0  # requests per second
+    timeout_seconds: 10.0
+    max_retries: 3
+    retry_delay_seconds: 1.0
+    max_retry_delay_seconds: 30.0
+  
+  # Binance WebSocket
+  binance:
+    ws_url: wss://stream.binance.com:9443/ws
+    heartbeat_interval: 30.0
+    max_reconnect_delay: 60.0
+    message_queue_size: 1000
+
+# ==================================================================
+# DATABASE CONFIGURATION
+# ==================================================================
+database:
+  path: data/trading.db
+  pool_size: 5
+  cache_ttl_seconds: 5
+  enable_wal: true
+  vacuum_interval_hours: 24
+  backup_enabled: true
+  backup_interval_hours: 6
+  backup_path: data/backups/
+
+# ==================================================================
+# MONITORING & HEALTH
+# ==================================================================
+monitoring:
+  # Health checks
+  health_check_interval: 30.0  # seconds
+  health_check_timeout: 10.0
+  failure_threshold: 3  # failures before alert
+  
+  # Metrics
+  metrics_enabled: true
+  metrics_interval: 60.0  # seconds
+  metrics_retention_days: 30
+  
+  # Alerting
+  alerts_enabled: true
+  alert_cooldown: 300.0  # 5 minutes between repeat alerts
+  
+  # Auto-restart
+  auto_restart_enabled: true
+  max_restart_attempts: 3
+  restart_cooldown: 60.0  # seconds
+
+# ==================================================================
+# LOGGING
+# ==================================================================
+logging:
+  # Output
+  console_enabled: true
+  file_enabled: true
+  file_path: logs/trading.log
+  
+  # Rotation
+  max_file_size_mb: 100
+  max_backup_count: 10
+  
+  # Format
+  format: json  # json or text
+  include_timestamp: true
+  include_level: true
+  include_logger: true
+  
+  # Levels per component
+  levels:
+    root: INFO
+    api_client: INFO
+    execution: INFO
+    websocket: INFO
+    health_monitor: INFO
+    circuit_breaker: WARNING
+    database: WARNING
+
+# ==================================================================
+# STRATEGIES
+# ==================================================================
+strategies:
+  # Latency Arbitrage
+  latency_arb:
+    enabled: true
+    max_position_size_pct: 5.0
+    min_price_movement: 0.02  # 2%
+    max_latency_ms: 100
+    confidence_threshold: 0.7
+  
+  # Mean Reversion
+  mean_reversion:
+    enabled: true
+    max_position_size_pct: 3.0
+    lookback_window: 60  # seconds
+    std_dev_threshold: 2.0
+  
+  # Volatility Breakout
+  volatility_breakout:
+    enabled: true
+    max_position_size_pct: 4.0
+    volatility_threshold: 5.0  # 5% movement
+    confirmation_window: 10  # seconds
+
+# ==================================================================
+# MARKETS CONFIGURATION
+# ==================================================================
+markets:
+  # Symbols to track
+  crypto_symbols:
+    - BTC
+    - ETH
+    - SOL
+  
+  # Market filters
+  min_volume_24h: 10000  # $10k minimum volume
+  min_liquidity: 1000  # $1k minimum liquidity
+  max_spread_pct: 5.0  # Skip if spread > 5%
+  
+  # Update intervals
+  market_data_refresh_seconds: 5
+  orderbook_refresh_seconds: 2
+  price_refresh_seconds: 1
+
+# ==================================================================
+# EXECUTION CONFIGURATION
+# ==================================================================
+execution:
+  # Order placement
+  default_order_type: LIMIT
+  use_post_only: true  # Maker orders only
+  
+  # Timeout settings
+  order_timeout_seconds: 60
+  fill_check_interval_seconds: 2
+  max_partial_fill_wait_seconds: 30
+  
+  # Cleanup
+  cleanup_interval_seconds: 300  # 5 minutes
+  max_order_age_seconds: 3600  # 1 hour
+  
+  # Dead letter queue
+  dlq_enabled: true
+  dlq_max_size: 1000
+
+# ==================================================================
+# PERFORMANCE TUNING
+# ==================================================================
+performance:
+  # Async settings
+  max_concurrent_orders: 10
+  max_concurrent_api_calls: 5
+  
+  # Cache settings
+  enable_caching: true
+  cache_size: 1000
+  
+  # Connection pooling
+  http_pool_size: 10
+  http_pool_maxsize: 20
+
+# ==================================================================
+# DEVELOPMENT/DEBUG
+# ==================================================================
+development:
+  # Dry run (no actual orders)
+  dry_run: false
+  
+  # Simulation
+  simulate_fills: true  # In paper trading mode
+  simulate_latency: false
+  
+  # Testing
+  skip_market_data: false
+  mock_api_calls: false
+  
+  # Profiling
+  enable_profiling: false
+  profile_output_path: logs/profile.json
+
+# ==================================================================
+# NOTIFICATIONS
+# ==================================================================
+notifications:
+  # Telegram
+  telegram:
+    enabled: false
+    bot_token: ""  # Set in secrets
+    chat_id: ""  # Set in secrets
+  
+  # Email
+  email:
+    enabled: false
+    smtp_host: smtp.gmail.com
+    smtp_port: 587
+    from_address: ""  # Set in secrets
+    to_addresses: []  # Set in secrets
+  
+  # PagerDuty
+  pagerduty:
+    enabled: false
+    integration_key: ""  # Set in secrets
+
+# ==================================================================
+# MAINTENANCE
+# ==================================================================
+maintenance:
+  # Database maintenance
+  vacuum_enabled: true
+  vacuum_hour: 3  # 3 AM
+  analyze_enabled: true
+  
+  # Log rotation
+  rotate_logs: true
+  rotation_hour: 2  # 2 AM
+  
+  # Metrics cleanup
+  cleanup_old_metrics: true
+  metrics_retention_days: 30
+  
+  # Position review
+  review_positions: true
+  review_interval_hours: 1
+  close_stale_positions_hours: 24
+
+# ==================================================================
+# SAFETY LIMITS (HARD CAPS)
+# ==================================================================
+safety:
+  # Absolute maximums (cannot be exceeded)
+  absolute_max_position_size: 2000.00  # $2k max position
+  absolute_max_total_exposure: 8000.00  # $8k max total (80% of $10k)
+  absolute_max_daily_loss: 1000.00  # $1k max daily loss
+  absolute_max_drawdown: 1500.00  # $1.5k max drawdown
+  
+  # Emergency stops
+  emergency_stop_on_error: true
+  emergency_stop_on_disconnect: false  # Will auto-reconnect
+  emergency_stop_on_health_fail: true
+  
+  # Kill switch (requires manual intervention)
+  kill_switch_enabled: false
+  kill_switch_reason: ""
+
+# ==================================================================
+# NOTES
+# ==================================================================
+# 
+# Configuration Validation:
+# - All values are validated on load using Pydantic
+# - Invalid values will cause startup failure
+# - Check logs/trading.log for validation errors
+#
+# Secrets:
+# - Never commit secrets to this file
+# - Use secrets manager (AWS/local/env)
+# - See security/secrets_manager.py
+#
+# Paper Trading:
+# - paper_trading must be true for testing
+# - simulate_fills should be true
+# - All orders are simulated (no real money)
+#
+# Production:
+# - Set paper_trading to false
+# - Configure all notification channels
+# - Enable all monitoring
+# - Set appropriate risk limits
+#
+# ==================================================================
