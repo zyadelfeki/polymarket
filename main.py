@@ -1,166 +1,454 @@
+#!/usr/bin/env python3
+"""
+Polymarket Trading Bot - Main Application
+
+Production-grade trading system with:
+- Multiple trading strategies
+- Real-time market data
+- Risk management
+- Health monitoring
+- Paper trading mode
+
+Usage:
+    python main.py --config config/production.yaml --mode paper
+    python main.py --config config/production.yaml --mode live
+"""
+
 import asyncio
 import signal
 import sys
+import argparse
+from pathlib import Path
+from typing import Optional
 from decimal import Decimal
-import logging
-from datetime import datetime
+import yaml
+import structlog
 
-from config.settings import settings
-from utils.logger import setup_logger, performance_logger
-from utils.db import db
+# Import core components
+from data_feeds.polymarket_client_v2 import PolymarketClientV2
+from data_feeds.binance_websocket_v2 import BinanceWebSocketV2
+from database.ledger_async import AsyncLedger
+from services.execution_service_v2 import ExecutionServiceV2
+from services.health_monitor_v2 import HealthMonitorV2
+from risk.circuit_breaker_v2 import CircuitBreakerV2
+from security.secrets_manager import SecretsManager, get_secrets_manager
+from validation.models import TradingConfig
 
-from data_feeds.binance_websocket import BinanceWebSocketFeed
-from data_feeds.polymarket_client import PolymarketClient
+logger = structlog.get_logger(__name__)
 
-from risk.kelly_sizer import AdaptiveKellySizer
-from risk.position_manager import PositionManager
-from risk.circuit_breaker import CircuitBreaker
 
-from strategy.volatility_arbitrage import VolatilityArbitrageEngine
-from strategy.threshold_arbitrage import ThresholdArbitrageEngine
-
-logger = setup_logger()
-
-class PolymarketTradingBot:
-    def __init__(self):
-        self.running = False
-        
-        self.binance = BinanceWebSocketFeed()
-        self.polymarket = PolymarketClient()
-        
-        self.kelly_sizer = AdaptiveKellySizer()
-        self.position_manager = PositionManager()
-        self.circuit_breaker = CircuitBreaker(settings.INITIAL_CAPITAL)
-        
-        self.volatility_engine = VolatilityArbitrageEngine(
-            self.binance,
-            self.polymarket,
-            self.position_manager,
-            self.kelly_sizer
-        )
-        
-        self.threshold_engine = ThresholdArbitrageEngine(
-            self.binance,
-            self.polymarket,
-            self.position_manager,
-            self.kelly_sizer
-        )
-        
-        self.current_capital = settings.INITIAL_CAPITAL
-        self.start_time = datetime.utcnow()
-        
-        self.binance.on_volatility_spike = self.volatility_engine.on_volatility_spike
+class TradingSystem:
+    """
+    Main trading system orchestrator.
     
-    async def start(self):
-        if not settings.validate():
-            logger.error("Configuration validation failed")
-            return False
+    Manages all components and coordinates trading operations.
+    """
+    
+    def __init__(self, config: dict):
+        """
+        Initialize trading system.
         
-        settings.log_config()
+        Args:
+            config: Configuration dictionary
+        """
+        self.config = config
+        self.running = False
+        self.shutdown_event = asyncio.Event()
         
-        logger.info("Starting Polymarket Trading Bot V2")
-        logger.info(f"Mode: {'PAPER TRADING' if settings.PAPER_TRADING else 'LIVE TRADING'}")
+        # Components (initialized in start())
+        self.secrets_manager: Optional[SecretsManager] = None
+        self.ledger: Optional[AsyncLedger] = None
+        self.api_client: Optional[PolymarketClientV2] = None
+        self.websocket: Optional[BinanceWebSocketV2] = None
+        self.execution: Optional[ExecutionServiceV2] = None
+        self.health_monitor: Optional[HealthMonitorV2] = None
+        self.circuit_breaker: Optional[CircuitBreakerV2] = None
         
-        self.running = True
-        
-        tasks = [
-            asyncio.create_task(self.binance.listen()),
-            asyncio.create_task(self.volatility_engine.monitor_positions()),
-            asyncio.create_task(self.threshold_scan_loop()),
-            asyncio.create_task(self.performance_monitor_loop()),
-        ]
+        logger.info(
+            "trading_system_initialized",
+            environment=config.get('environment', 'unknown'),
+            paper_trading=config.get('trading', {}).get('paper_trading', True)
+        )
+    
+    async def initialize_components(self):
+        """Initialize all system components."""
+        logger.info("initializing_components")
         
         try:
-            await asyncio.gather(*tasks)
-        except asyncio.CancelledError:
-            logger.info("Bot tasks cancelled")
-        finally:
-            await self.shutdown()
-    
-    async def threshold_scan_loop(self):
-        await asyncio.sleep(10)
-        
-        while self.running:
-            try:
-                if not self.circuit_breaker.is_trading_allowed():
-                    logger.warning("Trading paused by circuit breaker")
-                    await asyncio.sleep(60)
-                    continue
-                
-                opportunities = await self.threshold_engine.scan_opportunities()
-                
-                if opportunities:
-                    logger.info(f"Found {len(opportunities)} threshold arbitrage opportunities")
-                    executed = await self.threshold_engine.execute_opportunities(opportunities)
-                    if executed > 0:
-                        logger.info(f"Executed {executed} threshold arbitrage trades")
-                
-                await asyncio.sleep(settings.PRICE_CHECK_INTERVAL)
-                
-            except Exception as e:
-                logger.error(f"Threshold scan error: {e}", exc_info=True)
-                await asyncio.sleep(5)
-    
-    async def performance_monitor_loop(self):
-        while self.running:
-            await asyncio.sleep(300)
+            # 1. Secrets Manager
+            secrets_config = self.config.get('secrets', {})
+            self.secrets_manager = SecretsManager(
+                backend=secrets_config.get('backend', 'env'),
+                aws_region=secrets_config.get('aws_region', 'us-east-1'),
+                local_secrets_path=secrets_config.get('local_secrets_path', '.secrets.enc')
+            )
+            logger.info("secrets_manager_initialized")
             
+            # 2. Database/Ledger
+            db_config = self.config.get('database', {})
+            db_path = db_config.get('path', 'data/trading.db')
+            
+            # Ensure directory exists
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+            
+            self.ledger = AsyncLedger(
+                db_path=db_path,
+                pool_size=db_config.get('pool_size', 5),
+                cache_ttl=db_config.get('cache_ttl_seconds', 5)
+            )
+            await self.ledger.pool.initialize()
+            logger.info("ledger_initialized", path=db_path)
+            
+            # Initialize with capital if needed
+            equity = await self.ledger.get_equity()
+            if equity == Decimal('0'):
+                initial_capital = Decimal(str(self.config.get('trading', {}).get('initial_capital', 10000)))
+                await self.ledger.record_deposit(initial_capital, "Initial capital")
+                logger.info("initial_capital_deposited", amount=initial_capital)
+            
+            # 3. API Client
+            api_config = self.config.get('api', {}).get('polymarket', {})
+            paper_trading = self.config.get('trading', {}).get('paper_trading', True)
+            
+            # Get API credentials from secrets
+            api_key = await self.secrets_manager.get_secret('polymarket_api_key')
+            private_key = await self.secrets_manager.get_secret('polymarket_private_key')
+            
+            self.api_client = PolymarketClientV2(
+                api_key=api_key,
+                private_key=private_key,
+                paper_trading=paper_trading,
+                rate_limit=api_config.get('rate_limit', 8.0),
+                timeout=api_config.get('timeout_seconds', 10.0),
+                max_retries=api_config.get('max_retries', 3)
+            )
+            logger.info("api_client_initialized", paper_trading=paper_trading)
+            
+            # 4. WebSocket
+            ws_config = self.config.get('api', {}).get('binance', {})
+            symbols = self.config.get('markets', {}).get('crypto_symbols', ['BTC', 'ETH'])
+            
+            self.websocket = BinanceWebSocketV2(
+                symbols=symbols,
+                ws_url=ws_config.get('ws_url', 'wss://stream.binance.com:9443/ws'),
+                heartbeat_interval=ws_config.get('heartbeat_interval', 30.0)
+            )
+            await self.websocket.start()
+            logger.info("websocket_initialized", symbols=symbols)
+            
+            # 5. Circuit Breaker
+            risk_config = self.config.get('risk', {})
+            current_equity = await self.ledger.get_equity()
+            
+            self.circuit_breaker = CircuitBreakerV2(
+                initial_equity=current_equity,
+                max_drawdown_pct=risk_config.get('max_drawdown_pct', 15.0),
+                max_loss_streak=risk_config.get('max_loss_streak', 5),
+                daily_loss_limit_pct=risk_config.get('daily_loss_limit_pct', 10.0)
+            )
+            logger.info("circuit_breaker_initialized", initial_equity=current_equity)
+            
+            # 6. Execution Service
+            exec_config = self.config.get('execution', {})
+            
+            self.execution = ExecutionServiceV2(
+                api_client=self.api_client,
+                ledger=self.ledger,
+                order_timeout=exec_config.get('order_timeout_seconds', 60)
+            )
+            logger.info("execution_service_initialized")
+            
+            # 7. Health Monitor
+            monitor_config = self.config.get('monitoring', {})
+            
+            self.health_monitor = HealthMonitorV2(
+                check_interval=monitor_config.get('health_check_interval', 30.0),
+                failure_threshold=monitor_config.get('failure_threshold', 3),
+                auto_restart=monitor_config.get('auto_restart_enabled', True)
+            )
+            
+            # Register components for health checks
+            self.health_monitor.register_component(
+                'api_client',
+                self.api_client.health_check
+            )
+            self.health_monitor.register_component(
+                'websocket',
+                self.websocket.health_check
+            )
+            self.health_monitor.register_component(
+                'database',
+                self._check_database_health
+            )
+            
+            await self.health_monitor.start()
+            logger.info("health_monitor_initialized")
+            
+            logger.info("all_components_initialized")
+            
+        except Exception as e:
+            logger.error(
+                "component_initialization_failed",
+                error=str(e),
+                error_type=type(e).__name__
+            )
+            raise
+    
+    async def _check_database_health(self) -> bool:
+        """Check database health."""
+        try:
+            if not self.ledger:
+                return False
+            
+            # Simple query to verify connection
+            equity = await self.ledger.get_equity()
+            return equity is not None
+        except Exception:
+            return False
+    
+    async def start(self):
+        """Start the trading system."""
+        logger.info("starting_trading_system")
+        
+        try:
+            # Initialize all components
+            await self.initialize_components()
+            
+            self.running = True
+            
+            logger.info(
+                "trading_system_started",
+                status="operational"
+            )
+            
+            # Main loop
+            await self._main_loop()
+            
+        except Exception as e:
+            logger.error(
+                "trading_system_start_failed",
+                error=str(e),
+                error_type=type(e).__name__
+            )
+            raise
+    
+    async def _main_loop(self):
+        """Main trading loop."""
+        logger.info("entering_main_loop")
+        
+        iteration = 0
+        
+        while self.running:
             try:
-                stats = self.position_manager.get_statistics()
-                breaker_status = self.circuit_breaker.get_status()
+                iteration += 1
                 
-                logger.info("=" * 60)
-                logger.info("PERFORMANCE UPDATE")
-                logger.info(f"Capital: ${self.current_capital:.2f}")
-                logger.info(f"Open Positions: {stats['open_positions']}")
-                logger.info(f"Exposure: ${stats['total_exposure']:.2f}")
-                logger.info(f"Unrealized P&L: ${stats['unrealized_pnl']:+.2f}")
-                logger.info(f"Win Rate: {stats['win_rate']:.1%}")
-                logger.info(f"Drawdown: {breaker_status['current_drawdown']:.2f}%")
-                logger.info(f"Trades Today: {breaker_status['trades_today']}")
-                logger.info("=" * 60)
+                # Wait for shutdown or next iteration
+                try:
+                    await asyncio.wait_for(
+                        self.shutdown_event.wait(),
+                        timeout=60.0  # Check every minute
+                    )
+                    break  # Shutdown requested
+                except asyncio.TimeoutError:
+                    pass  # Continue normal operation
                 
-                db.log_performance({
-                    "capital": float(self.current_capital),
-                    "open_positions": stats['open_positions'],
-                    "daily_pnl": 0.0,
-                    "total_pnl": float(self.current_capital - settings.INITIAL_CAPITAL),
-                    "win_rate": stats['win_rate'],
-                    "max_drawdown": breaker_status['current_drawdown']
-                })
+                # Periodic tasks
+                if iteration % 1 == 0:  # Every minute
+                    await self._periodic_check()
+                
+                if iteration % 5 == 0:  # Every 5 minutes
+                    await self._periodic_maintenance()
                 
             except Exception as e:
-                logger.error(f"Performance monitor error: {e}")
+                logger.error(
+                    "main_loop_error",
+                    iteration=iteration,
+                    error=str(e),
+                    error_type=type(e).__name__
+                )
+                
+                # Decide whether to continue
+                if self.config.get('safety', {}).get('emergency_stop_on_error', True):
+                    logger.critical("emergency_stop_triggered")
+                    break
+                
+                # Otherwise, continue after delay
+                await asyncio.sleep(10)
+        
+        logger.info("exiting_main_loop")
     
-    async def shutdown(self):
-        logger.info("Shutting down bot...")
-        self.running = False
-        
-        await self.binance.close()
-        await self.polymarket.close()
-        
-        logger.info("Bot shutdown complete")
+    async def _periodic_check(self):
+        """Periodic health and status check."""
+        try:
+            # Check circuit breaker
+            if self.circuit_breaker:
+                equity = await self.ledger.get_equity()
+                can_trade = await self.circuit_breaker.can_trade(equity)
+                
+                if not can_trade:
+                    logger.warning(
+                        "circuit_breaker_open",
+                        status=self.circuit_breaker.get_status()
+                    )
+            
+            # Log system status
+            logger.info(
+                "periodic_status_check",
+                equity=float(await self.ledger.get_equity()) if self.ledger else 0,
+                api_healthy=await self.api_client.health_check() if self.api_client else False,
+                ws_connected=self.websocket.connected if self.websocket else False,
+                circuit_breaker_state=self.circuit_breaker.state.value if self.circuit_breaker else 'unknown'
+            )
+            
+        except Exception as e:
+            logger.error(
+                "periodic_check_failed",
+                error=str(e)
+            )
     
-    def handle_signal(self, sig, frame):
-        logger.info(f"Received signal {sig}")
-        self.running = False
+    async def _periodic_maintenance(self):
+        """Periodic maintenance tasks."""
+        try:
+            # Validate ledger
+            if self.ledger:
+                is_balanced = await self.ledger.validate_ledger()
+                if not is_balanced:
+                    logger.error("ledger_validation_failed", message="Ledger not balanced!")
+            
+            # Clean up execution service
+            if self.execution:
+                cleaned = await self.execution.cleanup_old_orders(max_age_seconds=3600)
+                if cleaned > 0:
+                    logger.info("orders_cleaned_up", count=cleaned)
+            
+            # Clear cache
+            if self.secrets_manager:
+                self.secrets_manager.clear_cache()
+            
+        except Exception as e:
+            logger.error(
+                "periodic_maintenance_failed",
+                error=str(e)
+            )
+    
+    async def stop(self):
+        """Stop the trading system."""
+        logger.info("stopping_trading_system")
         
-        for task in asyncio.all_tasks():
-            task.cancel()
+        self.running = False
+        self.shutdown_event.set()
+        
+        try:
+            # Stop health monitor
+            if self.health_monitor:
+                await self.health_monitor.stop()
+                logger.info("health_monitor_stopped")
+            
+            # Stop WebSocket
+            if self.websocket:
+                await self.websocket.stop()
+                logger.info("websocket_stopped")
+            
+            # Close API client
+            if self.api_client:
+                await self.api_client.close()
+                logger.info("api_client_closed")
+            
+            # Close ledger
+            if self.ledger:
+                await self.ledger.close()
+                logger.info("ledger_closed")
+            
+            logger.info("trading_system_stopped")
+            
+        except Exception as e:
+            logger.error(
+                "shutdown_error",
+                error=str(e),
+                error_type=type(e).__name__
+            )
+
 
 async def main():
-    bot = PolymarketTradingBot()
+    """Main entry point."""
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='Polymarket Trading Bot')
+    parser.add_argument(
+        '--config',
+        default='config/production.yaml',
+        help='Configuration file path'
+    )
+    parser.add_argument(
+        '--mode',
+        choices=['paper', 'live'],
+        default='paper',
+        help='Trading mode'
+    )
+    args = parser.parse_args()
     
-    signal.signal(signal.SIGINT, bot.handle_signal)
-    signal.signal(signal.SIGTERM, bot.handle_signal)
+    # Configure logging
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.add_logger_name,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.JSONRenderer()
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
     
-    await bot.start()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.critical(f"Fatal error: {e}", exc_info=True)
+    # Load configuration
+    config_path = Path(args.config)
+    if not config_path.exists():
+        logger.error("config_not_found", path=str(config_path))
         sys.exit(1)
+    
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+    
+    # Override paper trading mode from command line
+    if 'trading' not in config:
+        config['trading'] = {}
+    config['trading']['paper_trading'] = (args.mode == 'paper')
+    
+    logger.info(
+        "configuration_loaded",
+        config_path=str(config_path),
+        mode=args.mode,
+        paper_trading=config['trading']['paper_trading']
+    )
+    
+    # Create trading system
+    system = TradingSystem(config)
+    
+    # Set up signal handlers
+    def signal_handler(signum, frame):
+        logger.info("shutdown_signal_received", signal=signum)
+        asyncio.create_task(system.stop())
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Start system
+    try:
+        await system.start()
+    except KeyboardInterrupt:
+        logger.info("keyboard_interrupt")
+    except Exception as e:
+        logger.error(
+            "fatal_error",
+            error=str(e),
+            error_type=type(e).__name__
+        )
+        sys.exit(1)
+    finally:
+        await system.stop()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
