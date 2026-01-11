@@ -15,7 +15,6 @@ import sys
 from pathlib import Path
 import structlog
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data_feeds.binance_websocket_v2 import BinanceWebSocketV2
@@ -24,14 +23,13 @@ from database.ledger_async import AsyncLedger
 from services.execution_service_v2 import ExecutionServiceV2
 from risk.circuit_breaker_v2 import CircuitBreakerV2
 
-# Configure structured logging to console
 structlog.configure(
     processors=[
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S.%f", utc=True),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
-        structlog.dev.ConsoleRenderer()  # Human-readable for dry run
+        structlog.dev.ConsoleRenderer()
     ],
     wrapper_class=structlog.stdlib.BoundLogger,
     context_class=dict,
@@ -43,9 +41,7 @@ logger = structlog.get_logger(__name__)
 
 
 class DryRun:
-    """
-    Single execution loop demonstrating the full flow.
-    """
+    """Single execution loop demonstrating the full flow."""
     
     def __init__(self):
         self.ledger = None
@@ -55,7 +51,7 @@ class DryRun:
         self.websocket = None
         
         self.tick_count = 0
-        self.max_ticks = 3  # Process 3 ticks then stop
+        self.max_ticks = 3
         self.test_complete = asyncio.Event()
     
     async def initialize(self):
@@ -64,12 +60,12 @@ class DryRun:
         logger.info("DRY RUN INITIALIZATION")
         logger.info("=" * 60)
         
-        # 1. Ledger (in-memory for testing)
+        # 1. Ledger
         logger.info("Initializing ledger...")
         self.ledger = AsyncLedger(db_path=":memory:", pool_size=5)
         
-        # CRITICAL: Ensure pool and schema are initialized
-        await self.ledger.pool.initialize()
+        # CRITICAL: Explicitly initialize schema BEFORE any queries
+        await self.ledger.initialize()
         
         # Initial capital
         initial_capital = Decimal('10000')
@@ -114,7 +110,7 @@ class DryRun:
         await self.execution.start()
         logger.info("execution_service_initialized")
         
-        # 5. WebSocket with price callback
+        # 5. WebSocket
         logger.info("Initializing Binance WebSocket...")
         self.websocket = BinanceWebSocketV2(
             symbols=['BTC'],
@@ -128,16 +124,7 @@ class DryRun:
         logger.info("=" * 60)
     
     async def _on_price_update(self, symbol: str, price_data):
-        """
-        Main strategy loop triggered by price updates.
-        
-        This demonstrates the full flow:
-          1. Receive Binance tick
-          2. Generate signal
-          3. Check risk (circuit breaker)
-          4. Execute order
-          5. Record in ledger
-        """
+        """Main strategy loop triggered by price updates."""
         if symbol != 'BTC':
             return
         
@@ -161,11 +148,9 @@ class DryRun:
         )
         
         try:
-            # STEP 2: Signal Generation (simplified for dry run)
-            # In reality, this would compare Binance price to Polymarket odds
+            # STEP 2: Signal Generation
             logger.info("\n--- SIGNAL GENERATION ---")
             
-            # Simulate: BTC price dropped, we think "YES to 100K" odds should increase
             signal = {
                 'action': 'BUY',
                 'market_id': 'market_btc_100k',
@@ -186,7 +171,7 @@ class DryRun:
                 quantity=float(signal['quantity'])
             )
             
-            # STEP 3: Risk Check - Circuit Breaker
+            # STEP 3: Risk Check
             logger.info("\n--- RISK CHECK ---")
             
             current_equity = await self.ledger.get_equity()
@@ -207,9 +192,9 @@ class DryRun:
                 )
                 return
             
-            # Risk check: Position sizing
+            # Position sizing
             position_value = signal['quantity'] * signal['target_price']
-            max_position_size = current_equity * Decimal('0.10')  # 10% max
+            max_position_size = current_equity * Decimal('0.10')
             
             if position_value > max_position_size:
                 logger.warning(
@@ -259,10 +244,9 @@ class DryRun:
                 )
                 return
             
-            # STEP 5: Ledger Entry (already done by ExecutionService)
+            # STEP 5: Ledger Update
             logger.info("\n--- LEDGER UPDATE ---")
             
-            # Query updated state
             updated_equity = await self.ledger.get_equity()
             positions = await self.ledger.get_open_positions()
             
@@ -273,7 +257,6 @@ class DryRun:
                 pnl=float(updated_equity - current_equity)
             )
             
-            # Show position details
             if positions:
                 latest_position = positions[-1]
                 logger.info(
@@ -285,8 +268,7 @@ class DryRun:
                 )
             
             # STEP 6: Update Circuit Breaker
-            # Simulate P&L after some time
-            simulated_pnl = Decimal('5.50')  # Positive outcome
+            simulated_pnl = Decimal('5.50')
             await self.circuit_breaker.record_trade_result(
                 updated_equity,
                 simulated_pnl
@@ -318,7 +300,6 @@ class DryRun:
         logger.info(f"Processing {self.max_ticks} Binance ticks...\n")
         
         try:
-            # Wait for ticks or timeout
             await asyncio.wait_for(
                 self.test_complete.wait(),
                 timeout=60.0
@@ -326,7 +307,6 @@ class DryRun:
         except asyncio.TimeoutError:
             logger.warning("dry_run_timeout", message="No price updates received in 60s")
         
-        # Final summary
         await self._print_summary()
     
     async def _print_summary(self):
@@ -335,11 +315,8 @@ class DryRun:
         logger.info("DRY RUN SUMMARY")
         logger.info("=" * 60)
         
-        # Get final state
         equity = await self.ledger.get_equity()
         positions = await self.ledger.get_open_positions()
-        
-        # Get all orders
         orders = list(self.execution.orders.values())
         
         logger.info(
@@ -351,7 +328,6 @@ class DryRun:
             profit_loss=float(equity - Decimal('10000'))
         )
         
-        # Circuit breaker status
         cb_status = self.circuit_breaker.get_status()
         logger.info(
             "circuit_breaker_final_status",
@@ -385,9 +361,7 @@ class DryRun:
 
 
 async def main():
-    """
-    Run dry run.
-    """
+    """Run dry run."""
     dry_run = DryRun()
     
     try:
