@@ -11,7 +11,7 @@ Features:
 - Comprehensive error handling
 - Metrics tracking
 - Database health monitoring
-- Automatic schema initialization from schema.sql file
+- Automatic schema initialization with fallback
 
 Standards:
 - Double-entry accounting enforced
@@ -32,6 +32,103 @@ import structlog
 import time
 
 logger = structlog.get_logger(__name__)
+
+# Embedded schema as fallback
+EMBEDDED_SCHEMA = """
+-- Polymarket Trading System Database Schema
+CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_name TEXT NOT NULL UNIQUE,
+    account_type TEXT NOT NULL CHECK(account_type IN ('ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE')),
+    balance DECIMAL(20, 8) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT OR IGNORE INTO accounts (account_name, account_type, balance) VALUES
+    ('Cash', 'ASSET', 0),
+    ('Positions', 'ASSET', 0),
+    ('Unrealized PnL', 'ASSET', 0),
+    ('Trading Fees', 'EXPENSE', 0),
+    ('Owner Equity', 'EQUITY', 0),
+    ('Trading Revenue', 'REVENUE', 0),
+    ('Trading Loss', 'EXPENSE', 0);
+
+CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    description TEXT NOT NULL,
+    transaction_type TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS transaction_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
+    amount DECIMAL(20, 8) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE CASCADE,
+    FOREIGN KEY (account_id) REFERENCES accounts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transaction_lines_txn ON transaction_lines(transaction_id);
+CREATE INDEX IF NOT EXISTS idx_transaction_lines_account ON transaction_lines(account_id);
+
+CREATE TABLE IF NOT EXISTS positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    entry_price DECIMAL(10, 6) NOT NULL,
+    quantity DECIMAL(20, 8) NOT NULL,
+    current_price DECIMAL(10, 6),
+    exit_price DECIMAL(10, 6),
+    unrealized_pnl DECIMAL(20, 8) DEFAULT 0,
+    realized_pnl DECIMAL(20, 8) DEFAULT 0,
+    fees DECIMAL(20, 8) DEFAULT 0,
+    status TEXT DEFAULT 'OPEN' CHECK(status IN ('OPEN', 'CLOSED')),
+    entry_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    exit_timestamp TIMESTAMP,
+    entry_order_id TEXT,
+    exit_order_id TEXT,
+    metadata TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_id);
+CREATE INDEX IF NOT EXISTS idx_positions_strategy ON positions(strategy);
+CREATE INDEX IF NOT EXISTS idx_positions_entry_time ON positions(entry_timestamp);
+
+CREATE TRIGGER IF NOT EXISTS trg_update_account_balance_insert
+AFTER INSERT ON transaction_lines
+BEGIN
+    UPDATE accounts
+    SET balance = balance + NEW.amount,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = NEW.account_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_update_account_balance_delete
+AFTER DELETE ON transaction_lines
+BEGIN
+    UPDATE accounts
+    SET balance = balance - OLD.amount,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = OLD.account_id;
+END;
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id INTEGER,
+    details TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_time ON audit_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id);
+"""
 
 
 @dataclass
@@ -85,25 +182,50 @@ class ConnectionPool:
             if self._initialized:  # Double-check
                 return
             
-            # Load schema from file
-            schema_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                'schema.sql'
-            )
+            # Try to load schema from file, fallback to embedded
+            schema_sql = None
+            schema_source = "embedded"
             
-            if not os.path.exists(schema_path):
-                raise FileNotFoundError(
-                    f"Schema file not found: {schema_path}. "
-                    f"Expected at: {os.path.abspath(schema_path)}"
+            try:
+                schema_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    'schema.sql'
                 )
+                
+                if os.path.exists(schema_path):
+                    with open(schema_path, 'r') as f:
+                        schema_sql = f.read()
+                    schema_source = "file"
+                    logger.info(
+                        "schema_loaded_from_file",
+                        schema_path=schema_path,
+                        schema_size=len(schema_sql)
+                    )
+                else:
+                    logger.warning(
+                        "schema_file_not_found",
+                        schema_path=schema_path,
+                        fallback="using_embedded_schema"
+                    )
+                    schema_sql = EMBEDDED_SCHEMA
             
-            with open(schema_path, 'r') as f:
-                schema_sql = f.read()
+            except Exception as e:
+                logger.warning(
+                    "schema_file_load_error",
+                    error=str(e),
+                    fallback="using_embedded_schema"
+                )
+                schema_sql = EMBEDDED_SCHEMA
+            
+            # Use embedded schema if nothing loaded
+            if not schema_sql:
+                schema_sql = EMBEDDED_SCHEMA
+                schema_source = "embedded"
             
             logger.info(
-                "schema_loaded",
-                schema_path=schema_path,
-                schema_size=len(schema_sql)
+                "initializing_database_schema",
+                schema_source=schema_source,
+                db_path=self.db_path
             )
             
             # Create first connection and initialize schema
@@ -123,14 +245,16 @@ class ConnectionPool:
                 
                 logger.info(
                     "database_schema_initialized",
-                    db_path=self.db_path
+                    db_path=self.db_path,
+                    schema_source=schema_source
                 )
             
             except Exception as e:
                 logger.error(
                     "schema_initialization_failed",
                     error=str(e),
-                    error_type=type(e).__name__
+                    error_type=type(e).__name__,
+                    exc_info=True
                 )
                 await first_conn.close()
                 raise
@@ -187,7 +311,7 @@ class AsyncLedger:
     - Prepared statements everywhere
     - Transaction batching support
     - Comprehensive metrics
-    - Automatic schema initialization from schema.sql
+    - Automatic schema initialization with embedded fallback
     """
     
     def __init__(
