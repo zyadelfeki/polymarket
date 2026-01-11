@@ -11,6 +11,7 @@ Features:
 - Slippage tracking
 - Execution quality metrics
 - Dead letter queue for failed orders
+- Instant paper trading simulation
 
 Standards:
 - Zero order loss
@@ -37,14 +38,14 @@ logger = structlog.get_logger(__name__)
 
 class OrderStatus(Enum):
     """Order status states"""
-    PENDING = "pending"  # Created, not yet submitted
-    SUBMITTED = "submitted"  # Sent to exchange
-    PARTIALLY_FILLED = "partially_filled"  # Some fills received
-    FILLED = "filled"  # Completely filled
-    CANCELLED = "cancelled"  # Cancelled by user/system
-    REJECTED = "rejected"  # Rejected by exchange
-    FAILED = "failed"  # Technical failure
-    EXPIRED = "expired"  # Timeout
+    PENDING = "pending"
+    SUBMITTED = "submitted"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+    FAILED = "failed"
+    EXPIRED = "expired"
 
 
 @dataclass
@@ -60,7 +61,6 @@ class OrderRequest:
     metadata: Dict = field(default_factory=dict)
     
     def __post_init__(self):
-        # Validate
         if self.quantity <= 0:
             raise ValueError(f"Invalid quantity: {self.quantity}")
         if not (Decimal('0.01') <= self.price <= Decimal('0.99')):
@@ -149,7 +149,6 @@ class OrderState:
         self.fills.append(fill)
         self.updated_at = datetime.utcnow()
         
-        # Update status
         if self.filled_quantity >= self.request.quantity:
             self.status = OrderStatus.FILLED
         elif self.filled_quantity > 0:
@@ -188,6 +187,7 @@ class ExecutionServiceV2:
     - Automatic retry with backoff
     - Dead letter queue for failures
     - Execution quality metrics
+    - Instant paper trading simulation
     """
     
     def __init__(
@@ -196,32 +196,20 @@ class ExecutionServiceV2:
         ledger: AsyncLedger,
         config: Optional[Dict] = None
     ):
-        """
-        Initialize execution service.
-        
-        Args:
-            polymarket_client: Polymarket API client
-            ledger: Ledger manager
-            config: Configuration dict
-        """
         self.client = polymarket_client
         self.ledger = ledger
         
-        # Configuration
         self.config = config or {}
         self.max_retries = self.config.get('max_retries', 3)
         self.timeout_seconds = self.config.get('timeout_seconds', 30)
         self.fill_check_interval = self.config.get('fill_check_interval', 2.0)
         self.max_order_age_seconds = self.config.get('max_order_age_seconds', 300)
         
-        # Order tracking
         self.orders: Dict[str, OrderState] = {}
         self.order_lock = asyncio.Lock()
         
-        # Dead letter queue
         self.dlq: List[OrderState] = []
         
-        # Metrics
         self.orders_placed = 0
         self.orders_filled = 0
         self.orders_failed = 0
@@ -229,14 +217,14 @@ class ExecutionServiceV2:
         self.total_fees = Decimal('0')
         self.execution_times_ms: List[float] = []
         
-        # Start background tasks
         self._monitor_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
         
         logger.info(
             "execution_service_initialized",
             max_retries=self.max_retries,
-            timeout_seconds=self.timeout_seconds
+            timeout_seconds=self.timeout_seconds,
+            paper_trading=self.client.paper_trading
         )
     
     async def start(self):
@@ -264,25 +252,8 @@ class ExecutionServiceV2:
         order_type: str = "GTC",
         metadata: Optional[Dict] = None
     ) -> OrderResult:
-        """
-        Place an order.
-        
-        Args:
-            strategy: Strategy name
-            market_id: Market ID
-            token_id: Token ID
-            side: 'YES' or 'NO'
-            quantity: Order quantity
-            price: Limit price
-            order_type: Order type (GTC, FOK, etc.)
-            metadata: Additional metadata
-        
-        Returns:
-            OrderResult with execution details
-        """
         start_time = time.time()
         
-        # Create order request
         try:
             order_side = OrderSide.BUY if side.upper() in ['YES', 'BUY'] else OrderSide.SELL
             request = OrderRequest(
@@ -303,10 +274,8 @@ class ExecutionServiceV2:
                 error=str(e)
             )
         
-        # Place order with retry
         for attempt in range(self.max_retries):
             try:
-                # Submit to exchange
                 response = await self.client.place_order(
                     token_id=token_id,
                     side=order_side,
@@ -317,7 +286,7 @@ class ExecutionServiceV2:
                 
                 if not response or not response.get('success'):
                     if attempt < self.max_retries - 1:
-                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                        await asyncio.sleep(2 ** attempt)
                         continue
                     else:
                         self.orders_failed += 1
@@ -327,10 +296,8 @@ class ExecutionServiceV2:
                             error="Order submission failed"
                         )
                 
-                # Order submitted successfully
                 order_id = response['order_id']
                 
-                # Create order state
                 order_state = OrderState(request, order_id)
                 order_state.mark_submitted()
                 
@@ -339,13 +306,31 @@ class ExecutionServiceV2:
                 
                 self.orders_placed += 1
                 
-                # Wait for fills (with timeout)
-                filled = await self._wait_for_fills(
-                    order_state,
-                    timeout=self.timeout_seconds
-                )
+                # PAPER TRADING: Simulate instant fill
+                if self.client.paper_trading:
+                    fill = Fill(
+                        fill_id=f"fill_{order_id}",
+                        order_id=order_id,
+                        quantity=quantity,
+                        price=price,
+                        fee=quantity * price * Decimal('0.002'),  # 0.2% fee
+                        timestamp=datetime.utcnow()
+                    )
+                    order_state.add_fill(fill)
+                    
+                    logger.info(
+                        "paper_fill_simulated",
+                        order_id=order_id,
+                        quantity=float(quantity),
+                        price=float(price)
+                    )
+                else:
+                    # LIVE TRADING: Wait for real fills
+                    await self._wait_for_fills(
+                        order_state,
+                        timeout=self.timeout_seconds
+                    )
                 
-                # Calculate metrics
                 execution_time_ms = (time.time() - start_time) * 1000
                 self.execution_times_ms.append(execution_time_ms)
                 
@@ -358,14 +343,12 @@ class ExecutionServiceV2:
                 
                 self.total_fees += order_state.total_fees
                 
-                # Record in ledger if filled
                 if order_state.status == OrderStatus.FILLED:
                     await self._record_trade_in_ledger(order_state)
                     self.orders_filled += 1
                 
-                # Build result
                 result = OrderResult(
-                    success=filled,
+                    success=(order_state.status == OrderStatus.FILLED),
                     order_id=order_id,
                     status=order_state.status,
                     filled_quantity=order_state.filled_quantity,
@@ -406,7 +389,6 @@ class ExecutionServiceV2:
                         error=str(e)
                     )
         
-        # Should never reach here
         return OrderResult(
             success=False,
             status=OrderStatus.FAILED,
@@ -418,30 +400,16 @@ class ExecutionServiceV2:
         order_state: OrderState,
         timeout: float
     ) -> bool:
-        """
-        Wait for order to be filled.
-        
-        Args:
-            order_state: Order state to monitor
-            timeout: Max wait time in seconds
-        
-        Returns:
-            True if filled
-        """
         start_time = time.time()
         
         while (time.time() - start_time) < timeout:
-            # Check order status
             status_response = await self.client.get_order_status(order_state.order_id)
             
             if status_response:
-                # Parse fills
                 fills = status_response.get('fills', [])
                 for fill_data in fills:
-                    # Check if we already have this fill
                     fill_id = fill_data.get('id')
                     if not any(f.fill_id == fill_id for f in order_state.fills):
-                        # New fill
                         fill = Fill(
                             fill_id=fill_id,
                             order_id=order_state.order_id,
@@ -460,14 +428,11 @@ class ExecutionServiceV2:
                             price=float(fill.price)
                         )
                 
-                # Check if complete
                 if order_state.status == OrderStatus.FILLED:
                     return True
             
-            # Wait before next check
             await asyncio.sleep(self.fill_check_interval)
         
-        # Timeout - mark as expired if not filled
         if order_state.status not in [OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED]:
             order_state.status = OrderStatus.EXPIRED
             logger.warning(
@@ -479,12 +444,6 @@ class ExecutionServiceV2:
         return order_state.status == OrderStatus.FILLED
     
     async def _record_trade_in_ledger(self, order_state: OrderState):
-        """
-        Record completed trade in ledger.
-        
-        Args:
-            order_state: Completed order state
-        """
         try:
             position_id = await self.ledger.record_trade_entry(
                 market_id=order_state.request.market_id,
@@ -509,13 +468,9 @@ class ExecutionServiceV2:
                 order_id=order_state.order_id,
                 error=str(e)
             )
-            # Add to DLQ for manual reconciliation
             self.dlq.append(order_state)
     
     async def _fill_monitor_loop(self):
-        """
-        Background task to monitor fills for pending orders.
-        """
         logger.info("fill_monitor_started")
         
         while True:
@@ -541,21 +496,17 @@ class ExecutionServiceV2:
                 logger.error("fill_monitor_error", error=str(e))
     
     async def _cleanup_loop(self):
-        """
-        Background task to cleanup old orders.
-        """
         logger.info("cleanup_loop_started")
         
         while True:
             try:
-                await asyncio.sleep(60)  # Every minute
+                await asyncio.sleep(60)
                 
                 async with self.order_lock:
-                    # Remove orders older than max_age
                     to_remove = []
                     for order_id, order in self.orders.items():
                         if order.age_seconds > self.max_order_age_seconds:
-                            if order.status.is_complete:
+                            if order.is_complete:
                                 to_remove.append(order_id)
                     
                     for order_id in to_remove:
@@ -574,12 +525,6 @@ class ExecutionServiceV2:
                 logger.error("cleanup_loop_error", error=str(e))
     
     async def cancel_all_orders(self) -> int:
-        """
-        Cancel all pending orders.
-        
-        Returns:
-            Number of orders cancelled
-        """
         async with self.order_lock:
             pending = [
                 order for order in self.orders.values()
@@ -601,12 +546,6 @@ class ExecutionServiceV2:
         return cancelled
     
     def get_metrics(self) -> Dict:
-        """
-        Get execution metrics.
-        
-        Returns:
-            Metrics dictionary
-        """
         avg_execution_time = (
             sum(self.execution_times_ms) / len(self.execution_times_ms)
             if self.execution_times_ms else 0.0
