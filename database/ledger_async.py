@@ -11,7 +11,7 @@ Features:
 - Comprehensive error handling
 - Metrics tracking
 - Database health monitoring
-- Automatic schema initialization
+- Automatic schema initialization from schema.sql file
 
 Standards:
 - Double-entry accounting enforced
@@ -22,6 +22,7 @@ Standards:
 
 import aiosqlite
 import asyncio
+import os
 from typing import List, Dict, Optional, Tuple
 from decimal import Decimal
 from datetime import datetime, timedelta
@@ -31,79 +32,6 @@ import structlog
 import time
 
 logger = structlog.get_logger(__name__)
-
-# Embedded schema for automatic initialization
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_name TEXT NOT NULL UNIQUE,
-    account_type TEXT NOT NULL CHECK(account_type IN ('ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE')),
-    balance DECIMAL(20, 8) NOT NULL DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-INSERT OR IGNORE INTO accounts (account_name, account_type) VALUES
-    ('Cash', 'ASSET'),
-    ('Positions', 'ASSET'),
-    ('Trading Fees', 'EXPENSE'),
-    ('Owner Equity', 'EQUITY'),
-    ('Trading Revenue', 'REVENUE');
-
-CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    description TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS transaction_lines (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_id INTEGER NOT NULL,
-    account_id INTEGER NOT NULL,
-    amount DECIMAL(20, 8) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (transaction_id) REFERENCES transactions(id),
-    FOREIGN KEY (account_id) REFERENCES accounts(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_transaction_lines_txn ON transaction_lines(transaction_id);
-CREATE INDEX IF NOT EXISTS idx_transaction_lines_account ON transaction_lines(account_id);
-
-CREATE TABLE IF NOT EXISTS positions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    market_id TEXT NOT NULL,
-    token_id TEXT NOT NULL,
-    strategy TEXT NOT NULL,
-    entry_price DECIMAL(10, 6) NOT NULL,
-    quantity DECIMAL(20, 8) NOT NULL,
-    current_price DECIMAL(10, 6),
-    unrealized_pnl DECIMAL(20, 8) DEFAULT 0,
-    realized_pnl DECIMAL(20, 8) DEFAULT 0,
-    status TEXT DEFAULT 'OPEN' CHECK(status IN ('OPEN', 'CLOSED')),
-    entry_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    exit_timestamp TIMESTAMP,
-    order_id TEXT,
-    metadata TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
-CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_id);
-
-CREATE TRIGGER IF NOT EXISTS trg_update_account_balance_insert
-AFTER INSERT ON transaction_lines
-BEGIN
-    UPDATE accounts
-    SET balance = balance + NEW.amount
-    WHERE id = NEW.account_id;
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_update_account_balance_delete
-AFTER DELETE ON transaction_lines
-BEGIN
-    UPDATE accounts
-    SET balance = balance - OLD.amount
-    WHERE id = OLD.account_id;
-END;
-"""
 
 
 @dataclass
@@ -157,6 +85,27 @@ class ConnectionPool:
             if self._initialized:  # Double-check
                 return
             
+            # Load schema from file
+            schema_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                'schema.sql'
+            )
+            
+            if not os.path.exists(schema_path):
+                raise FileNotFoundError(
+                    f"Schema file not found: {schema_path}. "
+                    f"Expected at: {os.path.abspath(schema_path)}"
+                )
+            
+            with open(schema_path, 'r') as f:
+                schema_sql = f.read()
+            
+            logger.info(
+                "schema_loaded",
+                schema_path=schema_path,
+                schema_size=len(schema_sql)
+            )
+            
             # Create first connection and initialize schema
             first_conn = await aiosqlite.connect(
                 self.db_path,
@@ -169,7 +118,7 @@ class ConnectionPool:
                 await first_conn.execute("PRAGMA journal_mode = WAL")
                 
                 # Execute schema
-                await first_conn.executescript(SCHEMA_SQL)
+                await first_conn.executescript(schema_sql)
                 await first_conn.commit()
                 
                 logger.info(
@@ -238,7 +187,7 @@ class AsyncLedger:
     - Prepared statements everywhere
     - Transaction batching support
     - Comprehensive metrics
-    - Automatic schema initialization
+    - Automatic schema initialization from schema.sql
     """
     
     def __init__(
@@ -505,7 +454,7 @@ class AsyncLedger:
                 INSERT INTO positions (
                     market_id, token_id, strategy, entry_price, quantity,
                     current_price, unrealized_pnl, realized_pnl, status,
-                    entry_timestamp, order_id, metadata
+                    entry_timestamp, entry_order_id, metadata
                 ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?, ?, ?)
                 """,
                 (
