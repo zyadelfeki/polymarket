@@ -275,6 +275,11 @@ class AsyncLedger:
             cache_ttl=cache_ttl
         )
     
+    async def initialize(self):
+        """Explicitly initialize database schema and connection pool."""
+        await self.pool.initialize()
+        logger.info("async_ledger_ready")
+    
     async def _execute_query(
         self,
         query: str,
