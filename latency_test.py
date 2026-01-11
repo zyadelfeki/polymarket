@@ -16,7 +16,6 @@ from decimal import Decimal
 import sys
 from pathlib import Path
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data_feeds.binance_websocket_v2 import BinanceWebSocketV2
@@ -26,9 +25,7 @@ from services.execution_service_v2 import ExecutionServiceV2
 
 
 class LatencyTest:
-    """
-    Measures actual latency from price update to order placement.
-    """
+    """Measures actual latency from price update to order placement."""
     
     def __init__(self):
         self.websocket = None
@@ -36,7 +33,6 @@ class LatencyTest:
         self.ledger = None
         self.api_client = None
         
-        # Timing measurements
         self.measurements = []
         self.test_complete = asyncio.Event()
     
@@ -47,7 +43,7 @@ class LatencyTest:
         
         # 1. Database
         self.ledger = AsyncLedger(db_path=":memory:", pool_size=5)
-        await self.ledger.pool.initialize()
+        await self.ledger.initialize()
         await self.ledger.record_deposit(Decimal('10000'), "Test capital")
         print(f"[✓] Ledger initialized with $10,000")
         
@@ -79,16 +75,10 @@ class LatencyTest:
         print("[TEST] All components initialized\n")
     
     async def _on_price_update(self, symbol: str, price_data):
-        """
-        Called when WebSocket receives price update.
-        
-        This is where we measure latency.
-        """
-        # Only process BTC
+        """Called when WebSocket receives price update."""
         if symbol != 'BTC':
             return
         
-        # Only process first 5 measurements
         if len(self.measurements) >= 5:
             if not self.test_complete.is_set():
                 self.test_complete.set()
@@ -105,7 +95,6 @@ class LatencyTest:
         print(f"  Timestamp: {t1.isoformat()}")
         
         try:
-            # Simulate strategy decision (minimal processing)
             market_id = "market_btc_100k"
             token_id = "token_yes"
             side = "YES"
@@ -130,11 +119,9 @@ class LatencyTest:
             t3_ns = time.time_ns()
             t3 = datetime.utcnow()
             
-            # Calculate latencies
             latency_total_ms = (t3_ns - t1_ns) / 1_000_000
             latency_order_ms = (t3_ns - t2_ns) / 1_000_000
             
-            # Record measurement
             measurement = {
                 'tick': len(self.measurements) + 1,
                 'price_timestamp': t1,
@@ -146,7 +133,6 @@ class LatencyTest:
             }
             self.measurements.append(measurement)
             
-            # Output results
             print(f"\n  [ORDER] Execution complete")
             print(f"    Status: {'✓ SUCCESS' if result.success else '✗ FAILED'}")
             print(f"    Order ID: {result.order_id}")
@@ -154,7 +140,6 @@ class LatencyTest:
             print(f"    Tick->Order Total: {latency_total_ms:.2f} ms")
             print(f"    Order Execution:   {latency_order_ms:.2f} ms")
             
-            # Check threshold
             if latency_total_ms > 200:
                 print(f"\n  [✗] LATENCY TOO HIGH (>{latency_total_ms:.2f} ms > 200 ms threshold)")
                 print(f"      Strategy will NOT be viable in production!")
@@ -166,12 +151,6 @@ class LatencyTest:
             print(f"      Error type: {type(e).__name__}")
     
     async def run(self, duration_seconds: int = 30):
-        """
-        Run latency test.
-        
-        Args:
-            duration_seconds: How long to run test
-        """
         print("\n" + "="*60)
         print("LATENCY TEST STARTED")
         print("="*60)
@@ -182,7 +161,6 @@ class LatencyTest:
         print("\nWaiting for Binance WebSocket price updates...\n")
         
         try:
-            # Wait for test to complete or timeout
             await asyncio.wait_for(
                 self.test_complete.wait(),
                 timeout=duration_seconds
@@ -192,11 +170,9 @@ class LatencyTest:
             if len(self.measurements) == 0:
                 print(f"[✗] No price updates received - WebSocket connection issue?")
         
-        # Print summary
         await self._print_summary()
     
     async def _print_summary(self):
-        """Print test summary."""
         print("\n" + "="*60)
         print("LATENCY TEST SUMMARY")
         print("="*60)
@@ -208,7 +184,6 @@ class LatencyTest:
             print("="*60)
             return
         
-        # Calculate statistics
         latencies = [m['latency_total_ms'] for m in self.measurements]
         avg_latency = sum(latencies) / len(latencies)
         min_latency = min(latencies)
@@ -217,7 +192,6 @@ class LatencyTest:
         success_count = sum(1 for m in self.measurements if m['order_success'])
         success_rate = (success_count / len(self.measurements)) * 100
         
-        # Print table
         print(f"\nMeasurements: {len(self.measurements)}")
         print(f"\n{'Tick':<6} {'Latency (ms)':<15} {'Status':<10} {'Order ID':<15}")
         print("-" * 60)
@@ -226,11 +200,10 @@ class LatencyTest:
             status = "✓ SUCCESS" if m['order_success'] else "✗ FAILED"
             latency_str = f"{m['latency_total_ms']:.2f}"
             
-            # Color code latency
             if m['latency_total_ms'] <= 200:
-                latency_display = f"{latency_str} (✓)"  # Good
+                latency_display = f"{latency_str} (✓)"
             else:
-                latency_display = f"{latency_str} (✗)"  # Too slow
+                latency_display = f"{latency_str} (✗)"
             
             print(f"{m['tick']:<6} {latency_display:<15} {status:<10} {m['order_id'] or 'N/A':<15}")
         
@@ -241,7 +214,6 @@ class LatencyTest:
         print(f"  Max Latency:     {max_latency:.2f} ms")
         print(f"  Success Rate:    {success_rate:.1f}%")
         
-        # Final verdict
         print(f"\n" + "="*60)
         if avg_latency <= 200 and success_rate >= 80:
             print("[✓] TEST PASSED")
@@ -260,7 +232,6 @@ class LatencyTest:
         print("="*60)
     
     async def cleanup(self):
-        """Cleanup components."""
         print("\n[TEST] Cleaning up...")
         
         if self.execution:
@@ -279,18 +250,12 @@ class LatencyTest:
 
 
 async def main():
-    """
-    Run latency test.
-    """
     test = LatencyTest()
     
     try:
-        # Initialize
         await test.initialize()
-        
-        # Run test
         await test.run(duration_seconds=30)
-        
+    
     except KeyboardInterrupt:
         print("\n[!] Test interrupted by user")
     
@@ -301,7 +266,6 @@ async def main():
         traceback.print_exc()
     
     finally:
-        # Cleanup
         await test.cleanup()
 
 
