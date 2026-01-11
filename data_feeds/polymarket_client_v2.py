@@ -36,18 +36,30 @@ import logging
 import structlog
 from collections import deque
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
-from eth_account import Account
-from eth_account.messages import encode_defunct
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY, SELL
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+    POLYMARKET_AVAILABLE = True
+except ImportError:
+    POLYMARKET_AVAILABLE = False
 
-from config.settings import settings
+try:
+    from config.settings import settings
+except ImportError:
+    # Fallback settings
+    class settings:
+        POLYMARKET_PRIVATE_KEY = None
+        RATE_LIMIT_PER_SEC = 8.0
+        PAPER_TRADING = True
 
 logger = structlog.get_logger(__name__)
 
 
-class OrderSide(Enum):"""Order side enum"""
+class OrderSide(Enum):
+    """Order side enum"""
     BUY = "BUY"
     SELL = "SELL"
 
@@ -181,7 +193,8 @@ class PolymarketClientV2:
     def __init__(
         self,
         private_key: Optional[str] = None,
-        rate_limit: float = 8.0,  # requests per second (conservative)
+        api_key: Optional[str] = None,
+        rate_limit: float = 8.0,
         max_retries: int = 3,
         timeout: float = 10.0,
         paper_trading: bool = True
@@ -191,6 +204,7 @@ class PolymarketClientV2:
         
         Args:
             private_key: Ethereum private key (0x...)
+            api_key: API key (optional)
             rate_limit: Max requests per second
             max_retries: Max retry attempts
             timeout: Request timeout in seconds
@@ -200,7 +214,8 @@ class PolymarketClientV2:
         self.gamma_url = "https://gamma-api.polymarket.com"
         self.chain_id = 137  # Polygon
         
-        self.private_key = private_key or settings.POLYMARKET_PRIVATE_KEY
+        self.private_key = private_key
+        self.api_key = api_key
         self.paper_trading = paper_trading
         self.max_retries = max_retries
         self.timeout = timeout
@@ -215,7 +230,7 @@ class PolymarketClientV2:
         self.session: Optional[aiohttp.ClientSession] = None
         
         # Initialize client
-        self.client: Optional[ClobClient] = None
+        self.client: Optional[Any] = None
         self.address: Optional[str] = None
         self.can_trade = False
         
@@ -231,6 +246,11 @@ class PolymarketClientV2:
     
     def _initialize_client(self):
         """Initialize Polymarket client with authentication."""
+        if not POLYMARKET_AVAILABLE:
+            logger.warning("polymarket_sdk_not_available", message="Install py-clob-client")
+            self.can_trade = False
+            return
+        
         if not self.private_key or self.private_key == "your_private_key_here":
             logger.warning("no_private_key", mode="read_only")
             self.client = ClobClient(self.host)
@@ -263,7 +283,8 @@ class PolymarketClientV2:
                 error=str(e),
                 error_type=type(e).__name__
             )
-            self.client = ClobClient(self.host)
+            if POLYMARKET_AVAILABLE:
+                self.client = ClobClient(self.host)
             self.can_trade = False
     
     async def _ensure_session(self):
@@ -366,9 +387,10 @@ class PolymarketClientV2:
         Returns:
             List of market dictionaries
         """
+        if not self.client:
+            return []
+        
         async def _fetch():
-            # Use sync client wrapped in executor for now
-            # TODO: Implement true async API calls
             loop = asyncio.get_event_loop()
             markets = await loop.run_in_executor(
                 None,
@@ -410,6 +432,9 @@ class PolymarketClientV2:
         Returns:
             Orderbook dict with 'bids' and 'asks', or None
         """
+        if not self.client:
+            return None
+        
         async def _fetch():
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
@@ -466,7 +491,7 @@ class PolymarketClientV2:
             }
         
         # Check trading capability
-        if not self.can_trade:
+        if not self.can_trade or not self.client:
             logger.error("cannot_trade", reason="no_credentials")
             return None
         
@@ -550,7 +575,7 @@ class PolymarketClientV2:
             logger.info("paper_order_cancelled", order_id=order_id)
             return True
         
-        if not self.can_trade:
+        if not self.can_trade or not self.client:
             return False
         
         async def _cancel():
@@ -580,6 +605,9 @@ class PolymarketClientV2:
         Returns:
             Order status dict or None
         """
+        if not self.client:
+            return None
+        
         async def _fetch():
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
@@ -642,26 +670,3 @@ class PolymarketClientV2:
             total_requests=self.metrics.total_requests,
             success_rate=self.metrics.get_success_rate()
         )
-
-
-# Singleton instance
-_client_instance: Optional[PolymarketClientV2] = None
-
-
-def get_polymarket_client() -> PolymarketClientV2:
-    """
-    Get singleton Polymarket client instance.
-    
-    Returns:
-        PolymarketClientV2 instance
-    """
-    global _client_instance
-    
-    if _client_instance is None:
-        _client_instance = PolymarketClientV2(
-            private_key=settings.POLYMARKET_PRIVATE_KEY,
-            rate_limit=float(settings.RATE_LIMIT_PER_SEC),
-            paper_trading=settings.PAPER_TRADING
-        )
-    
-    return _client_instance
