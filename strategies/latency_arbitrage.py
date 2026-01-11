@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""
+Latency Arbitrage Strategy
+
+Exploits pricing delays between Binance spot prices and Polymarket prediction odds.
+
+Strategy Logic:
+1. Monitor BTC price on Binance (real-time WebSocket)
+2. Poll Polymarket "BTC to 100K" market odds
+3. Calculate implied probability from BTC price
+4. When spread > threshold: Execute trade
+5. Circuit breaker prevents runaway losses
+
+Profit Source:
+- Binance updates instantly (sub-second)
+- Polymarket lags (human traders)
+- Window: 2-10 seconds of exploitable mispricing
+"""
+
+import asyncio
+from typing import Optional, Dict
+from decimal import Decimal
+from datetime import datetime, timedelta
+import structlog
+
+from data_feeds.binance_websocket_v2 import BinanceWebSocketV2
+from data_feeds.polymarket_client_v2 import PolymarketClientV2
+from services.execution_service_v2 import ExecutionServiceV2
+from risk.circuit_breaker_v2 import CircuitBreakerV2
+from database.ledger_async import AsyncLedger
+
+logger = structlog.get_logger(__name__)
+
+
+class LatencyArbitrageEngine:
+    """
+    Production latency arbitrage strategy.
+    
+    Monitors Binance BTC price and Polymarket odds for the
+    "BTC to 100K by [date]" market, executing when mispricing detected.
+    """
+    
+    def __init__(
+        self,
+        ledger: AsyncLedger,
+        polymarket_client: PolymarketClientV2,
+        execution_service: ExecutionServiceV2,
+        circuit_breaker: CircuitBreakerV2,
+        config: Optional[Dict] = None
+    ):
+        """
+        Initialize strategy.
+        
+        Args:
+            ledger: Database ledger
+            polymarket_client: Polymarket API client
+            execution_service: Order execution service
+            circuit_breaker: Risk management
+            config: Strategy configuration
+        """
+        self.ledger = ledger
+        self.polymarket_client = polymarket_client
+        self.execution = execution_service
+        self.circuit_breaker = circuit_breaker
+        
+        # Configuration
+        self.config = config or {}
+        self.market_id = self.config.get('market_id', 'btc_to_100k')
+        self.token_id = self.config.get('token_id', 'token_yes')
+        self.min_spread_bps = self.config.get('min_spread_bps', 50)  # 0.5%
+        self.max_spread_bps = self.config.get('max_spread_bps', 500)  # 5% (sanity)
+        self.max_position_pct = self.config.get('max_position_pct', 10.0)  # 10% of equity
+        self.poll_interval = self.config.get('poll_interval', 2.0)  # Poll Polymarket every 2s
+        self.btc_target = self.config.get('btc_target', 100000)  # Target price
+        
+        # State
+        self.running = False
+        self.binance_ws: Optional[BinanceWebSocketV2] = None
+        self.latest_btc_price: Optional[Decimal] = None
+        self.latest_btc_timestamp: Optional[datetime] = None
+        self.latest_polymarket_odds: Optional[Decimal] = None
+        self.latest_polymarket_timestamp: Optional[datetime] = None
+        
+        # Metrics
+        self.signals_generated = 0
+        self.trades_executed = 0
+        self.trades_blocked = 0
+        
+        logger.info(
+            "latency_arbitrage_initialized",
+            market_id=self.market_id,
+            min_spread_bps=self.min_spread_bps,
+            max_spread_bps=self.max_spread_bps,
+            max_position_pct=self.max_position_pct
+        )
+    
+    async def start(self):
+        """Start strategy execution."""
+        logger.info("starting_latency_arbitrage_strategy")
+        
+        self.running = True
+        
+        # Start Binance WebSocket
+        self.binance_ws = BinanceWebSocketV2(
+            symbols=['BTC'],
+            on_price_update=self._on_binance_price
+        )
+        await self.binance_ws.start()
+        
+        logger.info(
+            "strategy_started",
+            market=self.market_id,
+            binance_feed="active"
+        )
+        
+        # Start main loop
+        await self._strategy_loop()
+    
+    async def stop(self):
+        """Stop strategy execution."""
+        logger.info("stopping_latency_arbitrage_strategy")
+        
+        self.running = False
+        
+        if self.binance_ws:
+            await self.binance_ws.stop()
+        
+        logger.info(
+            "strategy_stopped",
+            signals_generated=self.signals_generated,
+            trades_executed=self.trades_executed,
+            trades_blocked=self.trades_blocked
+        )
+    
+    async def _on_binance_price(self, symbol: str, price_data):
+        """Callback for Binance price updates."""
+        if symbol != 'BTC':
+            return
+        
+        self.latest_btc_price = price_data.price
+        self.latest_btc_timestamp = price_data.timestamp
+        
+        logger.debug(
+            "binance_price_update",
+            symbol=symbol,
+            price=float(price_data.price)
+        )
+    
+    async def _strategy_loop(self):
+        """
+        Main strategy loop.
+        
+        Polls Polymarket, compares to Binance, executes when opportunity detected.
+        """
+        logger.info("strategy_loop_started")
+        
+        while self.running:
+            try:
+                # Wait for initial Binance price
+                if self.latest_btc_price is None:
+                    await asyncio.sleep(0.5)
+                    continue
+                
+                # Poll Polymarket odds
+                await self._fetch_polymarket_odds()
+                
+                # Check if we have both prices
+                if self.latest_polymarket_odds is None:
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+                
+                # Calculate opportunity
+                signal = await self._calculate_signal()
+                
+                if signal:
+                    # Execute trade
+                    await self._execute_signal(signal)
+                
+                # Sleep until next poll
+                await asyncio.sleep(self.poll_interval)
+            
+            except asyncio.CancelledError:
+                logger.info("strategy_loop_cancelled")
+                break
+            
+            except Exception as e:
+                logger.error(
+                    "strategy_loop_error",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    exc_info=True
+                )
+                await asyncio.sleep(self.poll_interval)
+        
+        logger.info("strategy_loop_stopped")
+    
+    async def _fetch_polymarket_odds(self):
+        """Fetch current Polymarket odds for our target market."""
+        try:
+            # Get market data
+            market_data = await self.polymarket_client.get_market(self.market_id)
+            
+            if not market_data:
+                logger.warning(
+                    "polymarket_market_not_found",
+                    market_id=self.market_id
+                )
+                return
+            
+            # Extract YES token price (probability)
+            yes_price = market_data.get('yes_price')
+            
+            if yes_price:
+                self.latest_polymarket_odds = Decimal(str(yes_price))
+                self.latest_polymarket_timestamp = datetime.utcnow()
+                
+                logger.debug(
+                    "polymarket_odds_fetched",
+                    market_id=self.market_id,
+                    yes_price=float(yes_price)
+                )
+        
+        except Exception as e:
+            logger.error(
+                "polymarket_fetch_failed",
+                error=str(e),
+                market_id=self.market_id
+            )
+    
+    async def _calculate_signal(self) -> Optional[Dict]:
+        """
+        Calculate trading signal.
+        
+        Returns:
+            Signal dict if opportunity exists, None otherwise
+        """
+        # Calculate implied probability from BTC price
+        # If BTC is at $95k and target is $100k, probability should be ~95%
+        implied_probability = min(
+            Decimal('0.99'),
+            max(Decimal('0.01'), self.latest_btc_price / Decimal(str(self.btc_target)))
+        )
+        
+        # Calculate spread
+        # Positive spread = Polymarket underpricing (BUY opportunity)
+        # Negative spread = Polymarket overpricing (SELL opportunity)
+        spread = implied_probability - self.latest_polymarket_odds
+        spread_bps = spread * Decimal('10000')
+        
+        logger.debug(
+            "signal_calculation",
+            btc_price=float(self.latest_btc_price),
+            implied_prob=float(implied_probability),
+            polymarket_odds=float(self.latest_polymarket_odds),
+            spread_bps=float(spread_bps)
+        )
+        
+        # Check if spread exceeds threshold
+        if abs(spread_bps) < self.min_spread_bps:
+            return None
+        
+        # Sanity check: spread too large = data error
+        if abs(spread_bps) > self.max_spread_bps:
+            logger.warning(
+                "spread_too_large",
+                spread_bps=float(spread_bps),
+                max_spread_bps=self.max_spread_bps,
+                action="skipping"
+            )
+            return None
+        
+        # Determine action
+        if spread_bps > 0:
+            # Polymarket underpriced -> BUY YES
+            action = 'BUY'
+            side = 'YES'
+            target_price = self.latest_polymarket_odds + (spread / Decimal('2'))  # Mid spread
+        else:
+            # Polymarket overpriced -> SELL YES (or BUY NO)
+            action = 'SELL'
+            side = 'NO'
+            target_price = self.latest_polymarket_odds - (abs(spread) / Decimal('2'))
+        
+        self.signals_generated += 1
+        
+        signal = {
+            'action': action,
+            'side': side,
+            'spread_bps': float(spread_bps),
+            'target_price': target_price,
+            'implied_probability': implied_probability,
+            'polymarket_odds': self.latest_polymarket_odds,
+            'btc_price': self.latest_btc_price,
+            'confidence': min(1.0, abs(float(spread_bps)) / 100)  # 1 bps = 1% confidence
+        }
+        
+        logger.info(
+            "signal_generated",
+            action=action,
+            side=side,
+            spread_bps=float(spread_bps),
+            confidence=signal['confidence']
+        )
+        
+        return signal
+    
+    async def _execute_signal(self, signal: Dict):
+        """
+        Execute trading signal.
+        
+        Args:
+            signal: Signal dictionary
+        """
+        try:
+            # Get current equity
+            equity = await self.ledger.get_equity()
+            
+            # Check circuit breaker
+            can_trade = await self.circuit_breaker.can_trade(equity)
+            
+            if not can_trade:
+                logger.warning(
+                    "trade_blocked_by_circuit_breaker",
+                    state=self.circuit_breaker.state.value,
+                    reason="Circuit breaker OPEN"
+                )
+                self.trades_blocked += 1
+                return
+            
+            # Calculate position size
+            max_position_value = equity * (Decimal(str(self.max_position_pct)) / Decimal('100'))
+            target_price = signal['target_price']
+            quantity = max_position_value / target_price
+            
+            # Round to 2 decimals
+            quantity = quantity.quantize(Decimal('0.01'))
+            
+            logger.info(
+                "executing_trade",
+                action=signal['action'],
+                side=signal['side'],
+                quantity=float(quantity),
+                price=float(target_price),
+                position_value=float(quantity * target_price),
+                max_allowed=float(max_position_value)
+            )
+            
+            # Place order
+            result = await self.execution.place_order(
+                strategy="latency_arbitrage",
+                market_id=self.market_id,
+                token_id=self.token_id,
+                side=signal['side'],
+                quantity=quantity,
+                price=target_price,
+                metadata={
+                    'spread_bps': signal['spread_bps'],
+                    'btc_price': float(signal['btc_price']),
+                    'implied_prob': float(signal['implied_probability']),
+                    'polymarket_odds': float(signal['polymarket_odds']),
+                    'confidence': signal['confidence']
+                }
+            )
+            
+            if result.success:
+                self.trades_executed += 1
+                
+                logger.info(
+                    "trade_executed_successfully",
+                    order_id=result.order_id,
+                    filled_quantity=float(result.filled_quantity),
+                    filled_price=float(result.filled_price),
+                    fees=float(result.fees),
+                    execution_time_ms=result.execution_time_ms
+                )
+                
+                # Update circuit breaker (simulate small profit)
+                new_equity = await self.ledger.get_equity()
+                pnl = Decimal(str(signal['spread_bps'])) / Decimal('10000') * quantity * target_price
+                await self.circuit_breaker.record_trade_result(new_equity, pnl)
+            
+            else:
+                logger.error(
+                    "trade_execution_failed",
+                    error=result.error
+                )
+                self.trades_blocked += 1
+        
+        except Exception as e:
+            logger.error(
+                "signal_execution_error",
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True
+            )
+            self.trades_blocked += 1
+    
+    def get_metrics(self) -> Dict:
+        """Get strategy metrics."""
+        return {
+            'signals_generated': self.signals_generated,
+            'trades_executed': self.trades_executed,
+            'trades_blocked': self.trades_blocked,
+            'execution_rate': (
+                self.trades_executed / self.signals_generated
+                if self.signals_generated > 0 else 0.0
+            ),
+            'latest_btc_price': float(self.latest_btc_price) if self.latest_btc_price else None,
+            'latest_polymarket_odds': float(self.latest_polymarket_odds) if self.latest_polymarket_odds else None
+        }
