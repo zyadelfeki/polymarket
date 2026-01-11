@@ -61,7 +61,7 @@ class LatencyTest:
         
         # 3. Execution Service
         self.execution = ExecutionServiceV2(
-            api_client=self.api_client,
+            polymarket_client=self.api_client,
             ledger=self.ledger
         )
         await self.execution.start()
