@@ -1,270 +1,454 @@
 #!/usr/bin/env python3
 """
-Polymarket Bot v2 - Enhanced with Latency Arbitrage, Whale Tracking, ML
+Polymarket Latency Arbitrage Bot - Production Entry Point
 
-Strategies Implemented:
-1. Latency Arbitrage (98% win rate) - CEX ↔ Polymarket price gaps
-2. Whale Copy Trading (65% win rate) - Copy top profitable wallets
-3. Liquidity Shock Detection (75% win rate) - Insider activity signals
-4. ML Ensemble (70% win rate) - Mispricing detection
-5. Threshold Arbitrage (95% win rate) - Guaranteed outcome arbitrage
+This is the main production executable. It:
+1. Initializes database and ledger
+2. Sets up API clients
+3. Configures risk management
+4. Starts the latency arbitrage strategy
+5. Monitors health and performance
 
-Exit Strategy: 30 seconds - 5 minutes (NOT 6 hours)
-Edge Duration: Seconds to minutes (latency, not directional)
+Usage:
+    python main_v2.py --paper  # Paper trading mode
+    python main_v2.py --live   # Live trading (requires private key)
 """
 
 import asyncio
-import logging
-from datetime import datetime
+import argparse
+import signal
+import sys
+from pathlib import Path
 from decimal import Decimal
-from typing import List, Dict
+from datetime import datetime
+import structlog
+import os
 
-from config.settings import settings
-from data_feeds.binance_websocket import BinanceWebSocketFeed
-from data_feeds.polymarket_client import PolymarketClient
-from strategy.volatility_arbitrage import VolatilityArbitrageEngine
-from strategy.threshold_arbitrage import ThresholdArbitrageEngine
-from strategy.latency_arbitrage import LatencyArbitrageEngine
-from strategy.whale_tracker import WhaleTracker
-from strategy.liquidity_shock_detector import LiquidityShockDetector
-from ml_models.ensemble_predictor import EnsemblePredictor
-from risk.kelly_sizer import AdaptiveKellySizer
-from risk.circuit_breaker import CircuitBreaker
-from risk.position_manager import PositionManager
-from utils.db import db
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    handlers=[
-        logging.FileHandler('logs/bot.log'),
-        logging.StreamHandler()
-    ]
+from database.ledger_async import AsyncLedger
+from data_feeds.polymarket_client_v2 import PolymarketClientV2
+from services.execution_service_v2 import ExecutionServiceV2
+from risk.circuit_breaker_v2 import CircuitBreakerV2
+from strategies.latency_arbitrage import LatencyArbitrageEngine
+
+# Configure structured logging
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.dev.ConsoleRenderer()
+    ],
+    wrapper_class=structlog.stdlib.BoundLogger,
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    cache_logger_on_first_use=True,
 )
-logger = logging.getLogger(__name__)
 
-class PolymarketBotV2:
+logger = structlog.get_logger(__name__)
+
+
+class TradingBot:
     """
-    Production trading bot for Polymarket.
+    Main trading bot orchestrator.
     
-    Key improvements from v1:
-    1. Sub-second latency monitoring (WebSocket, not HTTP polling)
-    2. Real-time whale tracking with copy-trading
-    3. Liquidity shock detection (insider signal)
-    4. ML ensemble for mispricing
-    5. 30-sec to 5-min exits (not 6-hour holds)
-    6. Mathematical edge focus (arbitrage, not prediction)
+    Manages lifecycle of all components and handles graceful shutdown.
     """
     
-    def __init__(self):
-        # Data feeds
-        self.binance = BinanceWebSocketFeed()
-        self.polymarket = PolymarketClient()
+    def __init__(self, config: dict):
+        """
+        Initialize bot.
         
-        # Strategies
-        self.latency_arb = LatencyArbitrageEngine()
-        self.whale_tracker = WhaleTracker()
-        self.liquidity_detector = LiquidityShockDetector()
-        self.ml_model = EnsemblePredictor()
-        self.volatility_arb = VolatilityArbitrageEngine()
-        self.threshold_arb = ThresholdArbitrageEngine()
+        Args:
+            config: Configuration dictionary
+        """
+        self.config = config
+        self.running = False
         
-        # Risk management
-        self.kelly_sizer = AdaptiveKellySizer()
-        self.circuit_breaker = CircuitBreaker()
-        self.position_manager = PositionManager()
+        # Components (initialized in start())
+        self.ledger: AsyncLedger = None
+        self.polymarket_client: PolymarketClientV2 = None
+        self.execution_service: ExecutionServiceV2 = None
+        self.circuit_breaker: CircuitBreakerV2 = None
+        self.strategy: LatencyArbitrageEngine = None
         
-        # State
-        self.active_trades = []
-        self.stats = {
-            'latency_arb_trades': 0,
-            'whale_copy_trades': 0,
-            'liquidity_shock_trades': 0,
-            'ml_trades': 0,
-            'total_pnl': 0,
-            'win_count': 0,
-            'loss_count': 0
-        }
+        # Health monitoring
+        self._health_task = None
+        self._stats_task = None
     
-    async def run(self):
+    async def initialize(self):
         """
-        Main bot loop.
-        """
+        Initialize all components.
         
-        logger.info("\n" + "="*60)
-        logger.info("POLYMARKET BOT v2 STARTING")
+        Order matters:
+        1. Ledger (database)
+        2. API Client
+        3. Execution Service
+        4. Circuit Breaker
+        5. Strategy
+        """
         logger.info("="*60)
-        logger.info(f"Mode: {'PAPER TRADING' if settings.PAPER_TRADING else 'LIVE TRADING'}")
-        logger.info(f"Capital: ${settings.INITIAL_CAPITAL:.2f}")
-        logger.info(f"Strategies: Latency Arb, Whale Copy, Liquidity Shocks, ML Ensemble")
-        logger.info("="*60 + "\n")
+        logger.info("POLYMARKET LATENCY ARBITRAGE BOT V2")
+        logger.info("="*60)
+        logger.info("")
+        logger.info("initializing_bot", mode=self.config['mode'])
         
-        # Connect to data feeds
-        binance_connected = await self.binance.connect()
-        if not binance_connected:
-            logger.error("Failed to connect to Binance")
-            return
+        # 1. Initialize Ledger
+        logger.info("[1/5] Initializing database ledger...")
         
-        logger.info("✅ Connected to Binance WebSocket")
+        db_path = self.config.get('db_path', 'data/trading.db')
+        if self.config['mode'] == 'paper':
+            db_path = ':memory:'  # Use in-memory for paper trading
         
-        # Start monitoring loop
-        try:
-            await self._monitor_loop()
-        except KeyboardInterrupt:
-            logger.info("\nShutdown requested")
-        except Exception as e:
-            logger.error(f"Fatal error: {e}", exc_info=True)
-        finally:
-            await self.binance.close()
-            logger.info("Bot stopped")
+        self.ledger = AsyncLedger(
+            db_path=db_path,
+            pool_size=10,
+            cache_ttl=5
+        )
+        
+        # CRITICAL: Initialize schema before any operations
+        await self.ledger.initialize()
+        
+        # Check if we need to seed capital
+        equity = await self.ledger.get_equity()
+        if equity == 0:
+            initial_capital = Decimal(str(self.config.get('initial_capital', 10000)))
+            await self.ledger.record_deposit(
+                initial_capital,
+                f"Initial capital - {self.config['mode']} mode"
+            )
+            equity = initial_capital
+            logger.info(
+                "initial_capital_deposited",
+                amount=float(initial_capital)
+            )
+        
+        logger.info(
+            "ledger_initialized",
+            db_path=db_path,
+            equity=float(equity)
+        )
+        
+        # 2. Initialize Polymarket Client
+        logger.info("[2/5] Initializing Polymarket API client...")
+        
+        private_key = None
+        if self.config['mode'] == 'live':
+            private_key = os.getenv('POLYMARKET_PRIVATE_KEY')
+            if not private_key:
+                raise ValueError("POLYMARKET_PRIVATE_KEY environment variable required for live trading")
+        
+        self.polymarket_client = PolymarketClientV2(
+            private_key=private_key,
+            paper_trading=(self.config['mode'] == 'paper'),
+            rate_limit=10.0
+        )
+        
+        logger.info(
+            "polymarket_client_initialized",
+            mode=self.config['mode'],
+            can_trade=self.polymarket_client.can_trade
+        )
+        
+        # 3. Initialize Execution Service
+        logger.info("[3/5] Initializing execution service...")
+        
+        self.execution_service = ExecutionServiceV2(
+            polymarket_client=self.polymarket_client,
+            ledger=self.ledger,
+            config={
+                'max_retries': 3,
+                'timeout_seconds': 30
+            }
+        )
+        
+        await self.execution_service.start()
+        
+        logger.info("execution_service_initialized")
+        
+        # 4. Initialize Circuit Breaker
+        logger.info("[4/5] Initializing circuit breaker...")
+        
+        self.circuit_breaker = CircuitBreakerV2(
+            initial_equity=equity,
+            max_drawdown_pct=self.config.get('max_drawdown_pct', 15.0),
+            max_loss_streak=self.config.get('max_loss_streak', 5),
+            daily_loss_limit_pct=self.config.get('daily_loss_limit_pct', 10.0)
+        )
+        
+        logger.info(
+            "circuit_breaker_initialized",
+            max_drawdown_pct=self.config.get('max_drawdown_pct', 15.0),
+            max_loss_streak=self.config.get('max_loss_streak', 5)
+        )
+        
+        # 5. Initialize Strategy
+        logger.info("[5/5] Initializing latency arbitrage strategy...")
+        
+        self.strategy = LatencyArbitrageEngine(
+            ledger=self.ledger,
+            polymarket_client=self.polymarket_client,
+            execution_service=self.execution_service,
+            circuit_breaker=self.circuit_breaker,
+            config={
+                'market_id': self.config.get('market_id', 'btc_to_100k'),
+                'token_id': self.config.get('token_id', 'token_yes'),
+                'min_spread_bps': self.config.get('min_spread_bps', 50),
+                'max_spread_bps': self.config.get('max_spread_bps', 500),
+                'max_position_pct': self.config.get('max_position_pct', 10.0),
+                'poll_interval': self.config.get('poll_interval', 2.0),
+                'btc_target': self.config.get('btc_target', 100000)
+            }
+        )
+        
+        logger.info("strategy_initialized")
+        
+        logger.info("")
+        logger.info("="*60)
+        logger.info("ALL COMPONENTS INITIALIZED SUCCESSFULLY")
+        logger.info("="*60)
+        logger.info("")
     
-    async def _monitor_loop(self):
-        """
-        Main monitoring loop: Check for opportunities and execute trades.
-        """
+    async def start(self):
+        """Start bot execution."""
+        self.running = True
         
-        cycle_count = 0
+        logger.info("starting_bot")
+        logger.info(
+            "configuration",
+            mode=self.config['mode'],
+            market=self.config.get('market_id', 'btc_to_100k'),
+            min_spread_bps=self.config.get('min_spread_bps', 50),
+            max_position_pct=self.config.get('max_position_pct', 10.0)
+        )
         
-        while True:
-            cycle_count += 1
-            cycle_start = datetime.utcnow()
-            
+        # Start health monitoring
+        self._health_task = asyncio.create_task(self._health_monitor())
+        self._stats_task = asyncio.create_task(self._stats_reporter())
+        
+        # Start strategy
+        try:
+            await self.strategy.start()
+        
+        except asyncio.CancelledError:
+            logger.info("bot_cancelled")
+        
+        except Exception as e:
+            logger.error(
+                "bot_error",
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True
+            )
+            raise
+    
+    async def stop(self):
+        """Stop bot execution."""
+        logger.info("stopping_bot")
+        
+        self.running = False
+        
+        # Stop health monitoring
+        if self._health_task:
+            self._health_task.cancel()
+        if self._stats_task:
+            self._stats_task.cancel()
+        
+        # Stop strategy
+        if self.strategy:
+            await self.strategy.stop()
+        
+        # Stop execution service
+        if self.execution_service:
+            await self.execution_service.stop()
+        
+        # Close API client
+        if self.polymarket_client:
+            await self.polymarket_client.close()
+        
+        # Close ledger
+        if self.ledger:
+            await self.ledger.close()
+        
+        logger.info("bot_stopped")
+    
+    async def _health_monitor(self):
+        """Monitor system health."""
+        while self.running:
             try:
+                await asyncio.sleep(60)  # Every minute
+                
                 # Check circuit breaker
-                if not self.circuit_breaker.can_trade():
-                    logger.warning("Circuit breaker engaged - trading halted")
-                    await asyncio.sleep(60)
-                    continue
+                cb_status = self.circuit_breaker.get_status()
                 
-                # Fetch markets
-                markets = await self.polymarket.get_markets(limit=50)
-                if not markets:
-                    await asyncio.sleep(5)
-                    continue
-                
-                # Get current prices
-                btc_price = self.binance.get_current_price('BTC')
-                eth_price = self.binance.get_current_price('ETH')
-                sol_price = self.binance.get_current_price('SOL')
-                
-                logger.info(
-                    f"\n[Cycle {cycle_count}] "
-                    f"BTC: ${btc_price:,.0f} | "
-                    f"ETH: ${eth_price:,.0f} | "
-                    f"SOL: ${sol_price:,.0f}"
-                )
-                
-                # Strategy 1: Latency Arbitrage (30-second edge)
-                latency_opps = await self.latency_arb.detect_price_threshold_breach(
-                    symbol='BTC',
-                    exchange_price=btc_price,
-                    markets=markets
-                )
-                
-                for opp in latency_opps[:3]:  # Top 3 opportunities
-                    if opp['confidence'] > 0.60:
-                        bet_size = await self.kelly_sizer.calculate_bet_size(
-                            bankroll=Decimal(settings.INITIAL_CAPITAL),
-                            win_probability=opp['confidence'],
-                            payout_odds=1 / opp['entry_price'] if opp['entry_price'] > 0 else 2.0,
-                            edge=opp['edge']
-                        )
-                        
-                        trade = await self.latency_arb.execute_latency_trade(
-                            self.polymarket,
-                            opp,
-                            float(bet_size)
-                        )
-                        
-                        if trade and trade['success']:
-                            self.stats['latency_arb_trades'] += 1
-                            self.stats['total_pnl'] += trade['pnl']
-                            if trade['roi'] > 0:
-                                self.stats['win_count'] += 1
-                            else:
-                                self.stats['loss_count'] += 1
-                
-                # Strategy 2: Whale Copy Trading (1-5 min edge)
-                whale_signals = await self.whale_tracker.monitor_whale_trades(self.polymarket)
-                
-                for signal in whale_signals[:2]:
-                    if signal['confidence'] > 0.50:
-                        bet_size = await self.kelly_sizer.calculate_bet_size(
-                            bankroll=Decimal(settings.INITIAL_CAPITAL),
-                            win_probability=signal['whale_win_rate'],
-                            payout_odds=2.0,
-                            edge=signal['estimated_edge']
-                        )
-                        
-                        trade = await self.whale_tracker.execute_whale_copy(
-                            self.polymarket,
-                            signal,
-                            float(bet_size)
-                        )
-                        
-                        if trade:
-                            self.stats['whale_copy_trades'] += 1
-                            self.stats['total_pnl'] += trade['pnl']
-                            if trade['success']:
-                                self.stats['win_count'] += 1
-                            else:
-                                self.stats['loss_count'] += 1
-                
-                # Strategy 3: Liquidity Shock Detection (1-5 min edge)
-                shocks = await self.liquidity_detector.detect_liquidity_shocks(
-                    self.polymarket,
-                    markets
-                )
-                
-                for shock in shocks[:2]:
-                    bet_size = 20  # Small position for shock trades
-                    
-                    trade = await self.liquidity_detector.execute_shock_trade(
-                        self.polymarket,
-                        shock,
-                        bet_size
+                if cb_status['state'] == 'OPEN':
+                    logger.warning(
+                        "circuit_breaker_open",
+                        reason=cb_status.get('reason', 'unknown')
                     )
-                    
-                    if trade:
-                        self.stats['liquidity_shock_trades'] += 1
-                        self.stats['total_pnl'] += trade['pnl']
                 
-                # Strategy 4: ML Mispricing (1-5 min edge)
-                ml_opps = self.ml_model.find_mispriced_markets(markets)
-                
-                for opp in ml_opps[:2]:
-                    if opp['confidence'] > 0.50:
-                        bet_size = min(50, float(settings.INITIAL_CAPITAL * 0.02))  # 2% max
-                        
-                        logger.info(
-                            f"ML Opportunity: {opp['question'][:50]} | "
-                            f"{opp['action']} | Edge: {opp['edge']:.1%}"
-                        )
-                        
-                        self.stats['ml_trades'] += 1
-                
-                # Log cycle stats
-                cycle_time = (datetime.utcnow() - cycle_start).total_seconds()
+                # Check equity
+                equity = await self.ledger.get_equity()
                 
                 logger.info(
-                    f"  Latency Arb: {self.stats['latency_arb_trades']} trades | "
-                    f"Whale Copies: {self.stats['whale_copy_trades']} | "
-                    f"Liquidity Shocks: {self.stats['liquidity_shock_trades']} | "
-                    f"PnL: ${self.stats['total_pnl']:+.2f} | "
-                    f"W/L: {self.stats['win_count']}/{self.stats['loss_count']} | "
-                    f"Cycle time: {cycle_time:.1f}s"
+                    "health_check",
+                    equity=float(equity),
+                    circuit_breaker_state=cb_status['state']
                 )
-                
-                # Wait before next cycle (avoid rate limiting)
-                await asyncio.sleep(10)
-                
+            
+            except asyncio.CancelledError:
+                break
+            
             except Exception as e:
-                logger.error(f"Cycle error: {e}", exc_info=True)
-                await asyncio.sleep(10)
+                logger.error(
+                    "health_monitor_error",
+                    error=str(e)
+                )
+    
+    async def _stats_reporter(self):
+        """Report statistics periodically."""
+        while self.running:
+            try:
+                await asyncio.sleep(300)  # Every 5 minutes
+                
+                # Get metrics
+                strategy_metrics = self.strategy.get_metrics()
+                execution_metrics = self.execution_service.get_metrics()
+                ledger_metrics = await self.ledger.get_metrics()
+                
+                # Get positions
+                positions = await self.ledger.get_open_positions()
+                
+                logger.info(
+                    "performance_report",
+                    timestamp=datetime.utcnow().isoformat(),
+                    strategy_signals=strategy_metrics['signals_generated'],
+                    strategy_trades=strategy_metrics['trades_executed'],
+                    strategy_execution_rate=strategy_metrics['execution_rate'],
+                    execution_fill_rate=execution_metrics['fill_rate'],
+                    execution_avg_latency_ms=execution_metrics['avg_execution_time_ms'],
+                    open_positions=len(positions),
+                    total_fees=execution_metrics['total_fees']
+                )
+            
+            except asyncio.CancelledError:
+                break
+            
+            except Exception as e:
+                logger.error(
+                    "stats_reporter_error",
+                    error=str(e)
+                )
+
 
 async def main():
-    bot = PolymarketBotV2()
-    await bot.run()
+    """
+    Main entry point.
+    """
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='Polymarket Latency Arbitrage Bot')
+    parser.add_argument(
+        '--mode',
+        choices=['paper', 'live'],
+        default='paper',
+        help='Trading mode (paper or live)'
+    )
+    parser.add_argument(
+        '--capital',
+        type=float,
+        default=10000,
+        help='Initial capital (only for paper trading)'
+    )
+    parser.add_argument(
+        '--market',
+        default='btc_to_100k',
+        help='Market ID to trade'
+    )
+    parser.add_argument(
+        '--min-spread',
+        type=int,
+        default=50,
+        help='Minimum spread in basis points (default: 50 = 0.5%%)'
+    )
+    parser.add_argument(
+        '--max-position',
+        type=float,
+        default=10.0,
+        help='Maximum position size as %% of equity (default: 10%%)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Build config
+    config = {
+        'mode': args.mode,
+        'initial_capital': args.capital,
+        'market_id': args.market,
+        'min_spread_bps': args.min_spread,
+        'max_position_pct': args.max_position,
+        'db_path': 'data/trading.db' if args.mode == 'live' else ':memory:'
+    }
+    
+    # Create bot
+    bot = TradingBot(config)
+    
+    # Setup signal handlers for graceful shutdown
+    def signal_handler(sig, frame):
+        logger.info("shutdown_signal_received", signal=sig)
+        asyncio.create_task(bot.stop())
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        # Initialize
+        await bot.initialize()
+        
+        # Start
+        await bot.start()
+    
+    except KeyboardInterrupt:
+        logger.info("keyboard_interrupt_received")
+    
+    except Exception as e:
+        logger.error(
+            "fatal_error",
+            error=str(e),
+            error_type=type(e).__name__,
+            exc_info=True
+        )
+        raise
+    
+    finally:
+        # Cleanup
+        await bot.stop()
+        
+        # Print final summary
+        logger.info("")
+        logger.info("="*60)
+        logger.info("BOT SHUTDOWN COMPLETE")
+        logger.info("="*60)
+
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    print("\n" + "="*60)
+    print("POLYMARKET LATENCY ARBITRAGE BOT V2")
+    print("="*60)
+    print("\nInitializing...\n")
+    
+    try:
+        asyncio.run(main())
+    
+    except KeyboardInterrupt:
+        print("\n\nShutdown complete.")
+    
+    except Exception as e:
+        print(f"\n\nFATAL ERROR: {e}")
+        sys.exit(1)
+    
+    print("\n" + "="*60)
+    print("EXECUTION COMPLETE")
+    print("="*60 + "\n")
