@@ -67,6 +67,8 @@ class DryRun:
         # 1. Ledger (in-memory for testing)
         logger.info("Initializing ledger...")
         self.ledger = AsyncLedger(db_path=":memory:", pool_size=5)
+        
+        # CRITICAL: Ensure pool and schema are initialized
         await self.ledger.pool.initialize()
         
         # Initial capital
@@ -106,7 +108,7 @@ class DryRun:
         # 4. Execution Service
         logger.info("Initializing execution service...")
         self.execution = ExecutionServiceV2(
-            api_client=self.api_client,
+            polymarket_client=self.api_client,
             ledger=self.ledger
         )
         await self.execution.start()
@@ -247,14 +249,13 @@ class DryRun:
                     order_id=result.order_id,
                     status=result.status.value,
                     filled_quantity=float(result.filled_quantity),
-                    average_price=float(result.average_fill_price) if result.average_fill_price else None,
+                    average_price=float(result.filled_price) if result.filled_price else None,
                     fees=float(result.fees)
                 )
             else:
                 logger.error(
                     "order_execution_failed",
-                    error=result.error,
-                    message=result.message
+                    error=result.error
                 )
                 return
             
@@ -277,10 +278,10 @@ class DryRun:
                 latest_position = positions[-1]
                 logger.info(
                     "position_opened",
-                    position_id=latest_position['id'],
-                    market=latest_position['market_id'],
-                    quantity=float(latest_position['quantity']),
-                    entry_price=float(latest_position['entry_price'])
+                    position_id=latest_position.id,
+                    market=latest_position.market_id,
+                    quantity=float(latest_position.quantity),
+                    entry_price=float(latest_position.entry_price)
                 )
             
             # STEP 6: Update Circuit Breaker
