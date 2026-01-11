@@ -10,8 +10,8 @@ This is the main production executable. It:
 5. Monitors health and performance
 
 Usage:
-    python main_v2.py --paper  # Paper trading mode
-    python main_v2.py --live   # Live trading (requires private key)
+    python main_v2.py --mode paper --capital 10000
+    python main_v2.py --mode live
 """
 
 import asyncio
@@ -109,7 +109,7 @@ class TradingBot:
             cache_ttl=5
         )
         
-        # CRITICAL: Initialize schema before any operations
+        # CRITICAL: Initialize schema BEFORE any database operations
         await self.ledger.initialize()
         
         # Check if we need to seed capital
