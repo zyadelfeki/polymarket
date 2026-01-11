@@ -83,21 +83,25 @@ class TradingBot:
         """
         Initialize all components.
         
-        Order matters:
-        1. Ledger (database)
-        2. API Client
-        3. Execution Service
-        4. Circuit Breaker
-        5. Strategy
+        Critical Order:
+        1. Create Ledger and initialize schema
+        2. Initialize API Client
+        3. Seed initial capital (paper mode)
+        4. Initialize Execution Service
+        5. Initialize Circuit Breaker
+        6. Initialize Strategy
         """
         logger.info("="*60)
         logger.info("POLYMARKET LATENCY ARBITRAGE BOT V2")
         logger.info("="*60)
         logger.info("")
         logger.info("initializing_bot", mode=self.config['mode'])
+        logger.info("")
         
-        # 1. Initialize Ledger
-        logger.info("[1/5] Initializing database ledger...")
+        # ================================================================
+        # STEP 1: Initialize Database Ledger
+        # ================================================================
+        logger.info("[1/6] Initializing database ledger...")
         
         db_path = self.config.get('db_path', 'data/trading.db')
         if self.config['mode'] == 'paper':
@@ -109,31 +113,21 @@ class TradingBot:
             cache_ttl=5
         )
         
-        # CRITICAL: Initialize schema BEFORE any database operations
+        # CRITICAL: Initialize schema FIRST - creates all tables
+        logger.info("Initializing database schema...")
         await self.ledger.initialize()
-        
-        # Check if we need to seed capital
-        equity = await self.ledger.get_equity()
-        if equity == 0:
-            initial_capital = Decimal(str(self.config.get('initial_capital', 10000)))
-            await self.ledger.record_deposit(
-                initial_capital,
-                f"Initial capital - {self.config['mode']} mode"
-            )
-            equity = initial_capital
-            logger.info(
-                "initial_capital_deposited",
-                amount=float(initial_capital)
-            )
+        logger.info("Database schema initialized successfully")
         
         logger.info(
-            "ledger_initialized",
-            db_path=db_path,
-            equity=float(equity)
+            "ledger_ready",
+            db_path=db_path
         )
         
-        # 2. Initialize Polymarket Client
-        logger.info("[2/5] Initializing Polymarket API client...")
+        # ================================================================
+        # STEP 2: Initialize Polymarket Client
+        # ================================================================
+        logger.info("")
+        logger.info("[2/6] Initializing Polymarket API client...")
         
         private_key = None
         if self.config['mode'] == 'live':
@@ -148,13 +142,55 @@ class TradingBot:
         )
         
         logger.info(
-            "polymarket_client_initialized",
+            "polymarket_client_ready",
             mode=self.config['mode'],
             can_trade=self.polymarket_client.can_trade
         )
         
-        # 3. Initialize Execution Service
-        logger.info("[3/5] Initializing execution service...")
+        # ================================================================
+        # STEP 3: Seed Initial Capital (Paper Mode Only)
+        # ================================================================
+        logger.info("")
+        logger.info("[3/6] Checking initial capital...")
+        
+        equity = await self.ledger.get_equity()
+        logger.info(f"Current equity: ${float(equity):.2f}")
+        
+        if equity == 0:
+            if self.config['mode'] == 'paper':
+                initial_capital = Decimal(str(self.config.get('initial_capital', 10000)))
+                logger.info(f"Depositing initial paper capital: ${float(initial_capital):.2f}")
+                
+                await self.ledger.record_deposit(
+                    initial_capital,
+                    f"Initial paper trading capital - {datetime.utcnow().isoformat()}"
+                )
+                
+                equity = await self.ledger.get_equity()
+                logger.info(
+                    "initial_capital_deposited",
+                    amount=float(initial_capital),
+                    new_equity=float(equity)
+                )
+            else:
+                logger.warning(
+                    "no_equity_in_live_mode",
+                    message="Starting with zero equity in live mode"
+                )
+        else:
+            logger.info(f"Using existing equity: ${float(equity):.2f}")
+        
+        logger.info(
+            "capital_ready",
+            equity=float(equity),
+            mode=self.config['mode']
+        )
+        
+        # ================================================================
+        # STEP 4: Initialize Execution Service
+        # ================================================================
+        logger.info("")
+        logger.info("[4/6] Initializing execution service...")
         
         self.execution_service = ExecutionServiceV2(
             polymarket_client=self.polymarket_client,
@@ -167,10 +203,13 @@ class TradingBot:
         
         await self.execution_service.start()
         
-        logger.info("execution_service_initialized")
+        logger.info("execution_service_ready")
         
-        # 4. Initialize Circuit Breaker
-        logger.info("[4/5] Initializing circuit breaker...")
+        # ================================================================
+        # STEP 5: Initialize Circuit Breaker
+        # ================================================================
+        logger.info("")
+        logger.info("[5/6] Initializing circuit breaker...")
         
         self.circuit_breaker = CircuitBreakerV2(
             initial_equity=equity,
@@ -180,13 +219,16 @@ class TradingBot:
         )
         
         logger.info(
-            "circuit_breaker_initialized",
+            "circuit_breaker_ready",
             max_drawdown_pct=self.config.get('max_drawdown_pct', 15.0),
             max_loss_streak=self.config.get('max_loss_streak', 5)
         )
         
-        # 5. Initialize Strategy
-        logger.info("[5/5] Initializing latency arbitrage strategy...")
+        # ================================================================
+        # STEP 6: Initialize Strategy
+        # ================================================================
+        logger.info("")
+        logger.info("[6/6] Initializing latency arbitrage strategy...")
         
         self.strategy = LatencyArbitrageEngine(
             ledger=self.ledger,
@@ -204,26 +246,32 @@ class TradingBot:
             }
         )
         
-        logger.info("strategy_initialized")
+        logger.info("strategy_ready")
         
+        # ================================================================
+        # Initialization Complete
+        # ================================================================
         logger.info("")
         logger.info("="*60)
         logger.info("ALL COMPONENTS INITIALIZED SUCCESSFULLY")
         logger.info("="*60)
+        logger.info("")
+        logger.info("System Status:")
+        logger.info(f"  Mode: {self.config['mode']}")
+        logger.info(f"  Equity: ${float(equity):.2f}")
+        logger.info(f"  Market: {self.config.get('market_id', 'btc_to_100k')}")
+        logger.info(f"  Min Spread: {self.config.get('min_spread_bps', 50)} bps")
+        logger.info(f"  Max Position: {self.config.get('max_position_pct', 10.0)}%")
         logger.info("")
     
     async def start(self):
         """Start bot execution."""
         self.running = True
         
-        logger.info("starting_bot")
-        logger.info(
-            "configuration",
-            mode=self.config['mode'],
-            market=self.config.get('market_id', 'btc_to_100k'),
-            min_spread_bps=self.config.get('min_spread_bps', 50),
-            max_position_pct=self.config.get('max_position_pct', 10.0)
-        )
+        logger.info("="*60)
+        logger.info("STARTING TRADING BOT")
+        logger.info("="*60)
+        logger.info("")
         
         # Start health monitoring
         self._health_task = asyncio.create_task(self._health_monitor())
@@ -247,7 +295,10 @@ class TradingBot:
     
     async def stop(self):
         """Stop bot execution."""
-        logger.info("stopping_bot")
+        logger.info("")
+        logger.info("="*60)
+        logger.info("STOPPING TRADING BOT")
+        logger.info("="*60)
         
         self.running = False
         
@@ -322,17 +373,20 @@ class TradingBot:
                 # Get positions
                 positions = await self.ledger.get_open_positions()
                 
-                logger.info(
-                    "performance_report",
-                    timestamp=datetime.utcnow().isoformat(),
-                    strategy_signals=strategy_metrics['signals_generated'],
-                    strategy_trades=strategy_metrics['trades_executed'],
-                    strategy_execution_rate=strategy_metrics['execution_rate'],
-                    execution_fill_rate=execution_metrics['fill_rate'],
-                    execution_avg_latency_ms=execution_metrics['avg_execution_time_ms'],
-                    open_positions=len(positions),
-                    total_fees=execution_metrics['total_fees']
-                )
+                logger.info("")
+                logger.info("="*60)
+                logger.info("PERFORMANCE REPORT")
+                logger.info("="*60)
+                logger.info(f"Timestamp: {datetime.utcnow().isoformat()}")
+                logger.info(f"Signals Generated: {strategy_metrics['signals_generated']}")
+                logger.info(f"Trades Executed: {strategy_metrics['trades_executed']}")
+                logger.info(f"Execution Rate: {strategy_metrics['execution_rate']:.2%}")
+                logger.info(f"Fill Rate: {execution_metrics['fill_rate']:.2%}")
+                logger.info(f"Avg Latency: {execution_metrics['avg_execution_time_ms']:.2f}ms")
+                logger.info(f"Open Positions: {len(positions)}")
+                logger.info(f"Total Fees: ${execution_metrics['total_fees']:.2f}")
+                logger.info("="*60)
+                logger.info("")
             
             except asyncio.CancelledError:
                 break
