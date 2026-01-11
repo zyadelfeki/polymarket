@@ -11,6 +11,7 @@ Features:
 - Comprehensive error handling
 - Metrics tracking
 - Database health monitoring
+- Automatic schema initialization
 
 Standards:
 - Double-entry accounting enforced
@@ -30,6 +31,79 @@ import structlog
 import time
 
 logger = structlog.get_logger(__name__)
+
+# Embedded schema for automatic initialization
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_name TEXT NOT NULL UNIQUE,
+    account_type TEXT NOT NULL CHECK(account_type IN ('ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE')),
+    balance DECIMAL(20, 8) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT OR IGNORE INTO accounts (account_name, account_type) VALUES
+    ('Cash', 'ASSET'),
+    ('Positions', 'ASSET'),
+    ('Trading Fees', 'EXPENSE'),
+    ('Owner Equity', 'EQUITY'),
+    ('Trading Revenue', 'REVENUE');
+
+CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    description TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS transaction_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
+    amount DECIMAL(20, 8) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (transaction_id) REFERENCES transactions(id),
+    FOREIGN KEY (account_id) REFERENCES accounts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transaction_lines_txn ON transaction_lines(transaction_id);
+CREATE INDEX IF NOT EXISTS idx_transaction_lines_account ON transaction_lines(account_id);
+
+CREATE TABLE IF NOT EXISTS positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    entry_price DECIMAL(10, 6) NOT NULL,
+    quantity DECIMAL(20, 8) NOT NULL,
+    current_price DECIMAL(10, 6),
+    unrealized_pnl DECIMAL(20, 8) DEFAULT 0,
+    realized_pnl DECIMAL(20, 8) DEFAULT 0,
+    status TEXT DEFAULT 'OPEN' CHECK(status IN ('OPEN', 'CLOSED')),
+    entry_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    exit_timestamp TIMESTAMP,
+    order_id TEXT,
+    metadata TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_update_account_balance_insert
+AFTER INSERT ON transaction_lines
+BEGIN
+    UPDATE accounts
+    SET balance = balance + NEW.amount
+    WHERE id = NEW.account_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_update_account_balance_delete
+AFTER DELETE ON transaction_lines
+BEGIN
+    UPDATE accounts
+    SET balance = balance - OLD.amount
+    WHERE id = OLD.account_id;
+END;
+"""
 
 
 @dataclass
@@ -75,7 +149,7 @@ class ConnectionPool:
         self.lock = asyncio.Lock()
     
     async def initialize(self):
-        """Initialize connection pool."""
+        """Initialize connection pool and create schema if needed."""
         if self._initialized:
             return
         
@@ -83,14 +157,45 @@ class ConnectionPool:
             if self._initialized:  # Double-check
                 return
             
-            for _ in range(self.pool_size):
+            # Create first connection and initialize schema
+            first_conn = await aiosqlite.connect(
+                self.db_path,
+                isolation_level=None
+            )
+            
+            try:
+                # Enable WAL mode and foreign keys
+                await first_conn.execute("PRAGMA foreign_keys = ON")
+                await first_conn.execute("PRAGMA journal_mode = WAL")
+                
+                # Execute schema
+                await first_conn.executescript(SCHEMA_SQL)
+                await first_conn.commit()
+                
+                logger.info(
+                    "database_schema_initialized",
+                    db_path=self.db_path
+                )
+            
+            except Exception as e:
+                logger.error(
+                    "schema_initialization_failed",
+                    error=str(e),
+                    error_type=type(e).__name__
+                )
+                await first_conn.close()
+                raise
+            
+            # Add first connection to pool
+            await self.connections.put(first_conn)
+            
+            # Create remaining connections
+            for _ in range(self.pool_size - 1):
                 conn = await aiosqlite.connect(
                     self.db_path,
-                    isolation_level=None  # Auto-commit off
+                    isolation_level=None
                 )
-                # Enable foreign keys
                 await conn.execute("PRAGMA foreign_keys = ON")
-                # WAL mode for better concurrency
                 await conn.execute("PRAGMA journal_mode = WAL")
                 await self.connections.put(conn)
             
@@ -133,6 +238,7 @@ class AsyncLedger:
     - Prepared statements everywhere
     - Transaction batching support
     - Comprehensive metrics
+    - Automatic schema initialization
     """
     
     def __init__(
