@@ -60,7 +60,13 @@ class TradingBot:
         
         # STEP 1: Database
         print("[1/6] Initializing database...")
-        db_path = ':memory:' if self.config['mode'] == 'paper' else self.config.get('db_path', 'data/trading.db')
+        
+        # CRITICAL: :memory: databases are per-connection in SQLite
+        # For paper trading with connection pooling, use a temp file instead
+        if self.config['mode'] == 'paper':
+            db_path = 'file:memdb1?mode=memory&cache=shared'  # Shared memory DB
+        else:
+            db_path = self.config.get('db_path', 'data/trading.db')
         
         self.ledger = AsyncLedger(db_path=db_path, pool_size=10, cache_ttl=5)
         
@@ -259,8 +265,14 @@ async def main():
     
     bot = TradingBot(config)
     
+    # Signal handler must be async-aware
+    loop = asyncio.get_event_loop()
+    
     def signal_handler(sig, frame):
-        asyncio.create_task(bot.stop())
+        """Handle shutdown signals gracefully."""
+        logger.info("shutdown_signal_received", signal=sig)
+        # Create task in the running event loop
+        loop.create_task(bot.stop())
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)

@@ -181,8 +181,20 @@ class BinanceWebSocketV2:
                     pass
         
         # Close WebSocket
-        if self.websocket and not self.websocket.closed:
-            await self.websocket.close()
+        if self.websocket:
+            try:
+                # Check if connection is open before trying to close
+                if hasattr(self.websocket, 'closed'):
+                    if not self.websocket.closed:
+                        await self.websocket.close()
+                else:
+                    # For ClientConnection objects, just try to close
+                    await self.websocket.close()
+            except Exception as e:
+                logger.warning(
+                    "websocket_close_error",
+                    error=str(e)
+                )
         
         logger.info(
             "binance_websocket_stopped",

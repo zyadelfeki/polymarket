@@ -228,25 +228,44 @@ class ConnectionPool:
                 db_path=self.db_path
             )
             
-            # Create first connection and initialize schema
-            first_conn = await aiosqlite.connect(
+            # CRITICAL FIX: Create temporary connection for schema initialization
+            # This ensures schema is visible to all subsequent connections
+            temp_conn = await aiosqlite.connect(
                 self.db_path,
                 isolation_level=None
             )
             
             try:
                 # Enable WAL mode and foreign keys
-                await first_conn.execute("PRAGMA foreign_keys = ON")
-                await first_conn.execute("PRAGMA journal_mode = WAL")
+                await temp_conn.execute("PRAGMA foreign_keys = ON")
+                await temp_conn.execute("PRAGMA journal_mode = WAL")
                 
                 # Execute schema
-                await first_conn.executescript(schema_sql)
-                await first_conn.commit()
+                await temp_conn.executescript(schema_sql)
+                await temp_conn.commit()
+                
+                # CRITICAL: Force a checkpoint to ensure WAL is applied to main DB
+                # This makes schema visible to all new connections
+                await temp_conn.execute("PRAGMA wal_checkpoint(FULL)")
+                await temp_conn.commit()
+                
+                # Verify tables exist
+                cursor = await temp_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+                )
+                tables = await cursor.fetchall()
+                table_names = [t[0] for t in tables]
+                
+                if 'accounts' not in table_names:
+                    raise RuntimeError("Critical: 'accounts' table not created!")
+                if 'transactions' not in table_names:
+                    raise RuntimeError("Critical: 'transactions' table not created!")
                 
                 logger.info(
                     "database_schema_initialized",
                     db_path=self.db_path,
-                    schema_source=schema_source
+                    schema_source=schema_source,
+                    tables=table_names
                 )
             
             except Exception as e:
@@ -256,21 +275,42 @@ class ConnectionPool:
                     error_type=type(e).__name__,
                     exc_info=True
                 )
-                await first_conn.close()
+                await temp_conn.close()
                 raise
             
-            # Add first connection to pool
-            await self.connections.put(first_conn)
+            finally:
+                # Close temporary connection - don't add to pool
+                await temp_conn.close()
             
-            # Create remaining connections
-            for _ in range(self.pool_size - 1):
+            # CRITICAL FIX: Small delay to ensure filesystem sync (especially on Windows)
+            await asyncio.sleep(0.1)
+            
+            # NOW create pool connections - schema is guaranteed visible
+            logger.info("creating_connection_pool", pool_size=self.pool_size)
+            
+            for i in range(self.pool_size):
                 conn = await aiosqlite.connect(
                     self.db_path,
                     isolation_level=None
                 )
                 await conn.execute("PRAGMA foreign_keys = ON")
                 await conn.execute("PRAGMA journal_mode = WAL")
+                
+                # Verify this connection can see tables
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+                )
+                table_count = (await cursor.fetchone())[0]
+                
+                if table_count == 0:
+                    await conn.close()
+                    raise RuntimeError(
+                        f"Connection {i} cannot see database tables! "
+                        "This indicates a critical race condition."
+                    )
+                
                 await self.connections.put(conn)
+                logger.debug(f"connection_{i}_added", table_count=table_count)
             
             self._initialized = True
             logger.info(
@@ -503,7 +543,7 @@ class AsyncLedger:
                 INSERT INTO transaction_lines (transaction_id, account_id, amount)
                 VALUES (?, (SELECT id FROM accounts WHERE account_name='Cash'), ?)
                 """,
-                (tx_id, float(amount))
+                (tx_id, str(amount))  # Use str() for exact Decimal precision
             )
             
             # Credit: Equity account
@@ -512,7 +552,7 @@ class AsyncLedger:
                 INSERT INTO transaction_lines (transaction_id, account_id, amount)
                 VALUES (?, (SELECT id FROM accounts WHERE account_name='Owner Equity'), ?)
                 """,
-                (tx_id, -float(amount))
+                (tx_id, str(-amount))  # Use str() for exact Decimal precision
             )
             
             await conn.commit()
@@ -585,9 +625,9 @@ class AsyncLedger:
                     market_id,
                     token_id,
                     strategy,
-                    float(entry_price),
-                    float(quantity),
-                    float(entry_price),  # Initial current price
+                    str(entry_price),  # Use str() for exact Decimal precision
+                    str(quantity),     # Use str() for exact Decimal precision
+                    str(entry_price),  # Initial current price
                     datetime.utcnow().isoformat(),
                     order_id,
                     str(metadata) if metadata else None
@@ -610,7 +650,7 @@ class AsyncLedger:
                 INSERT INTO transaction_lines (transaction_id, account_id, amount)
                 VALUES (?, (SELECT id FROM accounts WHERE account_name='Positions'), ?)
                 """,
-                (tx_id, float(cost))
+                (tx_id, str(cost))  # Use str() for exact Decimal precision
             )
             
             # Credit: Cash
@@ -619,7 +659,7 @@ class AsyncLedger:
                 INSERT INTO transaction_lines (transaction_id, account_id, amount)
                 VALUES (?, (SELECT id FROM accounts WHERE account_name='Cash'), ?)
                 """,
-                (tx_id, -float(cost))
+                (tx_id, str(-cost))  # Use str() for exact Decimal precision
             )
             
             await conn.commit()
@@ -711,7 +751,7 @@ class AsyncLedger:
                         unrealized_pnl = (? - entry_price) * quantity
                     WHERE token_id = ? AND status = 'OPEN'
                     """,
-                    (float(price), float(price), token_id)
+                    (str(price), str(price), token_id)  # Use str() for exact Decimal precision
                 )
             
             await conn.commit()

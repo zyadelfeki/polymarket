@@ -595,6 +595,52 @@ class PolymarketClientV2:
         
         return success
     
+    async def get_market(self, market_id: str) -> Optional[Dict]:
+        """
+        Get single market by ID or slug.
+        
+        Args:
+            market_id: Market ID or slug (e.g., 'btc_to_100k')
+        
+        Returns:
+            Market dict or None
+        """
+        # For paper trading, return mock data
+        if self.paper_trading or not self.client:
+            logger.debug("returning_mock_market_data", market_id=market_id)
+            return {
+                "market_id": market_id,
+                "question": f"Mock market: {market_id}",
+                "yes_price": 0.50,  # 50% probability
+                "no_price": 0.50,
+                "volume": 10000.0,
+                "liquidity": 5000.0,
+                "active": True,
+                "closed": False,
+                "mock": True
+            }
+        
+        # Try to find market in markets list
+        async def _fetch():
+            markets = await self.get_markets(limit=1000)
+            
+            # Search by ID or slug
+            for market in markets:
+                if (market.get('id') == market_id or 
+                    market.get('slug') == market_id or
+                    market.get('condition_id') == market_id):
+                    return market
+            
+            # Not found
+            logger.warning("market_not_found", market_id=market_id)
+            return None
+        
+        success, result = await self._retry_with_backoff(_fetch)
+        
+        if success:
+            return result
+        return None
+    
     async def get_order_status(self, order_id: str) -> Optional[Dict]:
         """
         Get order status.
