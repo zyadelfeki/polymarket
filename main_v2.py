@@ -104,6 +104,37 @@ class TradingBot:
         )
         print(f"  ✓ Client ready (paper={self.config['mode'] == 'paper'})")
         
+        # STEP 2.5: Sync wallet balance for live mode
+        if self.config['mode'] == 'live':
+            print("\n[2.5/6] Syncing wallet balance...")
+            try:
+                wallet_balance = await self.polymarket_client.get_usdc_balance()
+                logger.info("live_wallet_balance", amount=float(wallet_balance))
+                print(f"  - Wallet USDC balance: ${float(wallet_balance):.2f}")
+                
+                # Check local ledger
+                local_equity = await self.ledger.get_equity()
+                print(f"  - Local ledger equity: ${float(local_equity):.2f}")
+                
+                if local_equity == 0 and wallet_balance > 0:
+                    print(f"  - Syncing ${float(wallet_balance):.2f} to ledger...")
+                    await self.ledger.record_deposit(wallet_balance, "Initial Wallet Sync")
+                    print(f"  ✓ Wallet synced to ledger")
+                elif abs(local_equity - wallet_balance) > Decimal('0.01'):
+                    logger.warning(
+                        "wallet_ledger_mismatch",
+                        wallet_balance=float(wallet_balance),
+                        ledger_equity=float(local_equity),
+                        difference=float(abs(wallet_balance - local_equity))
+                    )
+                    print(f"  ⚠ Warning: Wallet and ledger mismatch by ${float(abs(wallet_balance - local_equity)):.2f}")
+                else:
+                    print(f"  ✓ Wallet and ledger in sync")
+            except Exception as e:
+                logger.error("wallet_sync_failed", error=str(e))
+                print(f"  ⚠ Wallet sync failed: {e}")
+                print(f"  - Continuing with manual capital initialization...")
+        
         # STEP 3: Initial Capital
         print("\n[3/6] Setting up capital...")
         equity = await self.ledger.get_equity()
