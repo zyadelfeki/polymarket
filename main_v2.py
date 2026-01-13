@@ -12,6 +12,7 @@ from decimal import Decimal
 from datetime import datetime
 import structlog
 import os
+import logging
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -20,20 +21,6 @@ from data_feeds.polymarket_client_v2 import PolymarketClientV2
 from services.execution_service_v2 import ExecutionServiceV2
 from risk.circuit_breaker_v2 import CircuitBreakerV2
 from strategies.latency_arbitrage import LatencyArbitrageEngine
-
-structlog.configure(
-    processors=[
-        structlog.stdlib.add_log_level,
-        structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.dev.ConsoleRenderer()
-    ],
-    wrapper_class=structlog.stdlib.BoundLogger,
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    cache_logger_on_first_use=True,
-)
 
 logger = structlog.get_logger(__name__)
 
@@ -49,6 +36,7 @@ class TradingBot:
         self.strategy: LatencyArbitrageEngine = None
         self._health_task = None
         self._stats_task = None
+        self._heartbeat_task = None
     
     async def initialize(self):
         print("\n" + "="*60)
@@ -56,6 +44,7 @@ class TradingBot:
         print("="*60)
         print(f"Mode: {self.config['mode']}")
         print(f"Capital: ${self.config['initial_capital']:.2f}")
+        print(f"Debug: {self.config.get('debug', False)}")
         print("="*60 + "\n")
         
         # STEP 1: Database
@@ -161,7 +150,8 @@ class TradingBot:
                 'max_spread_bps': self.config.get('max_spread_bps', 500),
                 'max_position_pct': self.config.get('max_position_pct', 10.0),
                 'poll_interval': self.config.get('poll_interval', 2.0),
-                'btc_target': self.config.get('btc_target', 100000)
+                'btc_target': self.config.get('btc_target', 100000),
+                'debug': self.config.get('debug', False)
             }
         )
         print("  ✓ Strategy ready")
@@ -178,6 +168,9 @@ class TradingBot:
     async def start(self):
         self.running = True
         print("Starting strategy...\n")
+        
+        heartbeat_interval = 10 if self.config.get('debug', False) else 30
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_monitor(heartbeat_interval))
         self._health_task = asyncio.create_task(self._health_monitor())
         self._stats_task = asyncio.create_task(self._stats_reporter())
         
@@ -193,6 +186,8 @@ class TradingBot:
         logger.info("stopping_bot")
         self.running = False
         
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
         if self._health_task:
             self._health_task.cancel()
         if self._stats_task:
@@ -207,6 +202,38 @@ class TradingBot:
             await self.ledger.close()
         
         logger.info("bot_stopped")
+    
+    async def _heartbeat_monitor(self, interval: int):
+        """Periodic heartbeat to show the bot is alive"""
+        while self.running:
+            try:
+                await asyncio.sleep(interval)
+                
+                equity = await self.ledger.get_equity()
+                positions = await self.ledger.get_open_positions()
+                
+                metrics = self.strategy.get_metrics() if self.strategy else {}
+                
+                logger.info(
+                    "heartbeat",
+                    status="active",
+                    equity=float(equity),
+                    open_positions=len(positions),
+                    signals=metrics.get('signals_generated', 0),
+                    trades=metrics.get('trades_executed', 0)
+                )
+                
+                if self.config.get('debug', False):
+                    logger.debug(
+                        "heartbeat_debug",
+                        last_check=datetime.now().isoformat(),
+                        circuit_breaker=self.circuit_breaker.get_status()['state']
+                    )
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("heartbeat_error", error=str(e))
     
     async def _health_monitor(self):
         while self.running:
@@ -223,9 +250,11 @@ class TradingBot:
                 logger.error("health_monitor_error", error=str(e))
     
     async def _stats_reporter(self):
+        report_interval = 60 if self.config.get('debug', False) else 300
+        
         while self.running:
             try:
-                await asyncio.sleep(300)
+                await asyncio.sleep(report_interval)
                 strategy_metrics = self.strategy.get_metrics()
                 execution_metrics = self.execution_service.get_metrics()
                 positions = await self.ledger.get_open_positions()
@@ -254,7 +283,30 @@ async def main():
     parser.add_argument('--min-spread', type=int, default=50)
     parser.add_argument('--max-spread', type=int, default=500, help="Maximum spread in bps (safety cap)")
     parser.add_argument('--max-position', type=float, default=10.0)
+    parser.add_argument('--debug', action='store_true', help="Enable verbose debug logs")
     args = parser.parse_args()
+    
+    # Configure logging level
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.dev.ConsoleRenderer()
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=False,
+    )
+    
+    logging.basicConfig(
+        level=log_level,
+        format='%(message)s'
+    )
     
     config = {
         'mode': args.mode,
@@ -263,6 +315,7 @@ async def main():
         'min_spread_bps': args.min_spread,
         'max_spread_bps': args.max_spread,
         'max_position_pct': args.max_position,
+        'debug': args.debug,
         'db_path': 'data/trading.db' if args.mode == 'live' else ':memory:'
     }
     
