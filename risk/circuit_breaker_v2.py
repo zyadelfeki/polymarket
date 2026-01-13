@@ -235,15 +235,22 @@ class CircuitBreakerV2:
         if current_equity > self.peak_equity:
             self.peak_equity = current_equity
         
+        # CRITICAL FIX: Prevent division by zero
+        if self.peak_equity == 0:
+            logger.warning("circuit_breaker_zero_equity", message="Peak equity is zero, skipping state update")
+            return
+        
         # Calculate drawdown
         drawdown_pct = float(
             (self.peak_equity - current_equity) / self.peak_equity * 100
         )
         
         # Calculate daily loss
-        daily_loss_pct = float(
-            (self.daily_start_equity - current_equity) / self.daily_start_equity * 100
-        )
+        daily_loss_pct = 0.0
+        if self.daily_start_equity > 0:
+            daily_loss_pct = float(
+                (self.daily_start_equity - current_equity) / self.daily_start_equity * 100
+            )
         
         # Check trip conditions
         if self.state == CircuitState.CLOSED:
