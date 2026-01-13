@@ -668,6 +668,44 @@ class PolymarketClientV2:
             return result
         return None
     
+    async def get_usdc_balance(self) -> Decimal:
+        """
+        Get USDC balance from wallet.
+        
+        Returns:
+            USDC balance as Decimal
+        """
+        # Paper trading: return 0
+        if self.paper_trading:
+            logger.debug("paper_trading_balance_query", balance=0)
+            return Decimal('0')
+        
+        # Check trading capability
+        if not self.can_trade or not self.client or not self.address:
+            logger.error("cannot_get_balance", reason="no_credentials")
+            return Decimal('0')
+        
+        async def _fetch():
+            loop = asyncio.get_event_loop()
+            # Get balance from client
+            balances = await loop.run_in_executor(
+                None,
+                self.client.get_balances
+            )
+            
+            # USDC balance is in the balances dict
+            usdc_balance = balances.get('USDC', 0)
+            return Decimal(str(usdc_balance))
+        
+        success, result = await self._retry_with_backoff(_fetch)
+        
+        if success:
+            logger.info("usdc_balance_fetched", balance=float(result))
+            return result
+        else:
+            logger.error("usdc_balance_fetch_failed")
+            return Decimal('0')
+    
     async def health_check(self) -> bool:
         """
         Perform health check by fetching server time.
