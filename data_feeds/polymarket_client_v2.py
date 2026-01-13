@@ -233,6 +233,7 @@ class PolymarketClientV2:
         self.client: Optional[Any] = None
         self.address: Optional[str] = None
         self.can_trade = False
+        self.credentials_derived = False
         
         self._initialize_client()
         
@@ -269,12 +270,13 @@ class PolymarketClientV2:
             account = Account.from_key(self.private_key)
             self.address = account.address
             
-            # Set up API credentials for live trading
-            if not self.paper_trading:
-                api_creds = self.client.create_or_derive_api_creds()
-                self.client.set_api_creds(api_creds)
-                logger.info("api_credentials_configured", address=self.address)
+            logger.info(
+                "client_initialized",
+                address=self.address,
+                paper_trading=self.paper_trading
+            )
             
+            # Mark as ready (credentials will be derived on first use)
             self.can_trade = True
             
         except Exception as e:
@@ -286,6 +288,65 @@ class PolymarketClientV2:
             if POLYMARKET_AVAILABLE:
                 self.client = ClobClient(self.host)
             self.can_trade = False
+    
+    async def derive_api_credentials(self) -> bool:
+        """
+        Derive API credentials from private key.
+        
+        This must be called before making authenticated requests in live mode.
+        
+        Returns:
+            True if credentials derived successfully
+        """
+        if self.paper_trading:
+            logger.debug("skipping_credential_derivation", reason="paper_trading")
+            return True
+        
+        if self.credentials_derived:
+            logger.debug("credentials_already_derived")
+            return True
+        
+        if not self.client or not self.can_trade:
+            logger.error("cannot_derive_credentials", reason="client_not_initialized")
+            return False
+        
+        try:
+            logger.info("deriving_api_credentials", address=self.address)
+            
+            # Run in executor since this is a blocking operation
+            loop = asyncio.get_event_loop()
+            api_creds = await loop.run_in_executor(
+                None,
+                self.client.create_or_derive_api_creds
+            )
+            
+            # Set credentials on client
+            await loop.run_in_executor(
+                None,
+                self.client.set_api_creds,
+                api_creds
+            )
+            
+            self.credentials_derived = True
+            
+            logger.info(
+                "api_credentials_derived",
+                address=self.address,
+                has_api_key=bool(api_creds.get('apiKey')),
+                has_secret=bool(api_creds.get('secret')),
+                has_passphrase=bool(api_creds.get('passphrase'))
+            )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(
+                "credential_derivation_failed",
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True
+            )
+            return False
     
     async def _ensure_session(self):
         """Ensure aiohttp session exists."""
@@ -495,6 +556,13 @@ class PolymarketClientV2:
             logger.error("cannot_trade", reason="no_credentials")
             return None
         
+        # Ensure credentials are derived
+        if not self.credentials_derived:
+            success = await self.derive_api_credentials()
+            if not success:
+                logger.error("cannot_trade", reason="credential_derivation_failed")
+                return None
+        
         # Validate inputs
         if not (Decimal('0.01') <= price <= Decimal('0.99')):
             logger.error(
@@ -578,6 +646,10 @@ class PolymarketClientV2:
         if not self.can_trade or not self.client:
             return False
         
+        # Ensure credentials are derived
+        if not self.credentials_derived:
+            await self.derive_api_credentials()
+        
         async def _cancel():
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
@@ -654,6 +726,10 @@ class PolymarketClientV2:
         if not self.client:
             return None
         
+        # Ensure credentials are derived for live mode
+        if not self.paper_trading and not self.credentials_derived:
+            await self.derive_api_credentials()
+        
         async def _fetch():
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
@@ -682,8 +758,16 @@ class PolymarketClientV2:
         
         # Check trading capability
         if not self.can_trade or not self.client or not self.address:
-            logger.error("cannot_get_balance", reason="no_credentials")
+            logger.error("cannot_get_balance", reason="client_not_initialized")
             return Decimal('0')
+        
+        # CRITICAL: Ensure credentials are derived before querying balance
+        if not self.credentials_derived:
+            logger.info("deriving_credentials_for_balance_check")
+            success = await self.derive_api_credentials()
+            if not success:
+                logger.error("cannot_get_balance", reason="credential_derivation_failed")
+                return Decimal('0')
         
         async def _fetch():
             loop = asyncio.get_event_loop()
@@ -741,7 +825,8 @@ class PolymarketClientV2:
             "current_rpm": self.metrics.get_current_rpm(),
             "rate_limit_hits": self.metrics.rate_limit_hits,
             "can_trade": self.can_trade,
-            "paper_trading": self.paper_trading
+            "paper_trading": self.paper_trading,
+            "credentials_derived": self.credentials_derived
         }
     
     async def close(self):
