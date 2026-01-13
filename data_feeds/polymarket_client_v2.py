@@ -234,19 +234,21 @@ class PolymarketClientV2:
         self.address: Optional[str] = None
         self.can_trade = False
         self.credentials_derived = False
+        self._initialized = False
         
         self._initialize_client()
         
         logger.info(
-            "polymarket_client_initialized",
+            "polymarket_client_constructed",
             address=self.address,
             can_trade=self.can_trade,
             paper_trading=self.paper_trading,
-            rate_limit=rate_limit
+            rate_limit=rate_limit,
+            requires_initialization=not self.paper_trading
         )
     
     def _initialize_client(self):
-        """Initialize Polymarket client with authentication."""
+        """Initialize Polymarket client with authentication (synchronous part)."""
         if not POLYMARKET_AVAILABLE:
             logger.warning("polymarket_sdk_not_available", message="Install py-clob-client")
             self.can_trade = False
@@ -271,12 +273,12 @@ class PolymarketClientV2:
             self.address = account.address
             
             logger.info(
-                "client_initialized",
+                "clob_client_created",
                 address=self.address,
                 paper_trading=self.paper_trading
             )
             
-            # Mark as ready (credentials will be derived on first use)
+            # Mark as ready (but still needs async initialization for live mode)
             self.can_trade = True
             
         except Exception as e:
@@ -288,6 +290,46 @@ class PolymarketClientV2:
             if POLYMARKET_AVAILABLE:
                 self.client = ClobClient(self.host)
             self.can_trade = False
+    
+    async def initialize(self) -> bool:
+        """
+        Complete async initialization (must be called after construction).
+        
+        For live mode, this derives API credentials immediately.
+        
+        Returns:
+            True if initialization successful
+        """
+        if self._initialized:
+            logger.debug("client_already_initialized")
+            return True
+        
+        logger.info(
+            "initializing_polymarket_client",
+            paper_trading=self.paper_trading,
+            has_private_key=bool(self.private_key),
+            has_client=bool(self.client)
+        )
+        
+        # For live mode, derive credentials NOW (not lazily)
+        if not self.paper_trading and self.can_trade:
+            logger.info("live_mode_forcing_credential_derivation")
+            success = await self.derive_api_credentials()
+            if not success:
+                logger.error("client_initialization_failed", reason="credential_derivation_failed")
+                return False
+            logger.info("live_mode_initialization_complete", credentials_derived=self.credentials_derived)
+        
+        self._initialized = True
+        logger.info(
+            "polymarket_client_initialized",
+            address=self.address,
+            can_trade=self.can_trade,
+            paper_trading=self.paper_trading,
+            credentials_derived=self.credentials_derived
+        )
+        
+        return True
     
     async def derive_api_credentials(self) -> bool:
         """
@@ -311,16 +353,31 @@ class PolymarketClientV2:
             return False
         
         try:
-            logger.info("deriving_api_credentials", address=self.address)
+            logger.info(
+                "deriving_api_credentials_START",
+                address=self.address,
+                timestamp=datetime.utcnow().isoformat()
+            )
             
             # Run in executor since this is a blocking operation
             loop = asyncio.get_event_loop()
+            
+            logger.debug("calling_create_or_derive_api_creds")
             api_creds = await loop.run_in_executor(
                 None,
                 self.client.create_or_derive_api_creds
             )
             
+            logger.info(
+                "api_creds_received",
+                has_apiKey=bool(api_creds.get('apiKey')),
+                has_secret=bool(api_creds.get('secret')),
+                has_passphrase=bool(api_creds.get('passphrase')),
+                apiKey_prefix=api_creds.get('apiKey', '')[:8] + "..." if api_creds.get('apiKey') else None
+            )
+            
             # Set credentials on client
+            logger.debug("setting_api_creds_on_client")
             await loop.run_in_executor(
                 None,
                 self.client.set_api_creds,
@@ -330,20 +387,20 @@ class PolymarketClientV2:
             self.credentials_derived = True
             
             logger.info(
-                "api_credentials_derived",
+                "deriving_api_credentials_SUCCESS",
                 address=self.address,
-                has_api_key=bool(api_creds.get('apiKey')),
-                has_secret=bool(api_creds.get('secret')),
-                has_passphrase=bool(api_creds.get('passphrase'))
+                credentials_set=True,
+                timestamp=datetime.utcnow().isoformat()
             )
             
             return True
             
         except Exception as e:
             logger.error(
-                "credential_derivation_failed",
+                "deriving_api_credentials_FAILED",
                 error=str(e),
                 error_type=type(e).__name__,
+                address=self.address,
                 exc_info=True
             )
             return False
@@ -558,6 +615,7 @@ class PolymarketClientV2:
         
         # Ensure credentials are derived
         if not self.credentials_derived:
+            logger.warning("credentials_not_derived_placing_order", action="deriving_now")
             success = await self.derive_api_credentials()
             if not success:
                 logger.error("cannot_trade", reason="credential_derivation_failed")
@@ -751,6 +809,15 @@ class PolymarketClientV2:
         Returns:
             USDC balance as Decimal
         """
+        logger.debug(
+            "get_usdc_balance_called",
+            paper_trading=self.paper_trading,
+            can_trade=self.can_trade,
+            has_client=bool(self.client),
+            has_address=bool(self.address),
+            credentials_derived=self.credentials_derived
+        )
+        
         # Paper trading: return 0
         if self.paper_trading:
             logger.debug("paper_trading_balance_query", balance=0)
@@ -758,24 +825,42 @@ class PolymarketClientV2:
         
         # Check trading capability
         if not self.can_trade or not self.client or not self.address:
-            logger.error("cannot_get_balance", reason="client_not_initialized")
+            logger.error(
+                "cannot_get_balance",
+                reason="client_not_initialized",
+                can_trade=self.can_trade,
+                has_client=bool(self.client),
+                has_address=bool(self.address)
+            )
             return Decimal('0')
         
         # CRITICAL: Ensure credentials are derived before querying balance
         if not self.credentials_derived:
-            logger.info("deriving_credentials_for_balance_check")
+            logger.warning("credentials_not_derived_in_balance_check", action="deriving_now")
             success = await self.derive_api_credentials()
             if not success:
                 logger.error("cannot_get_balance", reason="credential_derivation_failed")
                 return Decimal('0')
         
+        # Double-check client has credentials
+        try:
+            # Try to check if client has creds attribute
+            if hasattr(self.client, 'creds') and not self.client.creds:
+                logger.warning("client_creds_missing", action="re_deriving")
+                await self.derive_api_credentials()
+        except Exception as e:
+            logger.debug("creds_check_skipped", error=str(e))
+        
         async def _fetch():
+            logger.debug("fetching_balance_from_api")
             loop = asyncio.get_event_loop()
             # Get balance from client
             balances = await loop.run_in_executor(
                 None,
                 self.client.get_balances
             )
+            
+            logger.debug("balances_received", keys=list(balances.keys()) if isinstance(balances, dict) else None)
             
             # USDC balance is in the balances dict
             usdc_balance = balances.get('USDC', 0)
@@ -826,7 +911,8 @@ class PolymarketClientV2:
             "rate_limit_hits": self.metrics.rate_limit_hits,
             "can_trade": self.can_trade,
             "paper_trading": self.paper_trading,
-            "credentials_derived": self.credentials_derived
+            "credentials_derived": self.credentials_derived,
+            "initialized": self._initialized
         }
     
     async def close(self):
