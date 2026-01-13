@@ -171,6 +171,7 @@ class TradingBot:
         print("="*60)
         print(f"Equity: ${float(equity):.2f}")
         print(f"Min Spread: {self.config.get('min_spread_bps', 50)} bps")
+        print(f"Max Spread: {self.config.get('max_spread_bps', 500)} bps")
         print(f"Max Position: {self.config.get('max_position_pct', 10.0)}%")
         print("="*60 + "\n")
     
@@ -251,6 +252,7 @@ async def main():
     parser.add_argument('--capital', type=float, default=10000)
     parser.add_argument('--market', default='btc_to_100k')
     parser.add_argument('--min-spread', type=int, default=50)
+    parser.add_argument('--max-spread', type=int, default=500, help="Maximum spread in bps (safety cap)")
     parser.add_argument('--max-position', type=float, default=10.0)
     args = parser.parse_args()
     
@@ -259,6 +261,7 @@ async def main():
         'initial_capital': args.capital,
         'market_id': args.market,
         'min_spread_bps': args.min_spread,
+        'max_spread_bps': args.max_spread,
         'max_position_pct': args.max_position,
         'db_path': 'data/trading.db' if args.mode == 'live' else ':memory:'
     }
