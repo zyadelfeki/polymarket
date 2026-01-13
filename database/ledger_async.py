@@ -172,6 +172,13 @@ class ConnectionPool:
         self.connections: asyncio.Queue = asyncio.Queue(maxsize=pool_size)
         self._initialized = False
         self.lock = asyncio.Lock()
+        
+        # CRITICAL: Ensure database directory exists
+        if self.db_path not in (':memory:', '') and not self.db_path.startswith('file:'):
+            db_dir = os.path.dirname(self.db_path)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir, exist_ok=True)
+                logger.info("database_directory_created", path=db_dir)
     
     async def initialize(self):
         """Initialize connection pool and create schema if needed."""
@@ -368,6 +375,13 @@ class AsyncLedger:
             pool_size: Number of connections in pool
             cache_ttl: Cache TTL in seconds
         """
+        # CRITICAL: Ensure database directory exists before anything else
+        if db_path not in (':memory:', '') and not db_path.startswith('file:'):
+            db_dir = os.path.dirname(db_path)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir, exist_ok=True)
+                logger.info("database_directory_created", path=db_dir)
+        
         self.db_path = db_path
         self.pool = ConnectionPool(db_path, pool_size)
         
