@@ -22,10 +22,11 @@ Standards:
 
 import asyncio
 import time
+import uuid
 from typing import Dict, Optional, List, Any
 from decimal import Decimal
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 try:
     import structlog
@@ -37,6 +38,8 @@ from collections import defaultdict
 
 from data_feeds.polymarket_client_v2 import PolymarketClientV2, OrderSide
 from database.ledger_async import AsyncLedger
+from services.error_codes import ErrorCode
+from services.idempotency import IdempotencyCache, IdempotencyKeyBuilder
 
 if _structlog_available:
     logger = structlog.get_logger(__name__)
@@ -125,6 +128,10 @@ class OrderResult:
     fees: Decimal = Decimal('0')
     fills: List[Fill] = field(default_factory=list)
     error: Optional[str] = None
+    error_code: Optional[str] = None
+    correlation_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    is_duplicate: bool = False
     slippage_bps: float = 0.0
     execution_time_ms: float = 0.0
     
@@ -138,24 +145,13 @@ class OrderResult:
             OrderStatus.EXPIRED
         ]
 
+    def __getitem__(self, item: str):
+        return getattr(self, item)
 
-class OrderResultDict(dict):
-    """Dict-like order result that preserves attribute access."""
+    def get(self, item: str, default=None):
+        return getattr(self, item, default)
 
-    def __getattr__(self, item):
-        try:
-            return self[item]
-        except KeyError as exc:
-            raise AttributeError(item) from exc
 
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __delattr__(self, item):
-        try:
-            del self[item]
-        except KeyError as exc:
-            raise AttributeError(item) from exc
 
 
 class OrderState:
@@ -245,7 +241,8 @@ class ExecutionServiceV2:
         self,
         polymarket_client: PolymarketClientV2,
         ledger: AsyncLedger,
-        config: Optional[Dict] = None
+        config: Optional[Dict] = None,
+        idempotency_cache: Optional[IdempotencyCache] = None
     ):
         self.client = polymarket_client
         self.ledger = ledger
@@ -267,6 +264,8 @@ class ExecutionServiceV2:
         self.total_slippage_bps = 0.0
         self.total_fees = Decimal('0')
         self.execution_times_ms: List[float] = []
+
+        self._idempotency_cache = idempotency_cache or IdempotencyCache(ttl_seconds=300)
         
         self._monitor_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -275,23 +274,9 @@ class ExecutionServiceV2:
             "execution_service_initialized",
             max_retries=self.max_retries,
             timeout_seconds=self.timeout_seconds,
-            paper_trading=self.client.paper_trading
+            paper_trading=getattr(self.client, "paper_trading", False)
         )
 
-    def _result_dict(self, result: OrderResult) -> OrderResultDict:
-        return OrderResultDict({
-            "success": result.success,
-            "order_id": result.order_id,
-            "status": result.status,
-            "filled_quantity": result.filled_quantity,
-            "filled_price": result.filled_price,
-            "fees": result.fees,
-            "fills": result.fills,
-            "error": result.error,
-            "slippage_bps": result.slippage_bps,
-            "execution_time_ms": result.execution_time_ms,
-        })
-    
     async def start(self):
         """Start background monitoring tasks."""
         self._monitor_task = asyncio.create_task(self._fill_monitor_loop())
@@ -315,9 +300,44 @@ class ExecutionServiceV2:
         quantity: Decimal,
         price: Decimal,
         order_type: str = "GTC",
-        metadata: Optional[Dict] = None
-    ) -> OrderResultDict:
+        metadata: Optional[Dict] = None,
+        correlation_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None
+    ) -> OrderResult:
         start_time = time.time()
+        correlation_id = correlation_id or str(uuid.uuid4())
+        is_paper_trading = getattr(self.client, "paper_trading", False)
+
+        idempotency_key = IdempotencyKeyBuilder.build(
+            strategy=strategy,
+            market_id=market_id,
+            side=str(side),
+            quantity=quantity,
+            price=price,
+            override_key=idempotency_key
+        )
+
+        cached_result = self._idempotency_cache.get(idempotency_key)
+        if cached_result is not None:
+            cached_copy = replace(
+                cached_result,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
+                is_duplicate=True
+            )
+            logger.info(
+                "order_deduplicated_cache_hit",
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
+                cached_order_id=cached_copy.order_id,
+                cached_success=cached_copy.success,
+                strategy=strategy,
+                market_id=market_id,
+                side=side,
+                quantity=str(quantity),
+                price=str(price)
+            )
+            return cached_copy
         
         try:
             side_str = side.value if isinstance(side, OrderSide) else str(side)
@@ -330,25 +350,36 @@ class ExecutionServiceV2:
                 quantity=quantity,
                 price=price,
                 order_type=order_type,
-                metadata=metadata or {}
+                metadata={
+                    **(metadata or {}),
+                    "correlation_id": correlation_id,
+                    "idempotency_key": idempotency_key,
+                }
             )
         except ValueError as e:
             logger.error("invalid_order_request", error=str(e))
-            return self._result_dict(OrderResult(
+            result = OrderResult(
                 success=False,
                 status=OrderStatus.REJECTED,
-                error=str(e)
-            ))
+                error=str(e),
+                error_code=ErrorCode.INVALID_PRICE.value if "price" in str(e).lower() else ErrorCode.INVALID_QUANTITY.value,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
+                is_duplicate=False
+            )
+            self._idempotency_cache.set(idempotency_key, result)
+            return result
         
         for attempt in range(self.max_retries):
             try:
                 response = await self.client.place_order(
                     token_id=token_id,
                     side=order_side,
-                    price=float(price),
-                    size=float(quantity),
+                    price=price,
+                    size=quantity,
                     order_type=order_type,
-                    market_id=market_id
+                    market_id=market_id,
+                    correlation_id=correlation_id
                 )
                 
                 if not response or not isinstance(response, dict) or not response.get('success'):
@@ -357,11 +388,17 @@ class ExecutionServiceV2:
                         continue
                     else:
                         self.orders_failed += 1
-                        return self._result_dict(OrderResult(
+                        result = OrderResult(
                             success=False,
                             status=OrderStatus.FAILED,
-                            error=response.get('error') if isinstance(response, dict) else "Order submission failed"
-                        ))
+                            error=response.get('error') if isinstance(response, dict) else "Order submission failed",
+                            error_code=ErrorCode.ORDER_SUBMISSION_FAILED.value,
+                            correlation_id=correlation_id,
+                            idempotency_key=idempotency_key,
+                            is_duplicate=False
+                        )
+                        self._idempotency_cache.set(idempotency_key, result)
+                        return result
                 
                 order_id = response['order_id']
                 
@@ -374,7 +411,7 @@ class ExecutionServiceV2:
                 self.orders_placed += 1
                 
                 # PAPER TRADING: Simulate instant fill
-                if self.client.paper_trading:
+                if is_paper_trading:
                     fill = Fill(
                         fill_id=f"fill_{order_id}",
                         order_id=order_id,
@@ -389,7 +426,8 @@ class ExecutionServiceV2:
                         "paper_fill_simulated",
                         order_id=order_id,
                         quantity=float(quantity),
-                        price=float(price)
+                        price=float(price),
+                        correlation_id=correlation_id
                     )
                 else:
                     # LIVE TRADING: Wait for real fills
@@ -410,12 +448,17 @@ class ExecutionServiceV2:
                 
                 self.total_fees += order_state.total_fees
                 
-                if order_state.status == OrderStatus.FILLED:
-                    await self._record_trade_in_ledger(order_state)
-                    self.orders_filled += 1
+                if order_state.filled_quantity > 0:
+                    await self._record_trade_in_ledger(
+                        order_state,
+                        correlation_id=correlation_id,
+                        idempotency_key=idempotency_key
+                    )
+                    if order_state.status == OrderStatus.FILLED:
+                        self.orders_filled += 1
                 
                 result = OrderResult(
-                    success=(order_state.status == OrderStatus.FILLED),
+                    success=(order_state.filled_quantity > 0),
                     order_id=order_id,
                     status=order_state.status,
                     filled_quantity=order_state.filled_quantity,
@@ -423,7 +466,10 @@ class ExecutionServiceV2:
                     fees=order_state.total_fees,
                     fills=order_state.fills,
                     slippage_bps=slippage_bps,
-                    execution_time_ms=execution_time_ms
+                    execution_time_ms=execution_time_ms,
+                    correlation_id=correlation_id,
+                    idempotency_key=idempotency_key,
+                    is_duplicate=False
                 )
                 
                 logger.info(
@@ -434,33 +480,48 @@ class ExecutionServiceV2:
                     avg_price=float(order_state.avg_fill_price),
                     fees=float(order_state.total_fees),
                     slippage_bps=slippage_bps,
-                    execution_time_ms=execution_time_ms
+                    execution_time_ms=execution_time_ms,
+                    correlation_id=correlation_id
                 )
                 
-                return self._result_dict(result)
+                self._idempotency_cache.set(idempotency_key, result)
+                return result
             
             except Exception as e:
                 logger.error(
                     "order_execution_error",
                     error=str(e),
-                    attempt=attempt + 1
+                    attempt=attempt + 1,
+                    correlation_id=correlation_id
                 )
                 
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
                 else:
                     self.orders_failed += 1
-                    return self._result_dict(OrderResult(
+                    result = OrderResult(
                         success=False,
                         status=OrderStatus.FAILED,
-                        error=str(e)
-                    ))
+                        error=str(e),
+                        error_code=ErrorCode.NETWORK_ERROR.value,
+                        correlation_id=correlation_id,
+                        idempotency_key=idempotency_key,
+                        is_duplicate=False
+                    )
+                    self._idempotency_cache.set(idempotency_key, result)
+                    return result
         
-        return self._result_dict(OrderResult(
+        result = OrderResult(
             success=False,
             status=OrderStatus.FAILED,
-            error="Unknown error"
-        ))
+            error="Unknown error",
+            error_code=ErrorCode.UNKNOWN.value,
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key,
+            is_duplicate=False
+        )
+        self._idempotency_cache.set(idempotency_key, result)
+        return result
     
     async def _wait_for_fills(
         self,
@@ -510,7 +571,12 @@ class ExecutionServiceV2:
         
         return order_state.status == OrderStatus.FILLED
     
-    async def _record_trade_in_ledger(self, order_state: OrderState):
+    async def _record_trade_in_ledger(
+        self,
+        order_state: OrderState,
+        correlation_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None
+    ):
         try:
             position_id = await self.ledger.record_trade_entry(
                 market_id=order_state.request.market_id,
@@ -520,13 +586,19 @@ class ExecutionServiceV2:
                 quantity=order_state.filled_quantity,
                 fees=order_state.total_fees,
                 order_id=order_state.order_id,
-                metadata=order_state.request.metadata
+                metadata={
+                    **(order_state.request.metadata or {}),
+                    "correlation_id": correlation_id,
+                    "idempotency_key": idempotency_key,
+                }
             )
             
             logger.info(
                 "trade_recorded_in_ledger",
                 position_id=position_id,
-                order_id=order_state.order_id
+                order_id=order_state.order_id,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key
             )
         
         except Exception as e:

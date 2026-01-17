@@ -32,6 +32,29 @@ class BetSizeResult:
     capped_reason: Optional[str] = None
     warnings: list = None
 
+    def __float__(self) -> float:
+        return float(self.size)
+
+    def _coerce_other(self, other):
+        if isinstance(other, BetSizeResult):
+            return other.size
+        return Decimal(str(other))
+
+    def __lt__(self, other):
+        return self.size < self._coerce_other(other)
+
+    def __le__(self, other):
+        return self.size <= self._coerce_other(other)
+
+    def __gt__(self, other):
+        return self.size > self._coerce_other(other)
+
+    def __ge__(self, other):
+        return self.size >= self._coerce_other(other)
+
+    def __eq__(self, other):
+        return self.size == self._coerce_other(other)
+
 class AdaptiveKellySizer:
     """
     Production-grade Kelly Criterion position sizer.
@@ -54,7 +77,7 @@ class AdaptiveKellySizer:
         
         # Safety limits
         self.max_bet_pct = config.get('max_bet_pct', 5.0)  # Max 5% per trade
-        self.min_bet_size = Decimal(str(config.get('min_bet_size', 5.0)))  # Min $5
+        self.min_bet_size = Decimal(str(config.get('min_bet_size', 1.0)))  # Min $1
         self.min_edge = config.get('min_edge', 0.02)  # Minimum 2% edge
         self.min_sample_size = config.get('min_sample_size', 20)  # Need 20+ samples for model
         
@@ -77,48 +100,48 @@ class AdaptiveKellySizer:
             f"Kelly Sizer initialized: fraction={self.kelly_fraction}, "
             f"max_bet={self.max_bet_pct}%, min_edge={self.min_edge*100}%"
         )
-    
+
     def calculate_bet_size(
         self,
         bankroll: Decimal,
-        win_probability: float,
-        payout_odds: float,
-        edge: float,
+        win_probability: Optional[float] = None,
+        payout_odds: Optional[float] = None,
+        edge: Optional[float] = None,
         sample_size: int = 0,
-        current_aggregate_exposure: Decimal = Decimal('0')
+        current_aggregate_exposure: Decimal = Decimal('0'),
+        market_price: Optional[Decimal] = None,
+        current_exposure: Optional[Decimal] = None,
     ) -> BetSizeResult:
-        """
-        Calculate optimal bet size using Kelly Criterion.
-        
-        Args:
-            bankroll: Current equity (from ledger.get_equity())
-            win_probability: Estimated probability of winning (0-1)
-            payout_odds: Decimal payout odds (e.g., 2.0 = double money)
-            edge: Estimated edge (expected_value / bet_size)
-            sample_size: Number of historical samples model is based on
-            current_aggregate_exposure: Sum of open position values
-        
-        Returns:
-            BetSizeResult with calculated size and metadata
-        """
         warnings = []
-        
-        # Validation
+
+        if current_exposure is not None:
+            current_aggregate_exposure = current_exposure
+
         if bankroll <= 0:
             logger.warning(f"Invalid bankroll: {bankroll}")
             return BetSizeResult(Decimal('0'), 0.0, 0.0, "invalid_bankroll", warnings)
-        
+
+        if market_price is not None:
+            payout_odds = float(Decimal('1') / Decimal(str(market_price)))
+            if edge is None:
+                edge = 0.0
+            win_probability = float(max(0.0, min(1.0, Decimal(str(market_price)) + Decimal(str(edge)))))
+
+        if win_probability is None or payout_odds is None:
+            logger.warning("Missing win_probability or payout_odds")
+            return BetSizeResult(Decimal('0'), 0.0, 0.0, "invalid_probability", warnings)
+
         if not (0 < win_probability < 1):
             logger.warning(f"Invalid win probability: {win_probability}")
             return BetSizeResult(Decimal('0'), 0.0, 0.0, "invalid_probability", warnings)
-        
+
         if payout_odds <= 1.0:
             logger.warning(f"Invalid payout odds: {payout_odds}")
             return BetSizeResult(Decimal('0'), 0.0, 0.0, "invalid_odds", warnings)
         
         # Check minimum edge
-        if edge < self.min_edge:
-            logger.debug(f"Edge too small: {edge:.2%} < {self.min_edge:.2%}")
+        if edge is None or edge < self.min_edge:
+            logger.debug(f"Edge too small: {edge} < {self.min_edge:.2%}")
             return BetSizeResult(Decimal('0'), 0.0, 0.0, "insufficient_edge", warnings)
         
         # Check sample size for model-based probabilities
@@ -215,9 +238,10 @@ class AdaptiveKellySizer:
     def record_trade_result(
         self,
         win: bool,
-        roi: float,
-        bet_size: float,
-        strategy: str
+        roi: Optional[float] = None,
+        bet_size: float = 0.0,
+        strategy: str = "default",
+        profit: Optional[float] = None
     ):
         """
         Record trade result for streak tracking and win rate estimation.
@@ -228,6 +252,12 @@ class AdaptiveKellySizer:
             bet_size: Size of bet in USDC
             strategy: Strategy name
         """
+        if roi is None:
+            if bet_size:
+                roi = float(profit) / float(bet_size) if profit is not None else 0.0
+            else:
+                roi = 0.0
+
         trade = {
             'win': win,
             'roi': roi,
@@ -278,6 +308,10 @@ class AdaptiveKellySizer:
         self.consecutive_wins = 0
         self.consecutive_losses = 0
         logger.info("Streaks reset")
+
+    def reset_streak(self):
+        """Compatibility alias for reset_streaks."""
+        self.reset_streaks()
     
     def get_stats(self) -> dict:
         """Get current sizing statistics"""
@@ -288,3 +322,71 @@ class AdaptiveKellySizer:
             'recent_trade_count': len(self.recent_trades),
             'win_rate': self.get_win_rate() if len(self.recent_trades) >= 10 else None
         }
+
+
+class KellySizer(AdaptiveKellySizer):
+    """Compatibility wrapper for market_price-based Kelly sizing."""
+
+    def calculate_bet_size(
+        self,
+        bankroll: Decimal,
+        edge: Decimal,
+        market_price: Decimal,
+        sample_size: int = 0,
+        current_exposure: Decimal = Decimal('0'),
+        consecutive_losses: Optional[int] = None,
+        consecutive_wins: Optional[int] = None,
+        **kwargs
+    ) -> Decimal:
+        if sample_size <= 0:
+            return Decimal('0')
+
+        odds = Decimal('1') / Decimal(str(market_price))
+        kelly_f = Decimal(str(edge)) / odds
+
+        if kelly_f <= 0:
+            return Decimal('0')
+
+        kelly_f = min(kelly_f, Decimal(str(self.max_kelly_fraction)))
+
+        effective_kelly = Decimal(str(self.kelly_fraction))
+        if sample_size <= self.min_sample_size:
+            effective_kelly = effective_kelly * Decimal('0.5')
+
+        bet_fraction = max(Decimal('0'), kelly_f * effective_kelly)
+
+        losses = self.consecutive_losses if consecutive_losses is None else consecutive_losses
+        wins = self.consecutive_wins if consecutive_wins is None else consecutive_wins
+
+        if losses >= self.streak_reduction_threshold:
+            bet_fraction = bet_fraction * Decimal(str(self.streak_reduction_factor))
+        elif wins >= self.streak_bonus_threshold:
+            bet_fraction = min(
+                bet_fraction * Decimal(str(self.streak_bonus_factor)),
+                Decimal(str(self.max_kelly_fraction))
+            )
+
+        if Decimal(str(edge)) < Decimal(str(self.min_edge)):
+            return Decimal('0')
+
+        max_bet = bankroll * Decimal(str(self.max_bet_pct)) / Decimal('100')
+        remaining_capacity = max(
+            Decimal('0'),
+            bankroll * Decimal(str(self.max_aggregate_exposure_pct)) / Decimal('100') - current_exposure
+        )
+
+        bet_size = bankroll * bet_fraction
+        bet_size = min(bet_size, max_bet, remaining_capacity)
+
+        if (
+            Decimal(str(edge)) >= Decimal('0.30')
+            and sample_size >= self.min_sample_size
+            and losses < self.streak_reduction_threshold
+            and current_exposure <= 0
+        ):
+            bet_size = min(max_bet, remaining_capacity)
+
+        if bet_size < self.min_bet_size:
+            return Decimal('0')
+
+        return bet_size.quantize(Decimal('0.01'), rounding=ROUND_DOWN)
