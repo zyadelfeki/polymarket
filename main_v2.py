@@ -13,6 +13,10 @@ from datetime import datetime
 import structlog
 import os
 import logging
+from dotenv import load_dotenv
+
+# Load environment variables BEFORE any config initialization
+load_dotenv(override=True)
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -175,7 +179,8 @@ class TradingBot:
             execution_service=self.execution_service,
             circuit_breaker=self.circuit_breaker,
             config={
-                'market_id': self.config.get('market_id', 'btc_to_100k'),
+                # Market: "Will the price of Bitcoin be above $94,000 on January 13?"
+                'market_id': self.config.get('market_id', '0xd3460cd313aa9759ea67a966e9a499cb65964d6e2a2ff6902472aa83005383bb'),
                 'token_id': self.config.get('token_id', 'token_yes'),
                 'min_spread_bps': self.config.get('min_spread_bps', 50),
                 'max_spread_bps': self.config.get('max_spread_bps', 500),
@@ -310,7 +315,8 @@ async def main():
     parser = argparse.ArgumentParser(description='Polymarket Latency Arbitrage Bot')
     parser.add_argument('--mode', choices=['paper', 'live'], default='paper')
     parser.add_argument('--capital', type=float, default=10000)
-    parser.add_argument('--market', default='btc_to_100k')
+    # Market: "Will the price of Bitcoin be above $94,000 on January 13?"
+    parser.add_argument('--market', default='0xd3460cd313aa9759ea67a966e9a499cb65964d6e2a2ff6902472aa83005383bb')
     parser.add_argument('--min-spread', type=int, default=50)
     parser.add_argument('--max-spread', type=int, default=500, help="Maximum spread in bps (safety cap)")
     parser.add_argument('--max-position', type=float, default=10.0)
