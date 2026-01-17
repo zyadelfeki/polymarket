@@ -19,6 +19,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _format_amount(amount: Decimal) -> str:
+    return str(amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+
 class LedgerError(Exception):
     """Raised when ledger operations violate double-entry rules"""
     pass
@@ -69,26 +73,14 @@ class Ledger:
             Current equity in USDC
         """
         with self._get_connection() as conn:
-            cursor = conn.execute("""
-                SELECT 
-                    SUM(CASE WHEN a.account_type = 'ASSET' THEN tl.amount ELSE 0 END) as total_assets,
-                    SUM(CASE WHEN a.account_type = 'LIABILITY' THEN tl.amount ELSE 0 END) as total_liabilities
-                FROM transaction_lines tl
-                JOIN accounts a ON tl.account_id = a.id
-            """)
+            cursor = conn.execute(
+                "SELECT balance FROM accounts WHERE account_name = ?",
+                ("Cash",)
+            )
             row = cursor.fetchone()
-            
-            assets = Decimal(str(row['total_assets'] or 0))
-            liabilities = Decimal(str(row['total_liabilities'] or 0))
-            
-            # Get unrealized PnL from open positions
-            unrealized = self.get_unrealized_pnl()
-            
-            equity = assets - liabilities + unrealized
-            
-            logger.debug(f"Equity calculation: Assets={assets}, Liab={liabilities}, Unrealized={unrealized}, Total={equity}")
-            
-            return equity
+
+            cash_balance = Decimal(str(row['balance'])) if row and row['balance'] is not None else Decimal('0')
+            return cash_balance
     
     def get_unrealized_pnl(self) -> Decimal:
         """
@@ -120,27 +112,30 @@ class Ledger:
         
         with self._get_connection() as conn:
             # Create transaction
-            cursor = conn.execute("""
+            cursor = conn.execute(
+                """
                 INSERT INTO transactions (transaction_type, description)
                 VALUES ('DEPOSIT', ?)
-            """, (description,))
+                """,
+                (description,)
+            )
             txn_id = cursor.lastrowid
             
             # Get account IDs
-            cash_id = self._get_account_id(conn, 'cash')
-            equity_id = self._get_account_id(conn, 'retained_earnings')
+            cash_id = self._get_account_id(conn, 'Cash')
+            equity_id = self._get_account_id(conn, 'Owner Equity')
             
             # DR cash
             conn.execute("""
                 INSERT INTO transaction_lines (transaction_id, account_id, amount)
                 VALUES (?, ?, ?)
-            """, (txn_id, cash_id, float(amount)))
+            """, (txn_id, cash_id, _format_amount(amount)))
             
             # CR equity (negative = credit)
             conn.execute("""
                 INSERT INTO transaction_lines (transaction_id, account_id, amount)
                 VALUES (?, ?, ?)
-            """, (txn_id, equity_id, float(-amount)))
+            """, (txn_id, equity_id, _format_amount(-amount)))
             
             conn.commit()
             
@@ -149,119 +144,142 @@ class Ledger:
     
     def record_trade_entry(
         self,
-        strategy: str,
         market_id: str,
-        token_id: str,
         side: str,
         quantity: Decimal,
         entry_price: Decimal,
         fees: Decimal,
-        order_id: str,
+        strategy: str = "default",
+        token_id: str = "",
+        order_id: str = "",
         metadata: Optional[Dict] = None
-    ) -> Tuple[int, int]:
+    ) -> int:
         """
         Record trade entry (opening position).
         
         Double-entry:
-        - DR positions_open (asset) = quantity * entry_price
-        - DR trading_fees (expense) = fees
-        - CR cash (asset) = -(quantity * entry_price + fees)
+        - DR Positions (asset) = quantity * entry_price
+        - DR Trading Fees (expense) = fees
+        - CR Cash (asset) = -(quantity * entry_price + fees)
         
         Returns:
-            (transaction_id, position_id)
+            position_id
         """
         if quantity <= 0:
-            raise LedgerError(f"Quantity must be positive: {quantity}")
+            raise ValueError(f"Quantity must be positive: {quantity}")
         if entry_price <= 0 or entry_price > 1:
-            raise LedgerError(f"Invalid entry price: {entry_price}")
+            raise ValueError(f"Invalid entry price: {entry_price}")
         
         cost = quantity * entry_price
         total_cost = cost + fees
+
+        if total_cost > self.get_equity():
+            raise ValueError(f"Insufficient capital: required={total_cost}")
         
         with self._get_connection() as conn:
             # Create transaction
-            cursor = conn.execute("""
-                INSERT INTO transactions (transaction_type, strategy, reference_id, description, metadata)
-                VALUES ('TRADE_ENTRY', ?, ?, ?, ?)
-            """, (
-                strategy,
-                order_id,
-                f"Enter {side} position on {market_id[:20]}",
-                json.dumps(metadata) if metadata else None
-            ))
+            cursor = conn.execute(
+                """
+                INSERT INTO transactions (transaction_type, description, metadata)
+                VALUES ('TRADE_ENTRY', ?, ?)
+                """,
+                (
+                    f"Enter {side} position on {market_id[:20]}",
+                    json.dumps(metadata) if metadata else None
+                )
+            )
             txn_id = cursor.lastrowid
             
             # Get account IDs
-            cash_id = self._get_account_id(conn, 'cash')
-            positions_id = self._get_account_id(conn, 'positions_open')
-            fees_id = self._get_account_id(conn, 'trading_fees')
+            cash_id = self._get_account_id(conn, 'Cash')
+            positions_id = self._get_account_id(conn, 'Positions')
+            fees_id = self._get_account_id(conn, 'Trading Fees')
             
             # DR positions_open
             conn.execute("""
                 INSERT INTO transaction_lines (transaction_id, account_id, amount)
                 VALUES (?, ?, ?)
-            """, (txn_id, positions_id, float(cost)))
+            """, (txn_id, positions_id, _format_amount(cost)))
             
             # DR trading_fees
             if fees > 0:
                 conn.execute("""
                     INSERT INTO transaction_lines (transaction_id, account_id, amount)
                     VALUES (?, ?, ?)
-                """, (txn_id, fees_id, float(fees)))
+                """, (txn_id, fees_id, _format_amount(fees)))
             
             # CR cash
             conn.execute("""
                 INSERT INTO transaction_lines (transaction_id, account_id, amount)
                 VALUES (?, ?, ?)
-            """, (txn_id, cash_id, float(-total_cost)))
-            
-            # Create position record
-            cursor = conn.execute("""
+            """, (txn_id, cash_id, _format_amount(-total_cost)))
+
+            # Create position record (align position_id with transaction_id for compatibility)
+            cursor = conn.execute(
+                """
                 INSERT INTO positions (
-                    market_id, token_id, side, quantity, entry_price,
-                    entry_transaction_id, strategy, metadata
+                    position_id, market_id, token_id, strategy, side,
+                    entry_price, quantity, current_price, status,
+                    entry_timestamp, opened_at, entry_order_id,
+                    entry_fees, metadata
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                market_id, token_id, side, float(quantity), float(entry_price),
-                txn_id, strategy, json.dumps(metadata) if metadata else None
-            ))
-            position_id = cursor.lastrowid
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)
+                """,
+                (
+                    txn_id,
+                    market_id,
+                    token_id,
+                    strategy,
+                    side,
+                    str(entry_price),
+                    str(quantity),
+                    str(entry_price),
+                    datetime.utcnow().isoformat(),
+                    datetime.utcnow().isoformat(),
+                    order_id,
+                    _format_amount(fees),
+                    json.dumps(metadata) if metadata else None
+                )
+            )
+            position_row_id = cursor.lastrowid
             
             conn.commit()
             
             logger.info(
                 f"Recorded trade entry: {strategy} | {side} {quantity} @ {entry_price} | "
-                f"Cost: ${total_cost} | Position ID: {position_id}"
+                f"Cost: ${total_cost} | Position ID: {txn_id}"
             )
             
-            return txn_id, position_id
+            return txn_id
     
     def record_trade_exit(
         self,
         position_id: int,
         exit_price: Decimal,
         fees: Decimal,
-        exit_reason: str,
-        order_id: str
+        exit_reason: str = "EXIT",
+        order_id: str = ""
     ) -> int:
         """
         Record trade exit (closing position).
         
         Double-entry:
-        - DR cash (asset) = quantity * exit_price - fees
-        - DR trading_fees (expense) = fees
-        - CR positions_open (asset) = -(quantity * entry_price)
-        - DR/CR trading_profit (revenue) = realized PnL
+        - DR Cash (asset) = quantity * exit_price - fees
+        - DR Trading Fees (expense) = fees
+        - CR Positions (asset) = -(quantity * entry_price)
+        - DR/CR Trading Revenue/Loss = realized PnL
         
         Returns:
             transaction_id
         """
         with self._get_connection() as conn:
             # Get position details
-            cursor = conn.execute("""
-                SELECT * FROM positions WHERE id = ? AND status = 'OPEN'
-            """, (position_id,))
+            cursor = conn.execute(
+                """
+                SELECT * FROM positions WHERE position_id = ? AND status = 'OPEN'
+                """,
+                (position_id,)
+            )
             pos = cursor.fetchone()
             
             if not pos:
@@ -272,60 +290,108 @@ class Ledger:
             strategy = pos['strategy']
             market_id = pos['market_id']
             
+            entry_fees = Decimal(str(pos['entry_fees'] or 0))
+
             proceeds = quantity * exit_price - fees
             cost = quantity * entry_price
-            realized_pnl = proceeds - cost
+            cost_basis = cost + entry_fees
+            realized_pnl = proceeds - cost_basis
+            pnl_for_ledger = (quantity * exit_price) - cost
             
             # Create transaction
-            cursor = conn.execute("""
-                INSERT INTO transactions (transaction_type, strategy, reference_id, description)
-                VALUES ('TRADE_EXIT', ?, ?, ?)
-            """, (
-                strategy,
-                order_id,
-                f"Exit position {position_id}: {exit_reason}"
-            ))
+            cursor = conn.execute(
+                """
+                INSERT INTO transactions (transaction_type, description)
+                VALUES ('TRADE_EXIT', ?)
+                """,
+                (f"Exit position {position_id}: {exit_reason}",)
+            )
             txn_id = cursor.lastrowid
             
             # Get account IDs
-            cash_id = self._get_account_id(conn, 'cash')
-            positions_id = self._get_account_id(conn, 'positions_open')
-            fees_id = self._get_account_id(conn, 'trading_fees')
-            profit_id = self._get_account_id(conn, 'trading_profit')
+            cash_id = self._get_account_id(conn, 'Cash')
+            positions_id = self._get_account_id(conn, 'Positions')
+            fees_id = self._get_account_id(conn, 'Trading Fees')
+            revenue_id = self._get_account_id(conn, 'Trading Revenue')
+            loss_id = self._get_account_id(conn, 'Trading Loss')
             
             # DR cash (proceeds after fees)
             conn.execute("""
                 INSERT INTO transaction_lines (transaction_id, account_id, amount)
                 VALUES (?, ?, ?)
-            """, (txn_id, cash_id, float(proceeds)))
+            """, (txn_id, cash_id, _format_amount(proceeds)))
             
             # DR trading_fees
             if fees > 0:
                 conn.execute("""
                     INSERT INTO transaction_lines (transaction_id, account_id, amount)
                     VALUES (?, ?, ?)
-                """, (txn_id, fees_id, float(fees)))
+                """, (txn_id, fees_id, _format_amount(fees)))
             
             # CR positions_open (remove cost basis)
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO transaction_lines (transaction_id, account_id, amount)
                 VALUES (?, ?, ?)
-            """, (txn_id, positions_id, float(-cost)))
-            
-            # Record realized PnL
-            # If profit: DR trading_profit (negative = credit, increases revenue)
-            # If loss: CR trading_profit (positive = debit, decreases revenue)
-            conn.execute("""
-                INSERT INTO transaction_lines (transaction_id, account_id, amount)
-                VALUES (?, ?, ?)
-            """, (txn_id, profit_id, float(-realized_pnl)))
-            
-            # Close position
-            conn.execute("""
+                """,
+                (txn_id, positions_id, _format_amount(-cost))
+            )
+
+            if pnl_for_ledger >= 0:
+                conn.execute(
+                    """
+                    INSERT INTO transaction_lines (transaction_id, account_id, amount)
+                    VALUES (?, ?, ?)
+                    """,
+                    (txn_id, revenue_id, _format_amount(-pnl_for_ledger))
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO transaction_lines (transaction_id, account_id, amount)
+                    VALUES (?, ?, ?)
+                    """,
+                    (txn_id, loss_id, _format_amount(abs(pnl_for_ledger)))
+                )
+
+            cursor = conn.execute(
+                "SELECT SUM(amount) as total FROM transaction_lines WHERE transaction_id = ?",
+                (txn_id,)
+            )
+            total = cursor.fetchone()[0] or 0.0
+            if abs(total) > 0:
+                adjustment = -float(total)
+                adjustment_account = revenue_id if adjustment < 0 else loss_id
+                conn.execute(
+                    """
+                    INSERT INTO transaction_lines (transaction_id, account_id, amount)
+                    VALUES (?, ?, ?)
+                    """,
+                    (txn_id, adjustment_account, str(adjustment))
+                )
+
+            conn.execute(
+                """
                 UPDATE positions
-                SET status = 'CLOSED', closed_at = CURRENT_TIMESTAMP, current_price = ?
-                WHERE id = ?
-            """, (float(exit_price), position_id))
+                SET status = 'CLOSED',
+                    exit_price = ?,
+                    realized_pnl = ?,
+                    exit_fees = ?,
+                    exit_order_id = ?,
+                    exit_timestamp = CURRENT_TIMESTAMP,
+                    closed_at = CURRENT_TIMESTAMP,
+                    current_price = ?
+                WHERE position_id = ?
+                """,
+                (
+                    str(exit_price),
+                    _format_amount(realized_pnl),
+                    _format_amount(fees),
+                    order_id,
+                    str(exit_price),
+                    position_id
+                )
+            )
             
             conn.commit()
             
@@ -365,7 +431,7 @@ class Ledger:
                     p.*,
                     (p.current_price - p.entry_price) * p.quantity as unrealized_pnl,
                     ((p.current_price - p.entry_price) / p.entry_price) as unrealized_roi,
-                    (julianday('now') - julianday(p.opened_at)) * 86400 as hold_time_seconds
+                    (julianday('now') - julianday(COALESCE(p.opened_at, p.entry_timestamp))) * 86400 as hold_time_seconds
                 FROM positions p
                 WHERE p.status = 'OPEN'
             """
@@ -387,21 +453,22 @@ class Ledger:
             Dict with total_pnl, trade_count, win_rate, etc.
         """
         with self._get_connection() as conn:
-            cursor = conn.execute("""
+            cursor = conn.execute(
+                """
                 SELECT 
-                    t.strategy,
                     COUNT(DISTINCT t.id) as trade_count,
-                    SUM(CASE WHEN tl.amount < 0 THEN -tl.amount ELSE 0 END) as total_profit,
-                    SUM(CASE WHEN tl.amount > 0 THEN tl.amount ELSE 0 END) as total_loss,
-                    SUM(-tl.amount) as net_pnl
+                    SUM(CASE WHEN a.account_name = 'Trading Revenue' THEN -tl.amount ELSE 0 END) as total_profit,
+                    SUM(CASE WHEN a.account_name = 'Trading Loss' THEN tl.amount ELSE 0 END) as total_loss,
+                    SUM(CASE WHEN a.account_name = 'Trading Revenue' THEN -tl.amount ELSE 0 END)
+                    - SUM(CASE WHEN a.account_name = 'Trading Loss' THEN tl.amount ELSE 0 END) as net_pnl
                 FROM transactions t
                 JOIN transaction_lines tl ON t.id = tl.transaction_id
                 JOIN accounts a ON tl.account_id = a.id
-                WHERE a.name = 'trading_profit'
-                  AND t.strategy = ?
+                WHERE t.transaction_type = 'TRADE_EXIT'
                   AND t.timestamp >= datetime('now', ? || ' days')
-                GROUP BY t.strategy
-            """, (strategy, -days))
+            """,
+                (-days,)
+            )
             
             row = cursor.fetchone()
             if not row:
@@ -440,7 +507,7 @@ class Ledger:
     
     def _get_account_id(self, conn, account_name: str) -> int:
         """Get account ID by name"""
-        cursor = conn.execute("SELECT id FROM accounts WHERE name = ?", (account_name,))
+        cursor = conn.execute("SELECT id FROM accounts WHERE account_name = ?", (account_name,))
         row = cursor.fetchone()
         if not row:
             raise LedgerError(f"Account not found: {account_name}")

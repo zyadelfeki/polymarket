@@ -1,71 +1,98 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+try:
+    from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
+    from sqlalchemy.ext.declarative import declarative_base
+    from sqlalchemy.orm import sessionmaker
+    _sqlalchemy_available = True
+except ImportError:
+    create_engine = None
+    Column = Integer = String = Float = DateTime = Boolean = Text = None
+    declarative_base = None
+    sessionmaker = None
+    _sqlalchemy_available = False
 from datetime import datetime, timedelta
 from pathlib import Path
 from config.settings import settings
 
-Base = declarative_base()
+if _sqlalchemy_available:
+    Base = declarative_base()
+else:
+    Base = None
 
-class Trade(Base):
-    __tablename__ = 'trades'
-    
-    id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    strategy = Column(String(50))
-    market_id = Column(String(100))
-    market_title = Column(Text)
-    side = Column(String(10))
-    entry_price = Column(Float)
-    exit_price = Column(Float, nullable=True)
-    amount = Column(Float)
-    profit = Column(Float, nullable=True)
-    roi = Column(Float, nullable=True)
-    confidence = Column(Float)
-    edge = Column(Float)
-    status = Column(String(20))
-    exit_timestamp = Column(DateTime, nullable=True)
-    exit_reason = Column(String(100), nullable=True)
+if _sqlalchemy_available:
+    class Trade(Base):
+        __tablename__ = 'trades'
+        
+        id = Column(Integer, primary_key=True)
+        timestamp = Column(DateTime, default=datetime.utcnow)
+        strategy = Column(String(50))
+        market_id = Column(String(100))
+        market_title = Column(Text)
+        side = Column(String(10))
+        entry_price = Column(Float)
+        exit_price = Column(Float, nullable=True)
+        amount = Column(Float)
+        profit = Column(Float, nullable=True)
+        roi = Column(Float, nullable=True)
+        confidence = Column(Float)
+        edge = Column(Float)
+        status = Column(String(20))
+        exit_timestamp = Column(DateTime, nullable=True)
+        exit_reason = Column(String(100), nullable=True)
 
-class VolatilityEvent(Base):
-    __tablename__ = 'volatility_events'
-    
-    id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    symbol = Column(String(10))
-    volatility_pct = Column(Float)
-    price = Column(Float)
-    direction = Column(String(10))
-    opportunities_found = Column(Integer)
-    trades_executed = Column(Integer)
+    class VolatilityEvent(Base):
+        __tablename__ = 'volatility_events'
+        
+        id = Column(Integer, primary_key=True)
+        timestamp = Column(DateTime, default=datetime.utcnow)
+        symbol = Column(String(10))
+        volatility_pct = Column(Float)
+        price = Column(Float)
+        direction = Column(String(10))
+        opportunities_found = Column(Integer)
+        trades_executed = Column(Integer)
 
-class WhaleActivity(Base):
-    __tablename__ = 'whale_activity'
-    
-    id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    wallet_address = Column(String(100))
-    market_id = Column(String(100))
-    side = Column(String(10))
-    amount = Column(Float)
-    copied = Column(Boolean, default=False)
-    copy_amount = Column(Float, nullable=True)
+    class WhaleActivity(Base):
+        __tablename__ = 'whale_activity'
+        
+        id = Column(Integer, primary_key=True)
+        timestamp = Column(DateTime, default=datetime.utcnow)
+        wallet_address = Column(String(100))
+        market_id = Column(String(100))
+        side = Column(String(10))
+        amount = Column(Float)
+        copied = Column(Boolean, default=False)
+        copy_amount = Column(Float, nullable=True)
 
-class PerformanceMetric(Base):
-    __tablename__ = 'performance_metrics'
-    
-    id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    capital = Column(Float)
-    open_positions = Column(Integer)
-    daily_pnl = Column(Float)
-    total_pnl = Column(Float)
-    win_rate = Column(Float)
-    sharpe_ratio = Column(Float, nullable=True)
-    max_drawdown = Column(Float)
+    class PerformanceMetric(Base):
+        __tablename__ = 'performance_metrics'
+        
+        id = Column(Integer, primary_key=True)
+        timestamp = Column(DateTime, default=datetime.utcnow)
+        capital = Column(Float)
+        open_positions = Column(Integer)
+        daily_pnl = Column(Float)
+        total_pnl = Column(Float)
+        win_rate = Column(Float)
+        sharpe_ratio = Column(Float, nullable=True)
+        max_drawdown = Column(Float)
+else:
+    class Trade:
+        pass
+
+    class VolatilityEvent:
+        pass
+
+    class WhaleActivity:
+        pass
+
+    class PerformanceMetric:
+        pass
 
 class Database:
     def __init__(self):
+        if not _sqlalchemy_available:
+            raise ImportError("sqlalchemy is required for Database")
+
         db_path = Path(settings.DATABASE_PATH)
         db_path.parent.mkdir(exist_ok=True)
         
@@ -156,4 +183,7 @@ class Database:
         finally:
             session.close()
 
-db = Database()
+try:
+    db = Database()
+except ImportError:
+    db = None

@@ -23,7 +23,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from data_feeds.polymarket_client_v2 import PolymarketClientV2, OrderSide
-from services.execution_service_v2 import ExecutionServiceV2, OrderResultDict
+from services.execution_service_v2 import ExecutionServiceV2, OrderResult
 from strategies.latency_arbitrage import LatencyArbitrageEngine
 
 
@@ -57,14 +57,11 @@ async def test_order_execution_contract_returns_dict():
         price=Decimal("0.55"),
     )
 
-    assert isinstance(result, dict)
-    assert "success" in result
-    assert "order_id" in result
-    assert isinstance(result["success"], bool)
-    assert isinstance(result["order_id"], (str, type(None)))
-
-    # Ensure OrderSide enum is accepted without enum/string mismatches
-    assert result.success is True
+    assert isinstance(result, OrderResult)
+    assert hasattr(result, "success")
+    assert hasattr(result, "order_id")
+    assert isinstance(result.success, bool)
+    assert isinstance(result.order_id, (str, type(None)))
 
 
 @pytest.mark.asyncio
@@ -117,19 +114,17 @@ class CaptureExecutionService:
 
     async def place_order(self, **kwargs):
         self.calls.append(kwargs)
-        return OrderResultDict(
-            {
-                "success": True,
-                "order_id": "order_1",
-                "status": None,
-                "filled_quantity": Decimal("1"),
-                "filled_price": Decimal("0.5"),
-                "fees": Decimal("0"),
-                "fills": [],
-                "error": None,
-                "slippage_bps": 0.0,
-                "execution_time_ms": 0.0,
-            }
+        return OrderResult(
+            success=True,
+            order_id="order_1",
+            status=None,
+            filled_quantity=Decimal("1"),
+            filled_price=Decimal("0.5"),
+            fees=Decimal("0"),
+            fills=[],
+            error=None,
+            slippage_bps=0.0,
+            execution_time_ms=0.0,
         )
 
 
@@ -249,6 +244,8 @@ async def test_defensive_imports_missing_sdks(monkeypatch):
 
     for mod in modules_to_remove:
         monkeypatch.delitem(sys.modules, mod, raising=False)
+
+    monkeypatch.setenv("POLYMARKET_DISABLE_SDK", "1")
 
     import data_feeds.polymarket_client_v2 as client_module
 

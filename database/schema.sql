@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     description TEXT NOT NULL,
     transaction_type TEXT,
+    strategy TEXT,
+    reference_id TEXT,
+    metadata TEXT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -46,9 +50,11 @@ CREATE INDEX IF NOT EXISTS idx_transaction_lines_account ON transaction_lines(ac
 -- Positions (open and closed)
 CREATE TABLE IF NOT EXISTS positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_id INTEGER UNIQUE,
     market_id TEXT NOT NULL,
     token_id TEXT NOT NULL,
     strategy TEXT NOT NULL,
+    side TEXT,
     entry_price DECIMAL(10, 6) NOT NULL,
     quantity DECIMAL(20, 8) NOT NULL,
     current_price DECIMAL(10, 6),
@@ -56,9 +62,13 @@ CREATE TABLE IF NOT EXISTS positions (
     unrealized_pnl DECIMAL(20, 8) DEFAULT 0,
     realized_pnl DECIMAL(20, 8) DEFAULT 0,
     fees DECIMAL(20, 8) DEFAULT 0,
+    entry_fees DECIMAL(20, 8) DEFAULT 0,
+    exit_fees DECIMAL(20, 8) DEFAULT 0,
     status TEXT DEFAULT 'OPEN' CHECK(status IN ('OPEN', 'CLOSED')),
     entry_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     exit_timestamp TIMESTAMP,
+    opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    closed_at TIMESTAMP,
     entry_order_id TEXT,
     exit_order_id TEXT,
     metadata TEXT
@@ -68,6 +78,13 @@ CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
 CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_id);
 CREATE INDEX IF NOT EXISTS idx_positions_strategy ON positions(strategy);
 CREATE INDEX IF NOT EXISTS idx_positions_entry_time ON positions(entry_timestamp);
+
+CREATE TRIGGER IF NOT EXISTS trg_positions_set_position_id
+AFTER INSERT ON positions
+WHEN NEW.position_id IS NULL
+BEGIN
+    UPDATE positions SET position_id = NEW.id WHERE id = NEW.id;
+END;
 
 -- Triggers to maintain account balances automatically
 CREATE TRIGGER IF NOT EXISTS trg_update_account_balance_insert

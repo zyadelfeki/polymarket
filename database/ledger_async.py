@@ -328,6 +328,38 @@ class ConnectionPool:
                 # Execute schema
                 await temp_conn.executescript(schema_sql)
                 await temp_conn.commit()
+
+                # Ensure accounts table has updated_at for triggers
+                cursor = await temp_conn.execute("PRAGMA table_info(accounts)")
+                columns = [row[1] for row in await cursor.fetchall()]
+                if "updated_at" not in columns:
+                    await temp_conn.execute(
+                        "ALTER TABLE accounts ADD COLUMN updated_at TIMESTAMP"
+                    )
+                    await temp_conn.execute(
+                        "UPDATE accounts SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL"
+                    )
+
+                cursor = await temp_conn.execute("PRAGMA table_info(positions)")
+                position_columns = [row[1] for row in await cursor.fetchall()]
+                if "position_id" not in position_columns:
+                    await temp_conn.execute(
+                        "ALTER TABLE positions ADD COLUMN position_id INTEGER"
+                    )
+                    await temp_conn.execute(
+                        "UPDATE positions SET position_id = id WHERE position_id IS NULL"
+                    )
+                    await temp_conn.execute(
+                        """
+                        CREATE TRIGGER IF NOT EXISTS trg_positions_set_position_id
+                        AFTER INSERT ON positions
+                        WHEN NEW.position_id IS NULL
+                        BEGIN
+                            UPDATE positions SET position_id = NEW.id WHERE id = NEW.id;
+                        END;
+                        """
+                    )
+                    await temp_conn.commit()
                 
                 # CRITICAL: Force a checkpoint to ensure WAL is applied to main DB
                 # This makes schema visible to all new connections
@@ -340,12 +372,12 @@ class ConnectionPool:
                 )
                 tables = await cursor.fetchall()
                 table_names = [t[0] for t in tables]
-                
+
                 if 'accounts' not in table_names:
                     raise RuntimeError("Critical: 'accounts' table not created!")
                 if 'transactions' not in table_names:
                     raise RuntimeError("Critical: 'transactions' table not created!")
-                
+
                 logger.info(
                     "database_schema_initialized",
                     db_path=self.db_path,
@@ -472,6 +504,7 @@ class AsyncLedger:
         self.cache_hits = 0
         self.cache_misses = 0
         self.total_query_time_ms = 0.0
+        self._write_lock = asyncio.Lock()
         
         logger.info(
             "async_ledger_initialized",
@@ -617,61 +650,60 @@ class AsyncLedger:
         Returns:
             Transaction ID
         """
-        conn = await self.pool.acquire()
-        
-        try:
-            await conn.execute("BEGIN TRANSACTION")
+        async with self._write_lock:
+            conn = await self.pool.acquire()
+            try:
+                await conn.execute("BEGIN TRANSACTION")
+                
+                # Create transaction
+                cursor = await conn.execute(
+                    "INSERT INTO transactions (description) VALUES (?)",
+                    (description,)
+                )
+                tx_id = cursor.lastrowid
+                
+                # Debit: Cash account
+                await conn.execute(
+                    """
+                    INSERT INTO transaction_lines (transaction_id, account_id, amount)
+                    VALUES (?, (SELECT id FROM accounts WHERE account_name='Cash'), ?)
+                    """,
+                    (tx_id, str(amount))  # Use str() for exact Decimal precision
+                )
+                
+                # Credit: Equity account
+                await conn.execute(
+                    """
+                    INSERT INTO transaction_lines (transaction_id, account_id, amount)
+                    VALUES (?, (SELECT id FROM accounts WHERE account_name='Owner Equity'), ?)
+                    """,
+                    (tx_id, str(-amount))  # Use str() for exact Decimal precision
+                )
+                await conn.commit()
+                
+                # Invalidate cache
+                self.equity_cache.clear()
+                
+                logger.info(
+                    "deposit_recorded",
+                    transaction_id=tx_id,
+                    amount=float(amount)
+                )
+                
+                return tx_id
             
-            # Create transaction
-            cursor = await conn.execute(
-                "INSERT INTO transactions (description) VALUES (?)",
-                (description,)
-            )
-            tx_id = cursor.lastrowid
+            except Exception as e:
+                await conn.rollback()
+                logger.error(
+                    "deposit_failed",
+                    error=str(e),
+                    amount=float(amount)
+                )
+                raise
             
-            # Debit: Cash account
-            await conn.execute(
-                """
-                INSERT INTO transaction_lines (transaction_id, account_id, amount)
-                VALUES (?, (SELECT id FROM accounts WHERE account_name='Cash'), ?)
-                """,
-                (tx_id, str(amount))  # Use str() for exact Decimal precision
-            )
-            
-            # Credit: Equity account
-            await conn.execute(
-                """
-                INSERT INTO transaction_lines (transaction_id, account_id, amount)
-                VALUES (?, (SELECT id FROM accounts WHERE account_name='Owner Equity'), ?)
-                """,
-                (tx_id, str(-amount))  # Use str() for exact Decimal precision
-            )
-            
-            await conn.commit()
-            
-            # Invalidate cache
-            self.equity_cache.clear()
-            
-            logger.info(
-                "deposit_recorded",
-                transaction_id=tx_id,
-                amount=float(amount)
-            )
-            
-            return tx_id
-        
-        except Exception as e:
-            await conn.rollback()
-            logger.error(
-                "deposit_failed",
-                error=str(e),
-                amount=float(amount)
-            )
-            raise
-        
-        finally:
-            await self.pool.release(conn)
-    
+            finally:
+                await self.pool.release(conn)
+
     async def record_trade_entry(
         self,
         market_id: str,
@@ -684,104 +716,119 @@ class AsyncLedger:
         metadata: Optional[Dict] = None
     ) -> int:
         """
-        Record trade entry in ledger.
-        
-        Args:
-            market_id: Market ID
-            token_id: Token ID
-            strategy: Strategy name
-            entry_price: Entry price
-            quantity: Quantity
-            fees: Transaction fees
-            order_id: Order ID
-            metadata: Additional metadata
-        
+        Record trade entry (opening position).
+
         Returns:
-            Position ID
+            position_id
         """
-        conn = await self.pool.acquire()
-        
-        try:
-            await conn.execute("BEGIN TRANSACTION")
-            
-            # Create position
-            cursor = await conn.execute(
-                """
-                INSERT INTO positions (
-                    market_id, token_id, strategy, entry_price, quantity,
-                    current_price, unrealized_pnl, realized_pnl, status,
-                    entry_timestamp, entry_order_id, metadata
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?, ?, ?)
-                """,
-                (
-                    market_id,
-                    token_id,
-                    strategy,
-                    str(entry_price),  # Use str() for exact Decimal precision
-                    str(quantity),     # Use str() for exact Decimal precision
-                    str(entry_price),  # Initial current price
-                    datetime.utcnow().isoformat(),
-                    order_id,
-                    str(metadata) if metadata else None
+        if quantity <= 0:
+            raise ValueError(f"Quantity must be positive: {quantity}")
+        if entry_price <= 0 or entry_price > 1:
+            raise ValueError(f"Invalid entry price: {entry_price}")
+
+        async with self._write_lock:
+            conn = await self.pool.acquire()
+            try:
+                await conn.execute("BEGIN TRANSACTION")
+
+                cursor = await conn.execute("PRAGMA table_info(positions)")
+                columns = [row[1] for row in await cursor.fetchall()]
+
+                insert_data = {
+                    "market_id": market_id,
+                    "token_id": token_id,
+                    "strategy": strategy,
+                    "entry_price": str(entry_price),
+                    "quantity": str(quantity),
+                    "status": "OPEN",
+                    "entry_timestamp": datetime.utcnow().isoformat(),
+                    "metadata": str(metadata) if metadata else None,
+                }
+
+                if "current_price" in columns:
+                    insert_data["current_price"] = str(entry_price)
+
+                if "unrealized_pnl" in columns:
+                    insert_data["unrealized_pnl"] = "0"
+
+                if "realized_pnl" in columns:
+                    insert_data["realized_pnl"] = "0"
+
+                if "fees" in columns:
+                    insert_data["fees"] = str(fees)
+
+                if "entry_order_id" in columns:
+                    insert_data["entry_order_id"] = order_id
+                elif "order_id" in columns:
+                    insert_data["order_id"] = order_id
+
+                insert_columns = [col for col in insert_data.keys() if col in columns]
+                insert_values = [insert_data[col] for col in insert_columns]
+
+                placeholders = ", ".join(["?"] * len(insert_columns))
+                column_list = ", ".join(insert_columns)
+
+                cursor = await conn.execute(
+                    f"INSERT INTO positions ({column_list}) VALUES ({placeholders})",
+                    tuple(insert_values),
                 )
-            )
-            position_id = cursor.lastrowid
-            
-            # Record transaction
-            cost = entry_price * quantity + fees
-            
-            cursor = await conn.execute(
-                "INSERT INTO transactions (description) VALUES (?)",
-                (f"Trade Entry: {strategy} - {market_id[:20]}",)
-            )
-            tx_id = cursor.lastrowid
-            
-            # Debit: Position asset
-            await conn.execute(
-                """
-                INSERT INTO transaction_lines (transaction_id, account_id, amount)
-                VALUES (?, (SELECT id FROM accounts WHERE account_name='Positions'), ?)
-                """,
-                (tx_id, str(cost))  # Use str() for exact Decimal precision
-            )
-            
-            # Credit: Cash
-            await conn.execute(
-                """
-                INSERT INTO transaction_lines (transaction_id, account_id, amount)
-                VALUES (?, (SELECT id FROM accounts WHERE account_name='Cash'), ?)
-                """,
-                (tx_id, str(-cost))  # Use str() for exact Decimal precision
-            )
-            
-            await conn.commit()
-            
-            # Invalidate caches
-            self.equity_cache.clear()
-            self.position_cache.clear()
-            
-            logger.info(
-                "trade_entry_recorded",
-                position_id=position_id,
-                market_id=market_id,
-                entry_price=float(entry_price),
-                quantity=float(quantity),
-                cost=float(cost)
-            )
-            
-            return position_id
-        
-        except Exception as e:
-            await conn.rollback()
-            logger.error(
-                "trade_entry_failed",
-                error=str(e),
-                market_id=market_id
-            )
-            raise
-        
-        finally:
-            await self.pool.release(conn)
+                position_id = cursor.lastrowid
+
+                # Record transaction
+                cost = entry_price * quantity + fees
+
+                cursor = await conn.execute(
+                    "INSERT INTO transactions (description) VALUES (?)",
+                    (f"Trade Entry: {strategy} - {market_id[:20]}",)
+                )
+                tx_id = cursor.lastrowid
+
+                # Debit: Position asset
+                await conn.execute(
+                    """
+                    INSERT INTO transaction_lines (transaction_id, account_id, amount)
+                    VALUES (?, (SELECT id FROM accounts WHERE account_name='Positions'), ?)
+                    """,
+                    (tx_id, str(cost))  # Use str() for exact Decimal precision
+                )
+
+                # Credit: Cash
+                await conn.execute(
+                    """
+                    INSERT INTO transaction_lines (transaction_id, account_id, amount)
+                    VALUES (?, (SELECT id FROM accounts WHERE account_name='Cash'), ?)
+                    """,
+                    (tx_id, str(-cost))  # Use str() for exact Decimal precision
+                )
+
+                await conn.commit()
+
+                # Invalidate caches
+                self.equity_cache.clear()
+                self.position_cache.clear()
+
+                logger.info(
+                    "trade_entry_recorded",
+                    position_id=position_id,
+                    market_id=market_id,
+                    entry_price=float(entry_price),
+                    quantity=float(quantity),
+                    cost=float(cost)
+                )
+
+                return position_id
+
+            except Exception as e:
+                await conn.rollback()
+                logger.error(
+                    "trade_entry_failed",
+                    error=str(e),
+                    market_id=market_id
+                )
+                raise
+
+            finally:
+                await self.pool.release(conn)
     
     async def get_open_positions(self) -> List[PositionData]:
         """

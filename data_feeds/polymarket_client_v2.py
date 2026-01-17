@@ -12,6 +12,7 @@ import os
 import asyncio
 import time
 import json
+import uuid
 from decimal import Decimal
 from typing import Optional, Dict, List, Any
 from enum import Enum
@@ -22,7 +23,11 @@ except ImportError:
     structlog = None
     _structlog_available = False
 
+_DISABLE_SDK_ENV = os.getenv("POLYMARKET_DISABLE_SDK", "").lower() in {"1", "true", "yes"}
+
 try:
+    if _DISABLE_SDK_ENV:
+        raise ImportError("Polymarket SDK disabled via env")
     from web3 import Web3
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams
@@ -74,6 +79,69 @@ class OrderSide(Enum):
     """Order side enum"""
     BUY = "BUY"
     SELL = "SELL"
+
+
+class TokenBucket:
+    """Async token bucket rate limiter."""
+
+    def __init__(self, rate: float, capacity: float):
+        self.rate = max(rate, 0.1)
+        self.capacity = max(capacity, 1.0)
+        self.tokens = self.capacity
+        self.updated_at = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, tokens: float = 1.0, timeout: Optional[float] = None) -> bool:
+        start = time.monotonic()
+
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                elapsed = now - self.updated_at
+                self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+                self.updated_at = now
+
+                if self.tokens >= tokens:
+                    self.tokens -= tokens
+                    return True
+
+            if timeout is not None and (time.monotonic() - start) >= timeout:
+                return False
+
+            await asyncio.sleep(0.01)
+
+
+class RequestMetrics:
+    """Track request success/failure and latency."""
+
+    def __init__(self):
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.total_latency_ms = 0.0
+
+    def record_request(self, success: bool, latency_ms: float) -> None:
+        self.total_requests += 1
+        if success:
+            self.successful_requests += 1
+        else:
+            self.failed_requests += 1
+        self.total_latency_ms += float(latency_ms)
+
+    def get_metrics(self) -> Dict:
+        avg_latency = 0.0
+        if self.total_requests > 0:
+            avg_latency = self.total_latency_ms / self.total_requests
+        success_rate = 0.0
+        if self.total_requests > 0:
+            success_rate = self.successful_requests / self.total_requests
+        return {
+            "total_requests": self.total_requests,
+            "successful_requests": self.successful_requests,
+            "failed_requests": self.failed_requests,
+            "success_rate": success_rate,
+            "avg_latency_ms": avg_latency,
+        }
 
 
 class PolymarketClientV2:
@@ -129,6 +197,8 @@ class PolymarketClientV2:
         self.authenticated = False
         self._rate_lock = asyncio.Lock()
         self._last_request_ts = 0.0
+        self.rate_limiter = TokenBucket(rate=self.rate_limit, capacity=1.0)
+        self.metrics = RequestMetrics()
         
         # Initialize client NOW (synchronously)
         self._force_authentication()
@@ -253,6 +323,9 @@ class PolymarketClientV2:
     async def _throttle(self):
         """Simple rate limiter to respect max requests per second."""
         if self.rate_limit <= 0:
+            return
+        if self.rate_limiter:
+            await self.rate_limiter.acquire(tokens=1.0)
             return
         min_interval = 1.0 / self.rate_limit
         async with self._rate_lock:
@@ -576,10 +649,11 @@ class PolymarketClientV2:
         self,
         token_id: str,
         side: Any,
-        price: float,
-        size: float,
+        price: Any,
+        size: Any,
         order_type: str = "GTC",
-        market_id: Optional[str] = None
+        market_id: Optional[str] = None,
+        correlation_id: Optional[str] = None
     ) -> Dict:
         """
         Place an order.
@@ -597,32 +671,35 @@ class PolymarketClientV2:
         # Paper trading simulation
         await self._throttle()
 
+        price_dec = Decimal(str(price))
+        size_dec = Decimal(str(size))
+
+        if not (Decimal('0.01') <= price_dec <= Decimal('0.99')):
+            logger.error("invalid_price", price=str(price_dec), valid_range="0.01-0.99", correlation_id=correlation_id)
+            return {"success": False, "error": "invalid_price", "error_code": "invalid_price"}
+
+        if size_dec <= 0:
+            logger.error("invalid_size", size=str(size_dec), correlation_id=correlation_id)
+            return {"success": False, "error": "invalid_size", "error_code": "invalid_quantity"}
+
         if self.paper_trading:
-            order_id = f"paper_{int(time.time() * 1000)}"
+            order_id = f"paper_{uuid.uuid4().hex}"
             logger.info(
                 "paper_order_placed",
                 order_id=order_id,
                 market=market_id,
                 token=token_id,
                 side=side,
-                price=price,
-                size=size
+                price=str(price_dec),
+                size=str(size_dec),
+                correlation_id=correlation_id
             )
             return {"success": True, "order_id": order_id, "paper": True}
         
         # Check authentication for live trading
         if not self.authenticated or not self.client:
-            logger.error("cannot_place_order", reason="not_authenticated")
-            return {"success": False, "error": "not_authenticated"}
-        
-        # Validate inputs
-        if not (0.01 <= float(price) <= 0.99):
-            logger.error("invalid_price", price=price, valid_range="0.01-0.99")
-            return {"success": False, "error": "invalid_price"}
-        
-        if float(size) <= 0:
-            logger.error("invalid_size", size=size)
-            return {"success": False, "error": "invalid_size"}
+            logger.error("cannot_place_order", reason="not_authenticated", correlation_id=correlation_id)
+            return {"success": False, "error": "not_authenticated", "error_code": "not_authenticated"}
         
         try:
             logger.info(
@@ -630,8 +707,9 @@ class PolymarketClientV2:
                 market=market_id,
                 token=token_id,
                 side=side,
-                price=price,
-                size=size
+                price=str(price_dec),
+                size=str(size_dec),
+                correlation_id=correlation_id
             )
             
             # Create order
@@ -639,8 +717,8 @@ class PolymarketClientV2:
             order_side = SELL if side_str.upper() == "SELL" else BUY
             order = OrderArgs(
                 token_id=token_id,
-                price=float(price),
-                size=float(size),
+                price=float(price_dec),
+                size=float(size_dec),
                 side=order_side
             )
             
@@ -670,9 +748,10 @@ class PolymarketClientV2:
                 error_type=type(e).__name__,
                 market=market_id,
                 token=token_id,
-                side=side
+                side=side,
+                correlation_id=correlation_id
             )
-            return {"success": False, "error": str(e)}
+            return {"success": False, "error": str(e), "error_code": "order_submission_failed"}
     
     async def get_markets(
         self,
@@ -773,6 +852,28 @@ class PolymarketClientV2:
         if not self.authenticated or not self.client:
             logger.error("cannot_cancel_order", reason="not_authenticated")
             return False
+
+    async def get_order_status(self, order_id: str) -> Optional[Dict]:
+        """Get order status for an order ID."""
+        if self.paper_trading:
+            return {"order_id": order_id, "status": "filled", "fills": []}
+
+        if not self.authenticated or not self.client:
+            logger.error("cannot_get_order_status", reason="not_authenticated")
+            return None
+
+        try:
+            await self._throttle()
+            loop = asyncio.get_running_loop()
+            if hasattr(self.client, "get_order"):
+                return await loop.run_in_executor(None, self.client.get_order, order_id)
+            if hasattr(self.client, "get_order_status"):
+                return await loop.run_in_executor(None, self.client.get_order_status, order_id)
+            logger.warning("get_order_status_not_available")
+            return None
+        except Exception as e:
+            logger.error("order_status_fetch_failed", order_id=order_id, error=str(e))
+            return None
         
         try:
             await self._throttle()
@@ -810,7 +911,7 @@ class PolymarketClientV2:
         Returns:
             Metrics dictionary
         """
-        return {
+        metrics = {
             "authenticated": self.authenticated,
             "can_trade": self.can_trade,
             "paper_trading": self.paper_trading,
@@ -818,6 +919,8 @@ class PolymarketClientV2:
             "has_address": bool(self.address),
             "address": self.address
         }
+        metrics.update(self.metrics.get_metrics())
+        return metrics
     
     async def close(self):
         """Close client and cleanup resources."""

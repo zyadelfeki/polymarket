@@ -411,7 +411,8 @@ class LatencyArbitrageEngine:
                     'implied_prob': float(signal['implied_probability']),
                     'polymarket_odds': float(signal['polymarket_odds']),
                     'confidence': signal['confidence']
-                }
+                },
+                idempotency_key=signal.get('idempotency_key') if isinstance(signal, dict) else None
             )
             
             if result.success:
@@ -437,6 +438,14 @@ class LatencyArbitrageEngine:
                     error=result.error
                 )
                 self.trades_blocked += 1
+
+            if result.get("is_duplicate"):
+                logger.warning(
+                    "duplicate_averted",
+                    order_id=result.order_id,
+                    idempotency_key=result.get("idempotency_key"),
+                    correlation_id=result.get("correlation_id")
+                )
         
         except Exception as e:
             logger.error(
