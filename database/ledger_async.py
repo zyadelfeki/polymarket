@@ -27,11 +27,89 @@ from typing import List, Dict, Optional, Tuple
 from decimal import Decimal
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from cachetools import TTLCache
-import structlog
+try:
+    from cachetools import TTLCache
+    _cachetools_available = True
+except ImportError:
+    _cachetools_available = False
+
+    class TTLCache(dict):
+        """Minimal TTL cache fallback when cachetools is unavailable."""
+
+        def __init__(self, maxsize: int = 128, ttl: float = 600.0):
+            super().__init__()
+            self.maxsize = maxsize
+            self.ttl = ttl
+            self._expires = {}
+
+        def _purge_expired(self):
+            now = time.time()
+            expired = [k for k, exp in self._expires.items() if exp <= now]
+            for k in expired:
+                self._expires.pop(k, None)
+                super().pop(k, None)
+
+        def __setitem__(self, key, value):
+            self._purge_expired()
+            if len(self._expires) >= self.maxsize:
+                oldest = min(self._expires.items(), key=lambda item: item[1])[0]
+                self._expires.pop(oldest, None)
+                super().pop(oldest, None)
+            self._expires[key] = time.time() + self.ttl
+            return super().__setitem__(key, value)
+
+        def __getitem__(self, key):
+            self._purge_expired()
+            return super().__getitem__(key)
+
+        def get(self, key, default=None):
+            self._purge_expired()
+            return super().get(key, default)
+
+        def pop(self, key, default=None):
+            self._expires.pop(key, None)
+            return super().pop(key, default)
+
+        def clear(self):
+            self._expires.clear()
+            return super().clear()
+
+try:
+    import structlog
+    _structlog_available = True
+except ImportError:
+    structlog = None
+    _structlog_available = False
 import time
 
-logger = structlog.get_logger(__name__)
+if _structlog_available:
+    logger = structlog.get_logger(__name__)
+else:
+    import logging
+
+    logging.basicConfig(level=logging.INFO)
+    class _FallbackLogger:
+        def __init__(self, name: str):
+            self._logger = logging.getLogger(name)
+
+        def _log(self, level, event: str, **kwargs):
+            exc_info = kwargs.pop("exc_info", None)
+            message = f"{event} | {kwargs}" if kwargs else event
+            self._logger.log(level, message, exc_info=exc_info)
+
+        def debug(self, event: str, **kwargs):
+            self._log(logging.DEBUG, event, **kwargs)
+
+        def info(self, event: str, **kwargs):
+            self._log(logging.INFO, event, **kwargs)
+
+        def warning(self, event: str, **kwargs):
+            self._log(logging.WARNING, event, **kwargs)
+
+        def error(self, event: str, **kwargs):
+            self._log(logging.ERROR, event, **kwargs)
+
+    logger = _FallbackLogger(__name__)
 
 # Embedded schema as fallback
 EMBEDDED_SCHEMA = """

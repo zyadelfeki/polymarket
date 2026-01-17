@@ -21,7 +21,12 @@ import asyncio
 from typing import Optional, Dict
 from decimal import Decimal
 from datetime import datetime, timedelta
-import structlog
+try:
+    import structlog
+    _structlog_available = True
+except ImportError:
+    structlog = None
+    _structlog_available = False
 
 from data_feeds.binance_websocket_v2 import BinanceWebSocketV2
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
@@ -29,7 +34,34 @@ from services.execution_service_v2 import ExecutionServiceV2
 from risk.circuit_breaker_v2 import CircuitBreakerV2
 from database.ledger_async import AsyncLedger
 
-logger = structlog.get_logger(__name__)
+if _structlog_available:
+    logger = structlog.get_logger(__name__)
+else:
+    import logging
+
+    logging.basicConfig(level=logging.INFO)
+    class _FallbackLogger:
+        def __init__(self, name: str):
+            self._logger = logging.getLogger(name)
+
+        def _log(self, level, event: str, **kwargs):
+            exc_info = kwargs.pop("exc_info", None)
+            message = f"{event} | {kwargs}" if kwargs else event
+            self._logger.log(level, message, exc_info=exc_info)
+
+        def debug(self, event: str, **kwargs):
+            self._log(logging.DEBUG, event, **kwargs)
+
+        def info(self, event: str, **kwargs):
+            self._log(logging.INFO, event, **kwargs)
+
+        def warning(self, event: str, **kwargs):
+            self._log(logging.WARNING, event, **kwargs)
+
+        def error(self, event: str, **kwargs):
+            self._log(logging.ERROR, event, **kwargs)
+
+    logger = _FallbackLogger(__name__)
 
 
 class LatencyArbitrageEngine:
@@ -66,7 +98,7 @@ class LatencyArbitrageEngine:
         # Configuration
         self.config = config or {}
         self.market_id = self.config.get('market_id', 'btc_to_100k')
-        self.token_id = self.config.get('token_id', 'token_yes')
+        self.token_id = self.config.get('token_id')
         self.min_spread_bps = self.config.get('min_spread_bps', 50)  # 0.5%
         self.max_spread_bps = self.config.get('max_spread_bps', 500)  # 5% (sanity)
         self.max_position_pct = self.config.get('max_position_pct', 10.0)  # 10% of equity
@@ -80,6 +112,8 @@ class LatencyArbitrageEngine:
         self.latest_btc_timestamp: Optional[datetime] = None
         self.latest_polymarket_odds: Optional[Decimal] = None
         self.latest_polymarket_timestamp: Optional[datetime] = None
+        self.yes_token_id: Optional[str] = None
+        self.no_token_id: Optional[str] = None
         
         # Metrics
         self.signals_generated = 0
@@ -207,17 +241,25 @@ class LatencyArbitrageEngine:
                 )
                 return
             
-            # Extract YES token price (probability)
+            # Extract YES/NO token prices and IDs
             yes_price = market_data.get('yes_price')
+            no_price = market_data.get('no_price')
+            self.yes_token_id = market_data.get('yes_token_id') or market_data.get('yes_token')
+            self.no_token_id = market_data.get('no_token_id') or market_data.get('no_token')
+
+            if not self.yes_token_id or not self.no_token_id:
+                logger.warning("market_tokens_missing", market_id=self.market_id)
+                return
             
-            if yes_price:
+            if yes_price is not None:
                 self.latest_polymarket_odds = Decimal(str(yes_price))
                 self.latest_polymarket_timestamp = datetime.utcnow()
                 
                 logger.debug(
                     "polymarket_odds_fetched",
                     market_id=self.market_id,
-                    yes_price=float(yes_price)
+                    yes_price=float(yes_price),
+                    no_price=float(no_price) if no_price is not None else None
                 )
         
         except Exception as e:
@@ -272,12 +314,12 @@ class LatencyArbitrageEngine:
         # Determine action
         if spread_bps > 0:
             # Polymarket underpriced -> BUY YES
-            action = 'BUY'
+            action = 'BUY_YES'
             side = 'YES'
             target_price = self.latest_polymarket_odds + (spread / Decimal('2'))  # Mid spread
         else:
-            # Polymarket overpriced -> SELL YES (or BUY NO)
-            action = 'SELL'
+            # Polymarket overpriced -> BUY NO
+            action = 'BUY_NO'
             side = 'NO'
             target_price = self.latest_polymarket_odds - (abs(spread) / Decimal('2'))
         
@@ -335,6 +377,15 @@ class LatencyArbitrageEngine:
             # Round to 2 decimals
             quantity = quantity.quantize(Decimal('0.01'))
             
+            if quantity <= 0:
+                logger.warning("quantity_too_small", quantity=float(quantity))
+                return
+
+            token_id = self.yes_token_id if signal['side'] == 'YES' else self.no_token_id
+            if not token_id:
+                logger.error("token_id_missing_for_trade", side=signal['side'])
+                return
+
             logger.info(
                 "executing_trade",
                 action=signal['action'],
@@ -349,11 +400,12 @@ class LatencyArbitrageEngine:
             result = await self.execution.place_order(
                 strategy="latency_arbitrage",
                 market_id=self.market_id,
-                token_id=self.token_id,
-                side=signal['side'],
+                token_id=token_id,
+                side="BUY",
                 quantity=quantity,
                 price=target_price,
                 metadata={
+                    'outcome': signal['side'],
                     'spread_bps': signal['spread_bps'],
                     'btc_price': float(signal['btc_price']),
                     'implied_prob': float(signal['implied_probability']),
