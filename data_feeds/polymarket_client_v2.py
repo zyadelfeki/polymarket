@@ -15,7 +15,12 @@ import json
 from decimal import Decimal
 from typing import Optional, Dict, List, Any
 from enum import Enum
-import structlog
+try:
+    import structlog
+    _structlog_available = True
+except ImportError:
+    structlog = None
+    _structlog_available = False
 
 try:
     from web3 import Web3
@@ -25,9 +30,44 @@ try:
     from eth_account import Account
     POLYMARKET_AVAILABLE = True
 except ImportError:
+    Web3 = None
+    ClobClient = None
+    OrderArgs = None
+    OrderType = None
+    BalanceAllowanceParams = None
+    BUY = None
+    SELL = None
+    Account = None
     POLYMARKET_AVAILABLE = False
 
-logger = structlog.get_logger(__name__)
+if _structlog_available:
+    logger = structlog.get_logger(__name__)
+else:
+    import logging
+
+    logging.basicConfig(level=logging.INFO)
+    class _FallbackLogger:
+        def __init__(self, name: str):
+            self._logger = logging.getLogger(name)
+
+        def _log(self, level, event: str, **kwargs):
+            exc_info = kwargs.pop("exc_info", None)
+            message = f"{event} | {kwargs}" if kwargs else event
+            self._logger.log(level, message, exc_info=exc_info)
+
+        def debug(self, event: str, **kwargs):
+            self._log(logging.DEBUG, event, **kwargs)
+
+        def info(self, event: str, **kwargs):
+            self._log(logging.INFO, event, **kwargs)
+
+        def warning(self, event: str, **kwargs):
+            self._log(logging.WARNING, event, **kwargs)
+
+        def error(self, event: str, **kwargs):
+            self._log(logging.ERROR, event, **kwargs)
+
+    logger = _FallbackLogger(__name__)
 
 
 class OrderSide(Enum):
@@ -71,18 +111,24 @@ class PolymarketClientV2:
         self.paper_trading = paper_trading
         self.max_retries = max_retries
         self.timeout = timeout
+        self.rate_limit = max(rate_limit, 0.1)
         
         # Load proxy address from environment
         self.proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
         
-        # Initialize Web3 for balance checks
-        self.w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+        # Initialize Web3 for balance checks (optional)
+        if Web3:
+            self.w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+        else:
+            self.w3 = None
         
         # State tracking
         self.client: Optional[Any] = None
         self.address: Optional[str] = None
         self.can_trade = False
         self.authenticated = False
+        self._rate_lock = asyncio.Lock()
+        self._last_request_ts = 0.0
         
         # Initialize client NOW (synchronously)
         self._force_authentication()
@@ -107,6 +153,9 @@ class PolymarketClientV2:
         """
         if not POLYMARKET_AVAILABLE:
             logger.error("polymarket_sdk_not_available", message="Install py-clob-client")
+            self.client = None
+            self.can_trade = False
+            self.authenticated = False
             return
         
         if not self.private_key or self.private_key == "your_private_key_here":
@@ -200,6 +249,18 @@ class PolymarketClientV2:
             self.client = None
             self.can_trade = False
             self.authenticated = False
+
+    async def _throttle(self):
+        """Simple rate limiter to respect max requests per second."""
+        if self.rate_limit <= 0:
+            return
+        min_interval = 1.0 / self.rate_limit
+        async with self._rate_lock:
+            now = time.time()
+            wait = min_interval - (now - self._last_request_ts)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request_ts = time.time()
     
     async def initialize(self) -> bool:
         """
@@ -280,7 +341,7 @@ class PolymarketClientV2:
             proxy_checksum = Web3.to_checksum_address(self.proxy_address)
             
             # Fetch balance from BOTH contracts
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             
             balance_bridged = await loop.run_in_executor(
                 None,
@@ -340,32 +401,61 @@ class PolymarketClientV2:
                 "market_id": market_id,
                 "question": f"Mock market: {market_id}",
                 "tokens": [
-                    {"token_id": "yes", "price": 0.50},
-                    {"token_id": "no", "price": 0.50}
+                    {"token_id": "yes", "outcome": "YES", "price": 0.50},
+                    {"token_id": "no", "outcome": "NO", "price": 0.50}
                 ],
+                "yes_price": 0.50,
+                "no_price": 0.50,
+                "yes_token_id": "yes",
+                "no_token_id": "no",
                 "mock": True
             }
         
         try:
+            await self._throttle()
             logger.debug("fetching_market_via_direct_lookup", market_id=market_id)
-            
-            loop = asyncio.get_event_loop()
-            market = await loop.run_in_executor(
-                None,
-                lambda: self.client.get_market(market_id)
-            )
+            market = None
+            if hasattr(self.client, "get_market"):
+                loop = asyncio.get_running_loop()
+                market = await loop.run_in_executor(
+                    None,
+                    lambda: self.client.get_market(market_id)
+                )
             
             logger.debug("direct_market_lookup_response_type", type=type(market).__name__)
             
             # Validate response
             if not isinstance(market, dict):
                 logger.warning("market_response_not_dict", type=type(market).__name__)
-                return {"tokens": [], "error": "invalid_response", "market_id": market_id}
+                market = None
             
-            # Ensure tokens field exists
-            if 'tokens' not in market:
+            # Fallback to Gamma API if needed
+            if not market or 'tokens' not in market:
+                market = await self._fetch_market_via_gamma(market_id)
+            if not market or 'tokens' not in market:
                 logger.warning("market_missing_tokens_field", market_id=market_id)
-                market['tokens'] = []
+                return {"tokens": [], "error": "market_not_found", "market_id": market_id}
+
+            yes_token, no_token = self._infer_yes_no_tokens(market.get('tokens', []))
+            if not yes_token or not no_token:
+                logger.warning("unable_to_infer_yes_no_tokens", market_id=market_id)
+                return {"tokens": market.get('tokens', []), "error": "token_inference_failed", "market_id": market_id}
+
+            yes_token_id = yes_token.get('token_id') or yes_token.get('tokenId')
+            no_token_id = no_token.get('token_id') or no_token.get('tokenId')
+
+            yes_price = await self._get_best_ask(yes_token_id)
+            no_price = await self._get_best_ask(no_token_id)
+
+            if yes_price is None:
+                yes_price = self._extract_token_price(yes_token)
+            if no_price is None:
+                no_price = self._extract_token_price(no_token)
+
+            market['yes_price'] = yes_price
+            market['no_price'] = no_price
+            market['yes_token_id'] = yes_token_id
+            market['no_token_id'] = no_token_id
             
             logger.info(
                 "market_found_via_direct_lookup",
@@ -408,15 +498,89 @@ class PolymarketClientV2:
             
             # Return safe default
             return {"tokens": [], "error": str(e), "market_id": market_id}
+
+    async def _fetch_market_via_gamma(self, condition_id: str) -> Optional[Dict]:
+        """Fallback market lookup using Gamma API by condition id."""
+        try:
+            import httpx
+
+            await self._throttle()
+            base_url = "https://gamma-api.polymarket.com/markets"
+            candidates = [
+                f"{base_url}?condition_ids={condition_id}",
+                f"{base_url}?condition_id={condition_id}",
+                f"{base_url}?conditionId={condition_id}"
+            ]
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                for url in candidates:
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                    if isinstance(data, list) and data:
+                        return data[0]
+                    if isinstance(data, dict) and data.get('data'):
+                        items = data.get('data')
+                        if isinstance(items, list) and items:
+                            return items[0]
+            return None
+        except Exception as e:
+            logger.error("gamma_market_lookup_failed", error=str(e), condition_id=condition_id)
+            return None
+
+    def _infer_yes_no_tokens(self, tokens: List[Dict]) -> tuple:
+        """Infer YES/NO tokens from token metadata."""
+        yes_token = None
+        no_token = None
+        for token in tokens:
+            label = (
+                str(token.get('outcome') or token.get('label') or token.get('name') or token.get('symbol') or "")
+                .strip()
+                .lower()
+            )
+            if label == 'yes':
+                yes_token = token
+            elif label == 'no':
+                no_token = token
+        if not yes_token or not no_token:
+            if len(tokens) >= 2:
+                yes_token = yes_token or tokens[0]
+                no_token = no_token or tokens[1]
+        return yes_token, no_token
+
+    def _extract_token_price(self, token: Dict) -> Optional[float]:
+        price = token.get('price')
+        if price is None:
+            price = token.get('last_price')
+        try:
+            return float(price) if price is not None else None
+        except Exception:
+            return None
+
+    async def _get_best_ask(self, token_id: Optional[str]) -> Optional[float]:
+        if not token_id:
+            return None
+        await self._throttle()
+        orderbook = await self.get_orderbook(token_id)
+        if not orderbook:
+            return None
+        asks = orderbook.get("asks", [])
+        if asks:
+            try:
+                return float(asks[0].get("price"))
+            except Exception:
+                return None
+        return None
     
     async def place_order(
         self,
-        market_id: str,
         token_id: str,
-        side: str,
+        side: Any,
         price: float,
-        size: float
-    ) -> Optional[str]:
+        size: float,
+        order_type: str = "GTC",
+        market_id: Optional[str] = None
+    ) -> Dict:
         """
         Place an order.
         
@@ -428,9 +592,11 @@ class PolymarketClientV2:
             size: Order size
         
         Returns:
-            Order ID or None
+            Dict with success flag and order_id
         """
         # Paper trading simulation
+        await self._throttle()
+
         if self.paper_trading:
             order_id = f"paper_{int(time.time() * 1000)}"
             logger.info(
@@ -442,21 +608,21 @@ class PolymarketClientV2:
                 price=price,
                 size=size
             )
-            return order_id
+            return {"success": True, "order_id": order_id, "paper": True}
         
         # Check authentication for live trading
         if not self.authenticated or not self.client:
             logger.error("cannot_place_order", reason="not_authenticated")
-            return None
+            return {"success": False, "error": "not_authenticated"}
         
         # Validate inputs
-        if not (0.01 <= price <= 0.99):
+        if not (0.01 <= float(price) <= 0.99):
             logger.error("invalid_price", price=price, valid_range="0.01-0.99")
-            return None
+            return {"success": False, "error": "invalid_price"}
         
-        if size <= 0:
+        if float(size) <= 0:
             logger.error("invalid_size", size=size)
-            return None
+            return {"success": False, "error": "invalid_size"}
         
         try:
             logger.info(
@@ -469,16 +635,17 @@ class PolymarketClientV2:
             )
             
             # Create order
-            order_side = BUY if side.upper() == "BUY" else SELL
+            side_str = side.value if isinstance(side, OrderSide) else str(side)
+            order_side = SELL if side_str.upper() == "SELL" else BUY
             order = OrderArgs(
                 token_id=token_id,
-                price=price,
-                size=size,
+                price=float(price),
+                size=float(size),
                 side=order_side
             )
             
             # Sign and post
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             signed_order = await loop.run_in_executor(
                 None,
                 self.client.create_order,
@@ -489,12 +656,12 @@ class PolymarketClientV2:
                 None,
                 self.client.post_order,
                 signed_order,
-                OrderType.GTC
+                OrderType.GTC if order_type.upper() == "GTC" else OrderType.GTC
             )
             
-            order_id = response.get('orderID', 'unknown')
+            order_id = response.get('orderID') or response.get('order_id') or 'unknown'
             logger.info("order_placed_successfully", order_id=order_id)
-            return order_id
+            return {"success": True, "order_id": order_id, "response": response}
             
         except Exception as e:
             logger.error(
@@ -505,7 +672,7 @@ class PolymarketClientV2:
                 token=token_id,
                 side=side
             )
-            return None
+            return {"success": False, "error": str(e)}
     
     async def get_markets(
         self,
@@ -526,7 +693,8 @@ class PolymarketClientV2:
             return []
         
         try:
-            loop = asyncio.get_event_loop()
+            await self._throttle()
+            loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
                 self.client.get_markets
@@ -575,7 +743,8 @@ class PolymarketClientV2:
             return None
         
         try:
-            loop = asyncio.get_event_loop()
+            await self._throttle()
+            loop = asyncio.get_running_loop()
             orderbook = await loop.run_in_executor(
                 None,
                 self.client.get_order_book,
@@ -606,7 +775,8 @@ class PolymarketClientV2:
             return False
         
         try:
-            loop = asyncio.get_event_loop()
+            await self._throttle()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
                 self.client.cancel,

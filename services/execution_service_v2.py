@@ -22,18 +22,50 @@ Standards:
 
 import asyncio
 import time
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 from decimal import Decimal
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from enum import Enum
-import structlog
+try:
+    import structlog
+    _structlog_available = True
+except ImportError:
+    structlog = None
+    _structlog_available = False
 from collections import defaultdict
 
 from data_feeds.polymarket_client_v2 import PolymarketClientV2, OrderSide
 from database.ledger_async import AsyncLedger
 
-logger = structlog.get_logger(__name__)
+if _structlog_available:
+    logger = structlog.get_logger(__name__)
+else:
+    import logging
+
+    logging.basicConfig(level=logging.INFO)
+    class _FallbackLogger:
+        def __init__(self, name: str):
+            self._logger = logging.getLogger(name)
+
+        def _log(self, level, event: str, **kwargs):
+            exc_info = kwargs.pop("exc_info", None)
+            message = f"{event} | {kwargs}" if kwargs else event
+            self._logger.log(level, message, exc_info=exc_info)
+
+        def debug(self, event: str, **kwargs):
+            self._log(logging.DEBUG, event, **kwargs)
+
+        def info(self, event: str, **kwargs):
+            self._log(logging.INFO, event, **kwargs)
+
+        def warning(self, event: str, **kwargs):
+            self._log(logging.WARNING, event, **kwargs)
+
+        def error(self, event: str, **kwargs):
+            self._log(logging.ERROR, event, **kwargs)
+
+    logger = _FallbackLogger(__name__)
 
 
 class OrderStatus(Enum):
@@ -105,6 +137,25 @@ class OrderResult:
             OrderStatus.FAILED,
             OrderStatus.EXPIRED
         ]
+
+
+class OrderResultDict(dict):
+    """Dict-like order result that preserves attribute access."""
+
+    def __getattr__(self, item):
+        try:
+            return self[item]
+        except KeyError as exc:
+            raise AttributeError(item) from exc
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+    def __delattr__(self, item):
+        try:
+            del self[item]
+        except KeyError as exc:
+            raise AttributeError(item) from exc
 
 
 class OrderState:
@@ -226,6 +277,20 @@ class ExecutionServiceV2:
             timeout_seconds=self.timeout_seconds,
             paper_trading=self.client.paper_trading
         )
+
+    def _result_dict(self, result: OrderResult) -> OrderResultDict:
+        return OrderResultDict({
+            "success": result.success,
+            "order_id": result.order_id,
+            "status": result.status,
+            "filled_quantity": result.filled_quantity,
+            "filled_price": result.filled_price,
+            "fees": result.fees,
+            "fills": result.fills,
+            "error": result.error,
+            "slippage_bps": result.slippage_bps,
+            "execution_time_ms": result.execution_time_ms,
+        })
     
     async def start(self):
         """Start background monitoring tasks."""
@@ -251,11 +316,12 @@ class ExecutionServiceV2:
         price: Decimal,
         order_type: str = "GTC",
         metadata: Optional[Dict] = None
-    ) -> OrderResult:
+    ) -> OrderResultDict:
         start_time = time.time()
         
         try:
-            order_side = OrderSide.BUY if side.upper() in ['YES', 'BUY'] else OrderSide.SELL
+            side_str = side.value if isinstance(side, OrderSide) else str(side)
+            order_side = OrderSide.SELL if side_str.upper() == 'SELL' else OrderSide.BUY
             request = OrderRequest(
                 strategy=strategy,
                 market_id=market_id,
@@ -268,33 +334,34 @@ class ExecutionServiceV2:
             )
         except ValueError as e:
             logger.error("invalid_order_request", error=str(e))
-            return OrderResult(
+            return self._result_dict(OrderResult(
                 success=False,
                 status=OrderStatus.REJECTED,
                 error=str(e)
-            )
+            ))
         
         for attempt in range(self.max_retries):
             try:
                 response = await self.client.place_order(
                     token_id=token_id,
                     side=order_side,
-                    price=price,
-                    size=quantity,
-                    order_type=order_type
+                    price=float(price),
+                    size=float(quantity),
+                    order_type=order_type,
+                    market_id=market_id
                 )
                 
-                if not response or not response.get('success'):
+                if not response or not isinstance(response, dict) or not response.get('success'):
                     if attempt < self.max_retries - 1:
                         await asyncio.sleep(2 ** attempt)
                         continue
                     else:
                         self.orders_failed += 1
-                        return OrderResult(
+                        return self._result_dict(OrderResult(
                             success=False,
                             status=OrderStatus.FAILED,
-                            error="Order submission failed"
-                        )
+                            error=response.get('error') if isinstance(response, dict) else "Order submission failed"
+                        ))
                 
                 order_id = response['order_id']
                 
@@ -370,7 +437,7 @@ class ExecutionServiceV2:
                     execution_time_ms=execution_time_ms
                 )
                 
-                return result
+                return self._result_dict(result)
             
             except Exception as e:
                 logger.error(
@@ -383,17 +450,17 @@ class ExecutionServiceV2:
                     await asyncio.sleep(2 ** attempt)
                 else:
                     self.orders_failed += 1
-                    return OrderResult(
+                    return self._result_dict(OrderResult(
                         success=False,
                         status=OrderStatus.FAILED,
                         error=str(e)
-                    )
+                    ))
         
-        return OrderResult(
+        return self._result_dict(OrderResult(
             success=False,
             status=OrderStatus.FAILED,
             error="Unknown error"
-        )
+        ))
     
     async def _wait_for_fills(
         self,

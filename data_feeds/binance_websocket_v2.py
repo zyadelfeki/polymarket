@@ -29,9 +29,41 @@ from decimal import Decimal
 from collections import deque
 from enum import Enum
 from dataclasses import dataclass
-import structlog
+try:
+    import structlog
+    _structlog_available = True
+except ImportError:
+    structlog = None
+    _structlog_available = False
 
-logger = structlog.get_logger(__name__)
+if _structlog_available:
+    logger = structlog.get_logger(__name__)
+else:
+    import logging
+
+    logging.basicConfig(level=logging.INFO)
+    class _FallbackLogger:
+        def __init__(self, name: str):
+            self._logger = logging.getLogger(name)
+
+        def _log(self, level, event: str, **kwargs):
+            exc_info = kwargs.pop("exc_info", None)
+            message = f"{event} | {kwargs}" if kwargs else event
+            self._logger.log(level, message, exc_info=exc_info)
+
+        def debug(self, event: str, **kwargs):
+            self._log(logging.DEBUG, event, **kwargs)
+
+        def info(self, event: str, **kwargs):
+            self._log(logging.INFO, event, **kwargs)
+
+        def warning(self, event: str, **kwargs):
+            self._log(logging.WARNING, event, **kwargs)
+
+        def error(self, event: str, **kwargs):
+            self._log(logging.ERROR, event, **kwargs)
+
+    logger = _FallbackLogger(__name__)
 
 
 class ConnectionState(Enum):
