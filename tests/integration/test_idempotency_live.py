@@ -1,5 +1,12 @@
-import pytest
+import os
+import sys
 from decimal import Decimal
+
+import pytest
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 from services.execution_service_v2 import ExecutionServiceV2
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
@@ -7,6 +14,9 @@ from data_feeds.polymarket_client_v2 import PolymarketClientV2
 
 class StubLedger:
     """Minimal ledger stub for testing (no DB required)."""
+
+    async def insert_order(self, **kwargs):
+        pass
 
     async def record_trade_entry(self, **kwargs):
         return 1
@@ -108,7 +118,9 @@ async def test_correlation_id_preserved_on_cache_hit():
     )
 
     assert result2["is_duplicate"] is True
-    assert result2["correlation_id"] == "corr_456"
+    assert result2["correlation_id"] == "corr_456", (
+        f"Should use new correlation_id, got {result2['correlation_id']}"
+    )
 
 
 @pytest.mark.asyncio
@@ -137,5 +149,5 @@ async def test_cache_metadata_includes_all_fields():
     ]
 
     for field in required_fields:
-        assert hasattr(result, field)
-        assert result[field] is not None
+        assert field in result.__dict__, f"Result missing required field: {field}"
+        assert result[field] is not None, f"Field {field} is None"
