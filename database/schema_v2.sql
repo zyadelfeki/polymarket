@@ -95,6 +95,28 @@ CREATE INDEX IF NOT EXISTS idx_tlines_account ON transaction_lines(account_id);
 CREATE INDEX IF NOT EXISTS idx_tlines_account_transaction ON transaction_lines(account_id, transaction_id);
 
 -- ==================================================================
+-- AUDIT LOG TABLE
+-- Critical state transitions for orders/positions/circuit breaker
+-- ==================================================================
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT,
+    old_state TEXT,
+    new_state TEXT,
+    reason TEXT,
+    context TEXT,
+    correlation_id TEXT,
+    details TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_time ON audit_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id);
+
+-- ==================================================================
 -- POSITIONS TABLE
 -- Trading positions tracking
 -- ==================================================================

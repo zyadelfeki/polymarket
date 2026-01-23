@@ -23,10 +23,14 @@ Standards:
 import aiosqlite
 import asyncio
 import os
-from typing import List, Dict, Optional, Tuple
+import json
+from typing import List, Dict, Optional, Tuple, Any
 from decimal import Decimal
 from datetime import datetime, timedelta
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from utils.decimal_json import dumps as decimal_dumps
+from services.correlation_context import inject_correlation
 try:
     from cachetools import TTLCache
     _cachetools_available = True
@@ -94,6 +98,7 @@ else:
 
         def _log(self, level, event: str, **kwargs):
             exc_info = kwargs.pop("exc_info", None)
+            kwargs = inject_correlation(kwargs)
             message = f"{event} | {kwargs}" if kwargs else event
             self._logger.log(level, message, exc_info=exc_info)
 
@@ -136,6 +141,11 @@ CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     description TEXT NOT NULL,
     transaction_type TEXT,
+    strategy TEXT,
+    reference_id TEXT,
+    correlation_id TEXT,
+    metadata TEXT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -157,13 +167,15 @@ CREATE TABLE IF NOT EXISTS positions (
     market_id TEXT NOT NULL,
     token_id TEXT NOT NULL,
     strategy TEXT NOT NULL,
-    entry_price DECIMAL(10, 6) NOT NULL,
+    entry_price DECIMAL(10, 8) NOT NULL,
     quantity DECIMAL(20, 8) NOT NULL,
-    current_price DECIMAL(10, 6),
-    exit_price DECIMAL(10, 6),
+    current_price DECIMAL(10, 8),
+    exit_price DECIMAL(10, 8),
     unrealized_pnl DECIMAL(20, 8) DEFAULT 0,
     realized_pnl DECIMAL(20, 8) DEFAULT 0,
     fees DECIMAL(20, 8) DEFAULT 0,
+    entry_fees DECIMAL(20, 8) DEFAULT 0,
+    exit_fees DECIMAL(20, 8) DEFAULT 0,
     status TEXT DEFAULT 'OPEN' CHECK(status IN ('OPEN', 'CLOSED')),
     entry_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     exit_timestamp TIMESTAMP,
@@ -199,13 +211,34 @@ CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     operation TEXT NOT NULL,
     entity_type TEXT NOT NULL,
-    entity_id INTEGER,
+    entity_id TEXT,
+    old_state TEXT,
+    new_state TEXT,
+    reason TEXT,
+    context TEXT,
+    correlation_id TEXT,
     details TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_time ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id);
+
+CREATE TABLE IF NOT EXISTS idempotency_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    order_id TEXT,
+    correlation_id TEXT,
+    status TEXT,
+    filled_quantity DECIMAL(20, 8) DEFAULT 0,
+    filled_price DECIMAL(10, 8) DEFAULT 0,
+    fees DECIMAL(20, 8) DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency_key ON idempotency_log(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_idempotency_order ON idempotency_log(order_id);
 """
 
 
@@ -342,6 +375,12 @@ class ConnectionPool:
 
                 cursor = await temp_conn.execute("PRAGMA table_info(positions)")
                 position_columns = [row[1] for row in await cursor.fetchall()]
+                if "side" not in position_columns:
+                    await temp_conn.execute("ALTER TABLE positions ADD COLUMN side TEXT")
+                if "entry_order_id" not in position_columns:
+                    await temp_conn.execute("ALTER TABLE positions ADD COLUMN entry_order_id TEXT")
+                if "exit_order_id" not in position_columns:
+                    await temp_conn.execute("ALTER TABLE positions ADD COLUMN exit_order_id TEXT")
                 if "position_id" not in position_columns:
                     await temp_conn.execute(
                         "ALTER TABLE positions ADD COLUMN position_id INTEGER"
@@ -357,6 +396,64 @@ class ConnectionPool:
                         BEGIN
                             UPDATE positions SET position_id = NEW.id WHERE id = NEW.id;
                         END;
+                        """
+                    )
+                    await temp_conn.commit()
+
+                cursor = await temp_conn.execute("PRAGMA table_info(transactions)")
+                transaction_columns = [row[1] for row in await cursor.fetchall()]
+                if "transaction_type" not in transaction_columns:
+                    await temp_conn.execute("ALTER TABLE transactions ADD COLUMN transaction_type TEXT")
+                if "strategy" not in transaction_columns:
+                    await temp_conn.execute("ALTER TABLE transactions ADD COLUMN strategy TEXT")
+                if "reference_id" not in transaction_columns:
+                    await temp_conn.execute("ALTER TABLE transactions ADD COLUMN reference_id TEXT")
+                if "correlation_id" not in transaction_columns:
+                    await temp_conn.execute("ALTER TABLE transactions ADD COLUMN correlation_id TEXT")
+                if "metadata" not in transaction_columns:
+                    await temp_conn.execute("ALTER TABLE transactions ADD COLUMN metadata TEXT")
+                if "timestamp" not in transaction_columns:
+                    await temp_conn.execute("ALTER TABLE transactions ADD COLUMN timestamp TIMESTAMP")
+                await temp_conn.commit()
+
+                cursor = await temp_conn.execute("PRAGMA table_info(audit_log)")
+                audit_columns = [row[1] for row in await cursor.fetchall()]
+                if "entity_id" not in audit_columns:
+                    await temp_conn.execute("ALTER TABLE audit_log ADD COLUMN entity_id TEXT")
+                if "old_state" not in audit_columns:
+                    await temp_conn.execute("ALTER TABLE audit_log ADD COLUMN old_state TEXT")
+                if "new_state" not in audit_columns:
+                    await temp_conn.execute("ALTER TABLE audit_log ADD COLUMN new_state TEXT")
+                if "reason" not in audit_columns:
+                    await temp_conn.execute("ALTER TABLE audit_log ADD COLUMN reason TEXT")
+                if "context" not in audit_columns:
+                    await temp_conn.execute("ALTER TABLE audit_log ADD COLUMN context TEXT")
+                if "correlation_id" not in audit_columns:
+                    await temp_conn.execute("ALTER TABLE audit_log ADD COLUMN correlation_id TEXT")
+                if "details" not in audit_columns:
+                    await temp_conn.execute("ALTER TABLE audit_log ADD COLUMN details TEXT")
+                await temp_conn.commit()
+
+                cursor = await temp_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='idempotency_log'"
+                )
+                if not await cursor.fetchone():
+                    await temp_conn.executescript(
+                        """
+                        CREATE TABLE IF NOT EXISTS idempotency_log (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            idempotency_key TEXT NOT NULL UNIQUE,
+                            order_id TEXT,
+                            correlation_id TEXT,
+                            status TEXT,
+                            filled_quantity DECIMAL(20, 8) DEFAULT 0,
+                            filled_price DECIMAL(10, 8) DEFAULT 0,
+                            fees DECIMAL(20, 8) DEFAULT 0,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency_key ON idempotency_log(idempotency_key);
+                        CREATE INDEX IF NOT EXISTS idx_idempotency_order ON idempotency_log(order_id);
                         """
                     )
                     await temp_conn.commit()
@@ -512,6 +609,32 @@ class AsyncLedger:
             pool_size=pool_size,
             cache_ttl=cache_ttl
         )
+
+    DECIMAL_COLUMNS = {
+        "balance",
+        "amount",
+        "entry_price",
+        "exit_price",
+        "current_price",
+        "filled_price",
+        "filled_quantity",
+        "quantity",
+        "fees",
+        "entry_fees",
+        "exit_fees",
+        "unrealized_pnl",
+        "realized_pnl",
+    }
+
+    def _convert_row(self, row: Tuple, columns: List[str]) -> Tuple:
+        converted: List[Any] = []
+        for idx, value in enumerate(row):
+            column = columns[idx]
+            if value is not None and column in self.DECIMAL_COLUMNS:
+                converted.append(Decimal(str(value)))
+            else:
+                converted.append(value)
+        return tuple(converted)
     
     async def initialize(self):
         """Explicitly initialize database schema and connection pool."""
@@ -549,8 +672,14 @@ class AsyncLedger:
             result = None
             if fetch_one:
                 result = await cursor.fetchone()
+                if result and cursor.description:
+                    columns = [col[0] for col in cursor.description]
+                    result = self._convert_row(result, columns)
             elif fetch_all:
                 result = await cursor.fetchall()
+                if result and cursor.description:
+                    columns = [col[0] for col in cursor.description]
+                    result = [self._convert_row(row, columns) for row in result]
             
             if commit:
                 await conn.commit()
@@ -579,226 +708,275 @@ class AsyncLedger:
         
         finally:
             await self.pool.release(conn)
-    
-    async def get_equity(self) -> Decimal:
+
+    async def execute(
+        self,
+        query: str,
+        params: Tuple = (),
+        fetch_one: bool = False,
+        fetch_all: bool = False,
+        commit: bool = False
+    ):
+        return await self._execute_query(
+            query,
+            params=params,
+            fetch_one=fetch_one,
+            fetch_all=fetch_all,
+            commit=commit
+        )
+
+    async def execute_scalar(self, query: str, params: Tuple = ()) -> Any:
+        result = await self._execute_query(query, params=params, fetch_one=True)
+        if not result:
+            return None
+        return result[0]
+
+    async def record_audit_event(
+        self,
+        *,
+        entity_type: str,
+        entity_id: Optional[str],
+        old_state: Optional[str],
+        new_state: Optional[str],
+        reason: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        correlation_id: Optional[str] = None,
+    ) -> None:
+        payload = context or {}
+        details_json = None
+        if payload:
+            details_json = decimal_dumps(payload)
+
+        await self._execute_query(
+            """
+            INSERT INTO audit_log
+            (operation, entity_type, entity_id, old_state, new_state, reason, context, correlation_id, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "STATE_CHANGE",
+                entity_type,
+                entity_id,
+                old_state,
+                new_state,
+                reason,
+                details_json,
+                correlation_id,
+                details_json,
+            ),
+            commit=True,
+        )
+
+    async def get_idempotency_record(self, idempotency_key: str) -> Optional[Dict]:
         """
-        Get current total equity (cached).
-        
+        Query idempotency_log table for existing order with this key.
+
         Returns:
-            Total equity in USD
+            Dict with order_id, status, filled_quantity, filled_price, fees if found
+            None if not found
         """
-        # Check cache
-        if 'equity' in self.equity_cache:
-            self.cache_hits += 1
-            return self.equity_cache['equity']
-        
-        self.cache_misses += 1
-        
-        # Query database
-        result = await self._execute_query(
-            "SELECT SUM(balance) FROM accounts WHERE account_type='ASSET'",
+        row = await self.execute(
+            """
+            SELECT order_id, status, filled_quantity, filled_price, fees, correlation_id
+            FROM idempotency_log
+            WHERE idempotency_key = ?
+            """,
+            (idempotency_key,),
             fetch_one=True
         )
-        
-        equity = Decimal(str(result[0])) if result and result[0] else Decimal('0')
-        
-        # Update cache
-        self.equity_cache['equity'] = equity
-        
-        logger.debug("equity_fetched", equity=float(equity))
-        
-        return equity
-    
-    async def get_account_balances(self) -> List[AccountBalance]:
-        """
-        Get all account balances.
-        
-        Returns:
-            List of AccountBalance objects
-        """
-        rows = await self._execute_query(
-            """
-            SELECT id, account_name, account_type, balance
-            FROM accounts
-            ORDER BY account_type, account_name
-            """,
-            fetch_all=True
-        )
-        
-        return [
-            AccountBalance(
-                account_id=row[0],
-                account_name=row[1],
-                account_type=row[2],
-                balance=Decimal(str(row[3]))
-            )
-            for row in rows
-        ]
-    
-    async def record_deposit(
+
+        if not row:
+            return None
+
+        return {
+            "order_id": row[0],
+            "status": row[1],
+            "filled_quantity": row[2] if isinstance(row[2], Decimal) else Decimal(str(row[2])),
+            "filled_price": row[3] if isinstance(row[3], Decimal) else Decimal(str(row[3])),
+            "fees": row[4] if isinstance(row[4], Decimal) else Decimal(str(row[4])),
+            "correlation_id": row[5],
+        }
+
+    async def record_idempotency(
         self,
-        amount: Decimal,
-        description: str = "Deposit"
-    ) -> int:
-        """
-        Record initial capital deposit.
-        
-        Args:
-            amount: Deposit amount
-            description: Transaction description
-        
-        Returns:
-            Transaction ID
-        """
-        async with self._write_lock:
-            conn = await self.pool.acquire()
-            try:
-                await conn.execute("BEGIN TRANSACTION")
-                
-                # Create transaction
-                cursor = await conn.execute(
-                    "INSERT INTO transactions (description) VALUES (?)",
-                    (description,)
-                )
-                tx_id = cursor.lastrowid
-                
-                # Debit: Cash account
-                await conn.execute(
-                    """
-                    INSERT INTO transaction_lines (transaction_id, account_id, amount)
-                    VALUES (?, (SELECT id FROM accounts WHERE account_name='Cash'), ?)
-                    """,
-                    (tx_id, str(amount))  # Use str() for exact Decimal precision
-                )
-                
-                # Credit: Equity account
-                await conn.execute(
-                    """
-                    INSERT INTO transaction_lines (transaction_id, account_id, amount)
-                    VALUES (?, (SELECT id FROM accounts WHERE account_name='Owner Equity'), ?)
-                    """,
-                    (tx_id, str(-amount))  # Use str() for exact Decimal precision
-                )
-                await conn.commit()
-                
-                # Invalidate cache
-                self.equity_cache.clear()
-                
-                logger.info(
-                    "deposit_recorded",
-                    transaction_id=tx_id,
-                    amount=float(amount)
-                )
-                
-                return tx_id
-            
-            except Exception as e:
-                await conn.rollback()
-                logger.error(
-                    "deposit_failed",
-                    error=str(e),
-                    amount=float(amount)
-                )
-                raise
-            
-            finally:
-                await self.pool.release(conn)
+        idempotency_key: str,
+        order_id: str,
+        correlation_id: str,
+        status: str = "PENDING"
+    ) -> None:
+        """Record order in idempotency_log."""
+        await self.execute(
+            """
+            INSERT OR IGNORE INTO idempotency_log (
+                idempotency_key, order_id, correlation_id, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (idempotency_key, order_id, correlation_id, status),
+            commit=True
+        )
+
+    async def update_idempotency(
+        self,
+        idempotency_key: str,
+        status: str,
+        filled_quantity: Decimal,
+        filled_price: Decimal,
+        fees: Decimal
+    ) -> None:
+        """Update idempotency record with fill details."""
+        await self.execute(
+            """
+            UPDATE idempotency_log
+            SET status = ?,
+                filled_quantity = ?,
+                filled_price = ?,
+                fees = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE idempotency_key = ?
+            """,
+            (str(status), str(filled_quantity), str(filled_price), str(fees), idempotency_key),
+            commit=True
+        )
 
     async def record_trade_entry(
         self,
+        order_id: str,
         market_id: str,
         token_id: str,
         strategy: str,
-        entry_price: Decimal,
+        side: str,
         quantity: Decimal,
-        fees: Decimal,
-        order_id: str,
-        metadata: Optional[Dict] = None
+        price: Decimal,
+        correlation_id: str,
+        **kwargs
     ) -> int:
-        """
-        Record trade entry (opening position).
+        """Record trade with double-entry accounting (SQLite version)."""
+        if "entry_price" in kwargs:
+            price = kwargs.get("entry_price")
+        if "metadata" in kwargs:
+            metadata = kwargs.get("metadata")
+        else:
+            metadata = None
 
-        Returns:
-            position_id
-        """
+        position_value = Decimal(str(quantity)) * Decimal(str(price))
         if quantity <= 0:
             raise ValueError(f"Quantity must be positive: {quantity}")
-        if entry_price <= 0 or entry_price > 1:
-            raise ValueError(f"Invalid entry price: {entry_price}")
+        if Decimal(str(price)) < Decimal("0.01") or Decimal(str(price)) > Decimal("0.99"):
+            raise ValueError(f"Invalid entry price: {price}")
 
         async with self._write_lock:
             conn = await self.pool.acquire()
             try:
                 await conn.execute("BEGIN TRANSACTION")
 
-                cursor = await conn.execute("PRAGMA table_info(positions)")
-                columns = [row[1] for row in await cursor.fetchall()]
-
-                insert_data = {
-                    "market_id": market_id,
-                    "token_id": token_id,
-                    "strategy": strategy,
-                    "entry_price": str(entry_price),
-                    "quantity": str(quantity),
-                    "status": "OPEN",
-                    "entry_timestamp": datetime.utcnow().isoformat(),
-                    "metadata": str(metadata) if metadata else None,
-                }
-
-                if "current_price" in columns:
-                    insert_data["current_price"] = str(entry_price)
-
-                if "unrealized_pnl" in columns:
-                    insert_data["unrealized_pnl"] = "0"
-
-                if "realized_pnl" in columns:
-                    insert_data["realized_pnl"] = "0"
-
-                if "fees" in columns:
-                    insert_data["fees"] = str(fees)
-
-                if "entry_order_id" in columns:
-                    insert_data["entry_order_id"] = order_id
-                elif "order_id" in columns:
-                    insert_data["order_id"] = order_id
-
-                insert_columns = [col for col in insert_data.keys() if col in columns]
-                insert_values = [insert_data[col] for col in insert_columns]
-
-                placeholders = ", ".join(["?"] * len(insert_columns))
-                column_list = ", ".join(insert_columns)
-
                 cursor = await conn.execute(
-                    f"INSERT INTO positions ({column_list}) VALUES ({placeholders})",
-                    tuple(insert_values),
-                )
-                position_id = cursor.lastrowid
-
-                # Record transaction
-                cost = entry_price * quantity + fees
-
-                cursor = await conn.execute(
-                    "INSERT INTO transactions (description) VALUES (?)",
-                    (f"Trade Entry: {strategy} - {market_id[:20]}",)
+                    """
+                    INSERT INTO transactions (description, transaction_type, strategy, reference_id, timestamp)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (f"Trade {side} {quantity} @ {price}", "TRADE", strategy, order_id)
                 )
                 tx_id = cursor.lastrowid
 
-                # Debit: Position asset
+                cursor = await conn.execute(
+                    "SELECT id FROM accounts WHERE account_name = 'Positions' LIMIT 1"
+                )
+                positions_account = (await cursor.fetchone())[0]
+
+                cursor = await conn.execute(
+                    "SELECT id FROM accounts WHERE account_name = 'Cash' LIMIT 1"
+                )
+                cash_account = (await cursor.fetchone())[0]
+
                 await conn.execute(
-                    """
-                    INSERT INTO transaction_lines (transaction_id, account_id, amount)
-                    VALUES (?, (SELECT id FROM accounts WHERE account_name='Positions'), ?)
-                    """,
-                    (tx_id, str(cost))  # Use str() for exact Decimal precision
+                    "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
+                    (tx_id, positions_account, str(position_value))
                 )
 
-                # Credit: Cash
+                await conn.execute(
+                    "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
+                    (tx_id, cash_account, str(-position_value))
+                )
+
+                metadata_payload = {"correlation_id": correlation_id}
+                if metadata is not None:
+                    metadata_payload["metadata"] = metadata
+
+                cursor = await conn.execute(
+                    """
+                    INSERT INTO positions
+                    (market_id, token_id, strategy, side, entry_price, quantity, status,
+                     entry_timestamp, entry_order_id, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, 'OPEN', CURRENT_TIMESTAMP, ?, ?)
+                    """,
+                    (
+                        market_id,
+                        token_id,
+                        strategy,
+                        side,
+                        str(price),
+                        str(quantity),
+                        order_id,
+                        decimal_dumps(metadata_payload) if correlation_id or metadata is not None else None
+                    )
+                )
+                position_id = cursor.lastrowid
+
                 await conn.execute(
                     """
-                    INSERT INTO transaction_lines (transaction_id, account_id, amount)
-                    VALUES (?, (SELECT id FROM accounts WHERE account_name='Cash'), ?)
+                    INSERT INTO audit_log
+                    (operation, entity_type, entity_id, old_state, new_state, reason, context, correlation_id, details)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (tx_id, str(-cost))  # Use str() for exact Decimal precision
+                    (
+                        "STATE_CHANGE",
+                        "position",
+                        str(position_id),
+                        None,
+                        "OPEN",
+                        "trade_entry",
+                        decimal_dumps({
+                            "market_id": market_id,
+                            "token_id": token_id,
+                            "quantity": quantity,
+                            "price": price,
+                            "strategy": strategy,
+                        }),
+                        correlation_id,
+                        decimal_dumps({
+                            "market_id": market_id,
+                            "token_id": token_id,
+                            "quantity": quantity,
+                            "price": price,
+                            "strategy": strategy,
+                        })
+                    )
+                )
+
+                await conn.execute(
+                    "INSERT INTO audit_log (operation, entity_type, entity_id, details) VALUES (?, ?, ?, ?)",
+                    (
+                        "CREATE",
+                        "TRANSACTION",
+                        tx_id,
+                        decimal_dumps({
+                            "position_value": str(position_value),
+                            "correlation_id": correlation_id
+                        })
+                    )
+                )
+
+                await conn.execute(
+                    "INSERT INTO audit_log (operation, entity_type, entity_id, details) VALUES (?, ?, ?, ?)",
+                    (
+                        "POST",
+                        "TRANSACTION",
+                        tx_id,
+                        decimal_dumps({
+                            "lines": 2,
+                            "correlation_id": correlation_id
+                        })
+                    )
                 )
 
                 await conn.commit()
@@ -811,9 +989,9 @@ class AsyncLedger:
                     "trade_entry_recorded",
                     position_id=position_id,
                     market_id=market_id,
-                    entry_price=float(entry_price),
-                    quantity=float(quantity),
-                    cost=float(cost)
+                    entry_price=str(price),
+                    quantity=str(quantity),
+                    cost=str(position_value)
                 )
 
                 return position_id
@@ -829,11 +1007,82 @@ class AsyncLedger:
 
             finally:
                 await self.pool.release(conn)
-    
+
+    async def record_deposit(self, amount: Decimal, description: str = "Initial deposit") -> int:
+        """
+        Record a cash deposit using double-entry accounting.
+
+        This increases the Cash account (asset).
+        In double-entry accounting, we need both sides:
+        - DEBIT: Cash account (asset increases)
+        - CREDIT: Equity account (owner's equity increases)
+
+        Args:
+            amount: Deposit amount (Decimal)
+            description: Description of the deposit
+
+        Returns:
+            transaction_id: The ID of the created transaction
+        """
+        amount = Decimal(str(amount))
+
+        async with self._write_lock:
+            conn = await self.pool.acquire()
+            try:
+                await conn.execute("BEGIN")
+                cursor = await conn.execute(
+                    """
+                    INSERT INTO transactions (description, transaction_type, strategy, reference_id, timestamp)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (description, "DEPOSIT", "SYSTEM", "INITIAL_DEPOSIT")
+                )
+                txn_id = cursor.lastrowid
+
+                cursor = await conn.execute("SELECT id FROM accounts WHERE account_name = 'Cash'")
+                cash_account = (await cursor.fetchone())[0]
+
+                cursor = await conn.execute("SELECT id FROM accounts WHERE account_name = 'Owner Equity'")
+                equity_account = (await cursor.fetchone())[0]
+
+                await conn.execute(
+                    "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
+                    (txn_id, cash_account, str(amount))
+                )
+
+                await conn.execute(
+                    "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
+                    (txn_id, equity_account, str(-amount))
+                )
+
+                await conn.execute(
+                    "INSERT INTO audit_log (operation, entity_type, entity_id, details) VALUES (?, ?, ?, ?)",
+                    (
+                        "CREATE",
+                        "TRANSACTION",
+                        txn_id,
+                        decimal_dumps({"amount": amount, "type": "DEPOSIT"})
+                    )
+                )
+
+                await conn.execute("COMMIT")
+
+                self.equity_cache.clear()
+                self.position_cache.clear()
+
+                return txn_id
+
+            except Exception:
+                await conn.execute("ROLLBACK")
+                raise
+
+            finally:
+                await self.pool.release(conn)
+
     async def get_open_positions(self) -> List[PositionData]:
         """
         Get all open positions.
-        
+
         Returns:
             List of PositionData objects
         """
@@ -851,7 +1100,7 @@ class AsyncLedger:
             """,
             fetch_all=True
         )
-        
+
         positions = []
         for row in rows:
             positions.append(PositionData(
@@ -861,63 +1110,27 @@ class AsyncLedger:
                 strategy=row[3],
                 entry_price=Decimal(str(row[4])),
                 quantity=Decimal(str(row[5])),
-                current_price=Decimal(str(row[6])) if row[6] else None,
+                current_price=Decimal(str(row[6])) if row[6] is not None else None,
                 unrealized_pnl=Decimal(str(row[7])),
                 realized_pnl=Decimal(str(row[8])),
                 status=row[9],
                 entry_timestamp=datetime.fromisoformat(row[10]),
                 exit_timestamp=datetime.fromisoformat(row[11]) if row[11] else None,
-                hold_time_seconds=float(row[12])
+                hold_time_seconds=float(row[12]) if row[12] is not None else 0.0
             ))
-        
+
         return positions
-    
-    async def update_position_prices(self, prices: Dict[str, Decimal]):
-        """
-        Update current prices for positions.
-        
-        Args:
-            prices: Dict of token_id -> price
-        """
-        conn = await self.pool.acquire()
-        
-        try:
-            for token_id, price in prices.items():
-                await conn.execute(
-                    """
-                    UPDATE positions
-                    SET current_price = ?,
-                        unrealized_pnl = (? - entry_price) * quantity
-                    WHERE token_id = ? AND status = 'OPEN'
-                    """,
-                    (str(price), str(price), token_id)  # Use str() for exact Decimal precision
-                )
-            
-            await conn.commit()
-            
-            # Invalidate caches
-            self.equity_cache.clear()
-            self.position_cache.clear()
-        
-        finally:
-            await self.pool.release(conn)
-    
+
     async def validate_ledger(self) -> bool:
         """
         Validate ledger integrity.
-        
+
         Checks:
         1. All transactions balance to zero
-        2. No orphaned records
-        3. Account balances match transaction history
-        
+
         Returns:
             True if valid
-        
-        Raises:
-            AssertionError if validation fails
         """
-        # Check 1: All transactions balance
         result = await self._execute_query(
             """
             SELECT transaction_id, SUM(amount)
@@ -927,7 +1140,7 @@ class AsyncLedger:
             """,
             fetch_all=True
         )
-        
+
         if result:
             unbalanced = [(row[0], row[1]) for row in result]
             logger.error(
@@ -936,70 +1149,56 @@ class AsyncLedger:
                 transactions=unbalanced
             )
             raise AssertionError(f"Unbalanced transactions: {unbalanced}")
-        
+
         logger.info("ledger_validation_passed")
         return True
-    
-    async def get_strategy_pnl(
-        self,
-        strategy: str,
-        days: int = 30
-    ) -> Dict:
+
+    async def get_equity(self) -> Decimal:
         """
-        Get PnL for a strategy.
-        
-        Args:
-            strategy: Strategy name
-            days: Number of days to look back
+        Get current total equity (cached).
         
         Returns:
-            PnL statistics dict
+            Total equity in USD
         """
-        cutoff = datetime.utcnow() - timedelta(days=days)
-        
-        result = await self._execute_query(
-            """
-            SELECT 
-                COUNT(*) as total_trades,
-                SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins,
-                SUM(realized_pnl) as net_pnl,
-                AVG(realized_pnl) as avg_pnl,
-                MAX(realized_pnl) as max_win,
-                MIN(realized_pnl) as max_loss
-            FROM positions
-            WHERE strategy = ?
-            AND status = 'CLOSED'
-            AND exit_timestamp >= ?
-            """,
-            (strategy, cutoff.isoformat()),
-            fetch_one=True
+        # Check cache (guard against TTL eviction race)
+        try:
+            equity = self.equity_cache['equity']
+            self.cache_hits += 1
+            return equity
+        except KeyError:
+            self.cache_misses += 1
+
+        txn_balance = await self.execute_scalar(
+            "SELECT COALESCE(SUM(amount), 0) FROM transaction_lines tl "
+            "JOIN accounts a ON tl.account_id=a.id WHERE a.account_type='ASSET'"
         )
-        
-        if not result or result[0] == 0:
-            return {
-                "total_trades": 0,
-                "wins": 0,
-                "win_rate": 0.0,
-                "net_pnl": 0.0,
-                "avg_pnl": 0.0,
-                "max_win": 0.0,
-                "max_loss": 0.0
-            }
-        
-        return {
-            "total_trades": result[0],
-            "wins": result[1],
-            "win_rate": result[1] / result[0] if result[0] > 0 else 0.0,
-            "net_pnl": result[2] or 0.0,
-            "avg_pnl": result[3] or 0.0,
-            "max_win": result[4] or 0.0,
-            "max_loss": result[5] or 0.0
-        }
-    
+        stored_balance = await self.execute_scalar(
+            "SELECT COALESCE(SUM(balance), 0) FROM accounts WHERE account_type='ASSET'"
+        )
+
+        txn_equity = Decimal(str(txn_balance)) if txn_balance is not None else Decimal('0')
+        stored_equity = Decimal(str(stored_balance)) if stored_balance is not None else Decimal('0')
+
+        if abs(txn_equity - stored_equity) > Decimal('0.01'):
+            logger.error(
+                "equity_mismatch",
+                calculated=str(txn_equity),
+                stored=str(stored_equity)
+            )
+
+        equity = txn_equity
+
+        # Update cache
+        self.equity_cache['equity'] = equity
+
+        logger.debug("equity_fetched", equity=str(equity))
+
+        return equity
+
     async def get_metrics(self) -> Dict:
         """
         Get ledger metrics.
-        
+
         Returns:
             Metrics dictionary
         """
@@ -1007,12 +1206,12 @@ class AsyncLedger:
             self.total_query_time_ms / self.queries_executed
             if self.queries_executed > 0 else 0.0
         )
-        
+
         cache_hit_rate = (
             self.cache_hits / (self.cache_hits + self.cache_misses)
             if (self.cache_hits + self.cache_misses) > 0 else 0.0
         )
-        
+
         return {
             "queries_executed": self.queries_executed,
             "avg_query_time_ms": avg_query_time,
@@ -1021,7 +1220,7 @@ class AsyncLedger:
             "cache_hit_rate": cache_hit_rate,
             "db_path": self.db_path
         }
-    
+
     async def close(self):
         """Close ledger and cleanup resources."""
         await self.pool.close_all()
@@ -1031,3 +1230,36 @@ class AsyncLedger:
             queries_executed=self.queries_executed,
             cache_hit_rate=self.cache_hits / max(1, self.cache_hits + self.cache_misses)
         )
+
+    @asynccontextmanager
+    async def transaction(self):
+        conn = await self.pool.acquire()
+        try:
+            await conn.execute("BEGIN TRANSACTION")
+            yield _LedgerTransaction(conn)
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await self.pool.release(conn)
+
+
+class _LedgerTransaction:
+    """Scoped transaction helper for AsyncLedger."""
+
+    def __init__(self, conn: aiosqlite.Connection):
+        self._conn = conn
+
+    async def execute(self, query: str, params: Tuple = ()) -> aiosqlite.Cursor:
+        return await self._conn.execute(query, params)
+
+    async def execute_scalar(self, query: str, params: Tuple = ()) -> Any:
+        cursor = await self._conn.execute(query, params)
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def last_insert_row_id(self) -> int:
+        cursor = await self._conn.execute("SELECT last_insert_rowid()")
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0

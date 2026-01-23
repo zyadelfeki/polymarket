@@ -11,6 +11,8 @@ if ROOT_DIR not in sys.path:
 from services.execution_service_v2 import ExecutionServiceV2
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
 
+VALID_MARKET_ID = "0x" + "b" * 64
+
 
 class StubLedger:
     """Minimal ledger stub for testing (no DB required)."""
@@ -20,6 +22,9 @@ class StubLedger:
 
     async def record_trade_entry(self, **kwargs):
         return 1
+
+    async def get_equity(self):
+        return Decimal("1000.00")
 
 
 @pytest.mark.asyncio
@@ -47,7 +52,7 @@ async def test_cache_hit_avoids_duplicate_market_call():
 
     result1 = await service.place_order(
         strategy="test",
-        market_id="0x123",
+        market_id=VALID_MARKET_ID,
         token_id="yes",
         side="BUY",
         quantity=Decimal("10"),
@@ -62,7 +67,7 @@ async def test_cache_hit_avoids_duplicate_market_call():
 
     result2 = await service.place_order(
         strategy="test",
-        market_id="0x123",
+        market_id=VALID_MARKET_ID,
         token_id="yes",
         side="BUY",
         quantity=Decimal("10"),
@@ -95,7 +100,7 @@ async def test_correlation_id_preserved_on_cache_hit():
 
     result1 = await service.place_order(
         strategy="test",
-        market_id="0xcorr",
+        market_id=VALID_MARKET_ID,
         token_id="yes",
         side="BUY",
         quantity=Decimal("5"),
@@ -108,7 +113,7 @@ async def test_correlation_id_preserved_on_cache_hit():
 
     result2 = await service.place_order(
         strategy="test",
-        market_id="0xcorr",
+        market_id=VALID_MARKET_ID,
         token_id="yes",
         side="BUY",
         quantity=Decimal("5"),
@@ -132,7 +137,7 @@ async def test_cache_metadata_includes_all_fields():
 
     result = await service.place_order(
         strategy="metadata_test",
-        market_id="0xmeta",
+        market_id=VALID_MARKET_ID,
         token_id="no",
         side="SELL",
         quantity=Decimal("3.5"),

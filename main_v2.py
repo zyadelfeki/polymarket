@@ -14,6 +14,7 @@ import structlog
 import os
 import logging
 from dotenv import load_dotenv
+from utils.correlation_id import CorrelationIdFilter, structlog_correlation_processor
 
 # Load environment variables BEFORE any config initialization
 load_dotenv(override=True)
@@ -43,16 +44,10 @@ class TradingBot:
         self._heartbeat_task = None
     
     async def initialize(self):
-        print("\n" + "="*60)
-        print("POLYMARKET LATENCY ARBITRAGE BOT V2")
-        print("="*60)
-        print(f"Mode: {self.config['mode']}")
-        print(f"Capital: ${self.config['initial_capital']:.2f}")
-        print(f"Debug: {self.config.get('debug', False)}")
-        print("="*60 + "\n")
+        logger.info("startup_banner", mode=self.config["mode"], capital=str(self.config["initial_capital"]), debug=self.config.get("debug", False))
         
         # STEP 1: Database
-        print("[1/6] Initializing database...")
+        logger.info("init_step", step="1/6", action="initializing_database")
         
         # CRITICAL: :memory: databases are per-connection in SQLite
         # For paper trading with connection pooling, use a temp file instead
@@ -63,23 +58,23 @@ class TradingBot:
         
         self.ledger = AsyncLedger(db_path=db_path, pool_size=10, cache_ttl=5)
         
-        print("  - Creating database schema...")
+        logger.info("database_schema_create_start")
         try:
             await self.ledger.initialize()
-            print("  ✓ Schema created")
+            logger.info("database_schema_created")
         except Exception as e:
-            print(f"  ✗ Schema creation FAILED: {e}")
+            logger.error("database_schema_failed", error=str(e))
             raise
         
         # Verify tables exist
-        print("  - Verifying tables...")
+        logger.info("database_schema_verify_start")
         try:
             conn = await self.ledger.pool.acquire()
             try:
                 cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 tables = await cursor.fetchall()
                 table_names = [t[0] for t in tables]
-                print(f"  ✓ Tables found: {', '.join(table_names)}")
+            logger.info("database_tables_found", tables=table_names)
                 
                 if 'transactions' not in table_names:
                     raise RuntimeError("transactions table missing after schema init!")
@@ -88,13 +83,13 @@ class TradingBot:
             finally:
                 await self.ledger.pool.release(conn)
         except Exception as e:
-            print(f"  ✗ Table verification FAILED: {e}")
+            logger.error("database_table_verification_failed", error=str(e))
             raise
         
         logger.info("ledger_initialized", db_path=db_path)
         
         # STEP 2: Client
-        print("\n[2/6] Initializing API client...")
+        logger.info("init_step", step="2/6", action="initializing_api_client")
         private_key = None
         if self.config['mode'] == 'live':
             private_key = os.getenv('POLYMARKET_PRIVATE_KEY')
@@ -106,24 +101,24 @@ class TradingBot:
             paper_trading=(self.config['mode'] == 'paper'),
             rate_limit=10.0
         )
-        print(f"  ✓ Client ready (paper={self.config['mode'] == 'paper'})")
+        logger.info("client_ready", paper_trading=(self.config["mode"] == "paper"))
         
         # STEP 2.5: Sync wallet balance for live mode
         if self.config['mode'] == 'live':
-            print("\n[2.5/6] Syncing wallet balance...")
+            logger.info("init_step", step="2.5/6", action="sync_wallet_balance")
             try:
                 wallet_balance = await self.polymarket_client.get_usdc_balance()
                 logger.info("live_wallet_balance", amount=float(wallet_balance))
-                print(f"  - Wallet USDC balance: ${float(wallet_balance):.2f}")
+                logger.info("wallet_balance", amount=str(wallet_balance))
                 
                 # Check local ledger
                 local_equity = await self.ledger.get_equity()
-                print(f"  - Local ledger equity: ${float(local_equity):.2f}")
+                logger.info("ledger_equity", amount=str(local_equity))
                 
                 if local_equity == 0 and wallet_balance > 0:
-                    print(f"  - Syncing ${float(wallet_balance):.2f} to ledger...")
+                    logger.info("wallet_sync_start", amount=str(wallet_balance))
                     await self.ledger.record_deposit(wallet_balance, "Initial Wallet Sync")
-                    print(f"  ✓ Wallet synced to ledger")
+                    logger.info("wallet_sync_complete")
                 elif abs(local_equity - wallet_balance) > Decimal('0.01'):
                     logger.warning(
                         "wallet_ledger_mismatch",
@@ -131,48 +126,48 @@ class TradingBot:
                         ledger_equity=float(local_equity),
                         difference=float(abs(wallet_balance - local_equity))
                     )
-                    print(f"  ⚠ Warning: Wallet and ledger mismatch by ${float(abs(wallet_balance - local_equity)):.2f}")
+                    logger.warning("wallet_ledger_mismatch_warning", difference=str(abs(wallet_balance - local_equity)))
                 else:
-                    print(f"  ✓ Wallet and ledger in sync")
+                    logger.info("wallet_ledger_in_sync")
             except Exception as e:
                 logger.error("wallet_sync_failed", error=str(e))
-                print(f"  ⚠ Wallet sync failed: {e}")
-                print(f"  - Continuing with manual capital initialization...")
+                logger.warning("wallet_sync_failed_warning", error=str(e))
         
         # STEP 3: Initial Capital
-        print("\n[3/6] Setting up capital...")
+        logger.info("init_step", step="3/6", action="setting_up_capital")
         equity = await self.ledger.get_equity()
-        print(f"  - Current equity: ${float(equity):.2f}")
+        logger.info("current_equity", amount=str(equity))
         
         if equity == 0 and self.config['mode'] == 'paper':
             initial_capital = Decimal(str(self.config['initial_capital']))
-            print(f"  - Depositing ${float(initial_capital):.2f}...")
+            logger.info("deposit_start", amount=str(initial_capital))
             await self.ledger.record_deposit(initial_capital, "Initial paper capital")
             equity = await self.ledger.get_equity()
-            print(f"  ✓ Deposit complete, equity: ${float(equity):.2f}")
+            logger.info("deposit_complete", equity=str(equity))
         
         # STEP 4: Execution
-        print("\n[4/6] Initializing execution service...")
+        logger.info("init_step", step="4/6", action="initializing_execution_service")
         self.execution_service = ExecutionServiceV2(
             polymarket_client=self.polymarket_client,
             ledger=self.ledger,
             config={'max_retries': 3, 'timeout_seconds': 30}
         )
         await self.execution_service.start()
-        print("  ✓ Execution service ready")
+        logger.info("execution_service_ready")
         
         # STEP 5: Circuit Breaker
-        print("\n[5/6] Initializing circuit breaker...")
+        logger.info("init_step", step="5/6", action="initializing_circuit_breaker")
         self.circuit_breaker = CircuitBreakerV2(
             initial_equity=equity,
             max_drawdown_pct=self.config.get('max_drawdown_pct', 15.0),
             max_loss_streak=self.config.get('max_loss_streak', 5),
-            daily_loss_limit_pct=self.config.get('daily_loss_limit_pct', 10.0)
+            daily_loss_limit_pct=self.config.get('daily_loss_limit_pct', 10.0),
+            audit_logger=self.ledger
         )
-        print(f"  ✓ Circuit breaker ready (max drawdown: {self.config.get('max_drawdown_pct', 15.0)}%)")
+        logger.info("circuit_breaker_ready", max_drawdown_pct=self.config.get('max_drawdown_pct', 15.0))
         
         # STEP 6: Strategy
-        print("\n[6/6] Initializing strategy...")
+        logger.info("init_step", step="6/6", action="initializing_strategy")
         self.strategy = LatencyArbitrageEngine(
             ledger=self.ledger,
             polymarket_client=self.polymarket_client,
@@ -190,20 +185,19 @@ class TradingBot:
                 'debug': self.config.get('debug', False)
             }
         )
-        print("  ✓ Strategy ready")
+        logger.info("strategy_ready")
         
-        print("\n" + "="*60)
-        print("INITIALIZATION COMPLETE")
-        print("="*60)
-        print(f"Equity: ${float(equity):.2f}")
-        print(f"Min Spread: {self.config.get('min_spread_bps', 50)} bps")
-        print(f"Max Spread: {self.config.get('max_spread_bps', 500)} bps")
-        print(f"Max Position: {self.config.get('max_position_pct', 10.0)}%")
-        print("="*60 + "\n")
+        logger.info(
+            "initialization_complete",
+            equity=str(equity),
+            min_spread_bps=self.config.get('min_spread_bps', 50),
+            max_spread_bps=self.config.get('max_spread_bps', 500),
+            max_position_pct=self.config.get('max_position_pct', 10.0)
+        )
     
     async def start(self):
         self.running = True
-        print("Starting strategy...\n")
+        logger.info("starting_strategy")
         
         heartbeat_interval = 10 if self.config.get('debug', False) else 30
         self._heartbeat_task = asyncio.create_task(self._heartbeat_monitor(heartbeat_interval))
@@ -314,7 +308,7 @@ class TradingBot:
 async def main():
     parser = argparse.ArgumentParser(description='Polymarket Latency Arbitrage Bot')
     parser.add_argument('--mode', choices=['paper', 'live'], default='paper')
-    parser.add_argument('--capital', type=float, default=10000)
+    parser.add_argument('--capital', type=str, default="10000")
     # Market: "Will the price of Bitcoin be above $94,000 on January 13?"
     parser.add_argument('--market', default='0xd3460cd313aa9759ea67a966e9a499cb65964d6e2a2ff6902472aa83005383bb')
     parser.add_argument('--min-spread', type=int, default=50)
@@ -328,6 +322,7 @@ async def main():
     
     structlog.configure(
         processors=[
+            structlog_correlation_processor,
             structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
             structlog.processors.StackInfoRenderer(),
@@ -342,12 +337,13 @@ async def main():
     
     logging.basicConfig(
         level=log_level,
-        format='%(message)s'
+        format='%(asctime)s | %(levelname)s | %(name)s | %(correlation_id)s | %(message)s'
     )
+    logging.getLogger().addFilter(CorrelationIdFilter())
     
     config = {
         'mode': args.mode,
-        'initial_capital': args.capital,
+        'initial_capital': Decimal(str(args.capital)),
         'market_id': args.market,
         'min_spread_bps': args.min_spread,
         'max_spread_bps': args.max_spread,
@@ -380,7 +376,7 @@ async def main():
         raise
     finally:
         await bot.stop()
-        print("\nShutdown complete.")
+        logger.info("shutdown_complete")
 
 
 if __name__ == '__main__':
@@ -389,5 +385,5 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        print(f"\nFATAL: {e}")
+        logger.error("fatal_startup_error", error=str(e))
         sys.exit(1)

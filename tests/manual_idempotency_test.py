@@ -1,5 +1,7 @@
 """Manual idempotency validation for production deployment."""
 import asyncio
+import tempfile
+import pytest
 from decimal import Decimal
 
 from services.execution_service_v2 import ExecutionServiceV2
@@ -7,10 +9,14 @@ from data_feeds.polymarket_client_v2 import PolymarketClientV2
 from database.ledger_async import AsyncLedger
 
 
+@pytest.mark.asyncio
 async def test_duplicate():
     """Verify duplicate order prevention in real execution environment."""
     client = PolymarketClientV2(paper_trading=True)
-    ledger = AsyncLedger(":memory:")
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp_db:
+        db_path = tmp_db.name
+
+    ledger = AsyncLedger(db_path=db_path)
     service = ExecutionServiceV2(client, ledger)
 
     # First call (will place order)

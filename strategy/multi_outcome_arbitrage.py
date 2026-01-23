@@ -164,7 +164,7 @@ class MultiOutcomeArbitrageEngine:
             
             if not order or not order.get('success'):
                 logger.error(f"Failed to buy {outcome['outcome']} - aborting arb")
-                # TODO: Unwind previous orders
+                await self._unwind_orders(client, orders)
                 return None
             
             orders.append({
@@ -208,6 +208,31 @@ class MultiOutcomeArbitrageEngine:
         )
         
         return trade
+
+    async def _unwind_orders(self, client, orders: List[Dict]) -> None:
+        """Best-effort unwind for already placed orders."""
+        if not orders:
+            return
+        for order in orders:
+            token_id = order.get('token_id')
+            shares = order.get('shares')
+            if not token_id or not shares:
+                continue
+            try:
+                result = None
+                if hasattr(client, "market_sell"):
+                    result = client.market_sell(token_id, shares)
+                elif hasattr(client, "place_order"):
+                    result = client.place_order(token_id=token_id, side="SELL", amount=shares, price=1.0)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                if not result or not result.get("success"):
+                    logger.error(
+                        "unwind_failed",
+                        extra={"token_id": token_id, "shares": shares}
+                    )
+            except Exception as e:
+                logger.error(f"Unwind error for token {token_id}: {e}")
 
 
 # Example usage

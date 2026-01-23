@@ -53,6 +53,15 @@ class PolymarketClient:
     async def get_markets(self, active: bool = True, limit: int = 100) -> List[Dict]:
         try:
             markets = self.client.get_markets()
+
+            if isinstance(markets, dict):
+                markets = markets.get("data") or markets.get("markets") or []
+
+            if not isinstance(markets, list):
+                logger.warning("Unexpected markets response type")
+                markets = []
+
+            markets = [m for m in markets if isinstance(m, dict)]
             
             if active:
                 markets = [m for m in markets if not m.get("closed", False) and m.get("active", True)]

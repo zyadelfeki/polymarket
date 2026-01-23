@@ -3,6 +3,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from config.settings import settings
+from utils.correlation_id import CorrelationIdFilter
 
 class PerformanceLogger:
     def __init__(self):
@@ -41,13 +42,16 @@ def setup_logger():
     
     logging.basicConfig(
         level=getattr(logging, settings.LOG_LEVEL),
-        format='%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s',
+        format='%(asctime)s | %(levelname)-8s | %(name)-20s | %(correlation_id)s | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
         handlers=[
             logging.FileHandler(log_file),
             logging.StreamHandler(sys.stdout)
         ]
     )
+
+    root_logger = logging.getLogger()
+    root_logger.addFilter(CorrelationIdFilter())
     
     logger = logging.getLogger(__name__)
     logger.info(f"Logging initialized: {log_file}")

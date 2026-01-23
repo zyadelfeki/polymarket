@@ -159,7 +159,7 @@ class ComplementArbitrageEngine:
         no_order = client.market_buy(no_token_id, amount_no)
         if not no_order or not no_order.get('success'):
             logger.error("Failed to buy NO shares - attempting to unwind YES position")
-            # TODO: Sell YES shares to unwind
+            await self._unwind_position(client, yes_token_id, shares)
             return None
         
         # Calculate actual costs (may differ due to slippage)
@@ -200,6 +200,23 @@ class ComplementArbitrageEngine:
         )
         
         return trade
+
+    async def _unwind_position(self, client, token_id: str, shares: float) -> None:
+        """Best-effort unwind for a single token position."""
+        if not token_id or not shares:
+            return
+        try:
+            result = None
+            if hasattr(client, "market_sell"):
+                result = client.market_sell(token_id, shares)
+            elif hasattr(client, "place_order"):
+                result = client.place_order(token_id=token_id, side="SELL", amount=shares, price=1.0)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if not result or not result.get("success"):
+                logger.error(f"Unwind failed for token {token_id}")
+        except Exception as e:
+            logger.error(f"Unwind error for token {token_id}: {e}")
     
     def get_open_positions(self) -> List[Dict]:
         """

@@ -1,7 +1,7 @@
 """Idempotency utilities for order deduplication."""
 
 import time
-import hashlib
+import uuid
 from decimal import Decimal
 from typing import Dict, Optional, Tuple, Any
 
@@ -13,22 +13,24 @@ class IdempotencyKeyBuilder:
     def build(
         strategy: str,
         market_id: str,
+        token_id: str,
         side: str,
         quantity: Decimal,
         price: Decimal,
+        order_type: str = "GTC",
         override_key: Optional[str] = None,
     ) -> str:
         if override_key:
             return override_key
 
-        key_material = f"{strategy}_{market_id}_{side}_{quantity}_{price}"
-        return hashlib.md5(key_material.encode()).hexdigest()[:16]
+        key_material = f"{strategy}:{market_id}:{token_id}:{side}:{order_type}:{quantity}:{price}"
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, key_material))
 
 
 class IdempotencyCache:
     """Minimal in-memory TTL cache for order deduplication."""
 
-    def __init__(self, ttl_seconds: int = 300):
+    def __init__(self, ttl_seconds: Optional[int] = 86400):
         self.ttl_seconds = ttl_seconds
         self._cache: Dict[str, Tuple[Any, float]] = {}
 
@@ -37,11 +39,11 @@ class IdempotencyCache:
             return None
 
         result, timestamp = self._cache[key]
-        age = time.time() - timestamp
-
-        if age > self.ttl_seconds:
-            del self._cache[key]
-            return None
+        if self.ttl_seconds is not None:
+            age = time.time() - timestamp
+            if age > self.ttl_seconds:
+                del self._cache[key]
+                return None
 
         return result
 

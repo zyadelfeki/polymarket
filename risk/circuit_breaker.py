@@ -84,6 +84,24 @@ class CircuitBreaker:
             return True
         
         return False
+
+    def can_trade(self, current_equity: Decimal) -> bool:
+        """Compatibility helper for legacy callers."""
+        if current_equity is None or current_equity <= 0:
+            logger.warning("Circuit breaker: current equity unavailable or zero")
+            return False
+        self.update_capital(current_equity)
+        self._check_circuit_breaker()
+        return self.is_trading_allowed()
+
+    def reset_baseline(self, capital: Decimal) -> None:
+        """Reset baseline capital after ledger initialization."""
+        self.initial_capital = capital
+        self.current_capital = capital
+        self.peak_capital = capital
+        self.daily_start_capital = capital
+        self.daily_reset_time = datetime.utcnow()
+        logger.info(f"Circuit breaker baseline reset: ${capital}")
     
     def _reset_breaker(self):
         logger.info(f"Circuit breaker reset. Resuming trading.")

@@ -40,6 +40,8 @@ from services.execution_service_v2 import (
     OrderResult
 )
 
+VALID_MARKET_ID = "0x" + "f" * 64
+
 
 # ==================== FIXTURES ====================
 
@@ -343,13 +345,14 @@ async def test_ledger_trade_entry(ledger):
     
     # Record trade
     position_id = await ledger.record_trade_entry(
-        market_id='market_123',
+        order_id='order_123',
+        market_id=VALID_MARKET_ID,
         token_id='token_yes',
         strategy='test_strategy',
-        entry_price=Decimal('0.55'),
+        side='BUY',
         quantity=Decimal('100'),
-        fees=Decimal('0.50'),
-        order_id='order_123',
+        price=Decimal('0.55'),
+        correlation_id='corr_test_123',
         metadata={'test': True}
     )
     
@@ -358,7 +361,7 @@ async def test_ledger_trade_entry(ledger):
     # Check position was created
     positions = await ledger.get_open_positions()
     assert len(positions) == 1
-    assert positions[0].market_id == 'market_123'
+    assert positions[0].market_id == VALID_MARKET_ID
     assert positions[0].quantity == Decimal('100')
 
 
@@ -411,9 +414,9 @@ async def test_execution_service_place_order(execution_service, ledger):
     # Place order
     result = await execution_service.place_order(
         strategy='test_strategy',
-        market_id='market_123',
+        market_id=VALID_MARKET_ID,
         token_id='token_yes',
-        side='YES',
+        side='BUY',
         quantity=Decimal('50'),
         price=Decimal('0.55'),
         metadata={'test': True}
@@ -430,9 +433,9 @@ async def test_execution_service_invalid_order(execution_service):
     # Invalid price
     result = await execution_service.place_order(
         strategy='test',
-        market_id='market_123',
+        market_id=VALID_MARKET_ID,
         token_id='token_yes',
-        side='YES',
+        side='BUY',
         quantity=Decimal('50'),
         price=Decimal('1.50'),  # Invalid (> 0.99)
     )
@@ -449,9 +452,9 @@ async def test_execution_service_metrics(execution_service, ledger):
     # Place successful order
     await execution_service.place_order(
         strategy='test',
-        market_id='market_123',
+        market_id=VALID_MARKET_ID,
         token_id='token_yes',
-        side='YES',
+        side='BUY',
         quantity=Decimal('50'),
         price=Decimal('0.55')
     )
@@ -501,9 +504,9 @@ async def test_end_to_end_trade_flow(mock_polymarket_client, ledger):
         # 3. Place order
         result = await execution.place_order(
             strategy='latency_arb',
-            market_id='market_btc',
+            market_id=VALID_MARKET_ID,
             token_id='token_yes',
-            side='YES',
+            side='BUY',
             quantity=Decimal('100'),
             price=Decimal('0.60'),
             metadata={'symbol': 'BTC', 'threshold': 100000}
@@ -547,9 +550,9 @@ async def test_concurrent_order_placement(mock_polymarket_client, ledger):
         tasks = [
             execution.place_order(
                 strategy='test',
-                market_id=f'market_{i}',
+                market_id=f"0x{i:064x}",
                 token_id=f'token_{i}',
-                side='YES',
+                side='BUY',
                 quantity=Decimal('10'),
                 price=Decimal('0.50')
             )

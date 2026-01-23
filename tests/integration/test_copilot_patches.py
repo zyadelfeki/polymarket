@@ -26,6 +26,8 @@ from data_feeds.polymarket_client_v2 import PolymarketClientV2, OrderSide
 from services.execution_service_v2 import ExecutionServiceV2, OrderResult
 from strategies.latency_arbitrage import LatencyArbitrageEngine
 
+VALID_MARKET_ID = "0x" + "1" * 64
+
 
 class StubLedger:
     async def record_trade_entry(self, **kwargs):
@@ -50,16 +52,16 @@ async def test_order_execution_contract_returns_dict():
 
     result = await service.place_order(
         strategy="test",
-        market_id="market_1",
+        market_id=VALID_MARKET_ID,
         token_id="yes_token",
         side=OrderSide.BUY,
         quantity=Decimal("10"),
         price=Decimal("0.55"),
     )
 
-    assert isinstance(result, OrderResult)
-    assert hasattr(result, "success")
-    assert hasattr(result, "order_id")
+    assert isinstance(result, dict)
+    assert "success" in result
+    assert "order_id" in result
     assert isinstance(result.success, bool)
     assert isinstance(result.order_id, (str, type(None)))
 
@@ -123,7 +125,7 @@ class CaptureExecutionService:
             fees=Decimal("0"),
             fills=[],
             error=None,
-            slippage_bps=0.0,
+            slippage_bps=Decimal("0"),
             execution_time_ms=0.0,
         )
 
@@ -221,8 +223,8 @@ async def test_rate_limiter_throttles():
         await client.place_order(
             token_id="yes",
             side=OrderSide.BUY,
-            price=0.5,
-            size=1.0,
+            price=Decimal("0.5"),
+            size=Decimal("1"),
             order_type="GTC",
             market_id="m1",
         )
@@ -256,13 +258,12 @@ async def test_defensive_imports_missing_sdks(monkeypatch):
     result = await client.place_order(
         token_id="yes",
         side=OrderSide.BUY,
-        price=0.5,
-        size=1.0,
+        price=Decimal("0.5"),
+        size=Decimal("1"),
         order_type="GTC",
         market_id="m1",
     )
 
     assert client_module.POLYMARKET_AVAILABLE is False
-    assert isinstance(result, dict)
-    assert result["success"] is False
-    assert "error" in result
+    assert result.success is False
+    assert result.error is not None

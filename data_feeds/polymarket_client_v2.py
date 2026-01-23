@@ -13,7 +13,7 @@ import asyncio
 import time
 import json
 import uuid
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, getcontext
 from typing import Optional, Dict, List, Any
 from enum import Enum
 try:
@@ -24,6 +24,8 @@ except ImportError:
     _structlog_available = False
 
 _DISABLE_SDK_ENV = os.getenv("POLYMARKET_DISABLE_SDK", "").lower() in {"1", "true", "yes"}
+
+getcontext().prec = 18
 
 try:
     if _DISABLE_SDK_ENV:
@@ -57,6 +59,7 @@ else:
 
         def _log(self, level, event: str, **kwargs):
             exc_info = kwargs.pop("exc_info", None)
+            kwargs = inject_correlation(kwargs)
             message = f"{event} | {kwargs}" if kwargs else event
             self._logger.log(level, message, exc_info=exc_info)
 
@@ -73,6 +76,10 @@ else:
             self._log(logging.ERROR, event, **kwargs)
 
     logger = _FallbackLogger(__name__)
+
+from services.error_codes import ErrorCode
+from services.correlation_context import CorrelationContext, inject_correlation
+from services.validators import BoundaryValidator
 
 
 class OrderSide(Enum):
@@ -437,9 +444,9 @@ class PolymarketClientV2:
             logger.info(
                 "balance_check",
                 proxy=self.proxy_address,
-                bridged=float(bridged_decimal),
-                native=float(native_decimal),
-                total=float(total_decimal)
+                bridged=str(bridged_decimal),
+                native=str(native_decimal),
+                total=str(total_decimal)
             )
             
             return total_decimal
@@ -474,11 +481,11 @@ class PolymarketClientV2:
                 "market_id": market_id,
                 "question": f"Mock market: {market_id}",
                 "tokens": [
-                    {"token_id": "yes", "outcome": "YES", "price": 0.50},
-                    {"token_id": "no", "outcome": "NO", "price": 0.50}
+                    {"token_id": "yes", "outcome": "YES", "price": Decimal("0.50")},
+                    {"token_id": "no", "outcome": "NO", "price": Decimal("0.50")}
                 ],
-                "yes_price": 0.50,
-                "no_price": 0.50,
+                "yes_price": Decimal("0.50"),
+                "no_price": Decimal("0.50"),
                 "yes_token_id": "yes",
                 "no_token_id": "no",
                 "mock": True
@@ -621,16 +628,18 @@ class PolymarketClientV2:
                 no_token = no_token or tokens[1]
         return yes_token, no_token
 
-    def _extract_token_price(self, token: Dict) -> Optional[float]:
+    def _extract_token_price(self, token: Dict) -> Optional[Decimal]:
         price = token.get('price')
         if price is None:
             price = token.get('last_price')
         try:
-            return float(price) if price is not None else None
+            if price is None:
+                return None
+            return Decimal(str(price)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
         except Exception:
             return None
 
-    async def _get_best_ask(self, token_id: Optional[str]) -> Optional[float]:
+    async def _get_best_ask(self, token_id: Optional[str]) -> Optional[Decimal]:
         if not token_id:
             return None
         await self._throttle()
@@ -640,7 +649,10 @@ class PolymarketClientV2:
         asks = orderbook.get("asks", [])
         if asks:
             try:
-                return float(asks[0].get("price"))
+                price = asks[0].get("price")
+                if price is None:
+                    return None
+                return Decimal(str(price)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
             except Exception:
                 return None
         return None
@@ -653,8 +665,9 @@ class PolymarketClientV2:
         size: Any,
         order_type: str = "GTC",
         market_id: Optional[str] = None,
-        correlation_id: Optional[str] = None
-    ) -> Dict:
+        correlation_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None
+    ):
         """
         Place an order.
         
@@ -671,16 +684,52 @@ class PolymarketClientV2:
         # Paper trading simulation
         await self._throttle()
 
-        price_dec = Decimal(str(price))
-        size_dec = Decimal(str(size))
+        from services.execution_service_v2 import OrderResult, OrderStatus
 
-        if not (Decimal('0.01') <= price_dec <= Decimal('0.99')):
-            logger.error("invalid_price", price=str(price_dec), valid_range="0.01-0.99", correlation_id=correlation_id)
-            return {"success": False, "error": "invalid_price", "error_code": "invalid_price"}
+        correlation_id = correlation_id or CorrelationContext.get()
 
-        if size_dec <= 0:
-            logger.error("invalid_size", size=str(size_dec), correlation_id=correlation_id)
-            return {"success": False, "error": "invalid_size", "error_code": "invalid_quantity"}
+        if isinstance(price, float) or isinstance(size, float):
+            logger.error(
+                "invalid_decimal_input",
+                **inject_correlation({
+                    "error": "float_not_allowed",
+                    "error_code": ErrorCode.INVALID_ORDER.value
+                })
+            )
+            return OrderResult(
+                success=False,
+                status=OrderStatus.REJECTED,
+                error="float_not_allowed",
+                error_code=ErrorCode.INVALID_ORDER.value,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key
+            )
+
+        try:
+            price_dec = BoundaryValidator.validate_price(price)
+            size_dec = BoundaryValidator.validate_quantity(size)
+        except ValueError as exc:
+            error_message = str(exc)
+            error_code = ErrorCode.INVALID_ORDER.value
+            if "price" in error_message.lower():
+                error_code = ErrorCode.INVALID_PRICE.value
+            elif "quantity" in error_message.lower():
+                error_code = ErrorCode.INVALID_QUANTITY.value
+            logger.error(
+                "invalid_order_input",
+                **inject_correlation({
+                    "error": error_message,
+                    "error_code": error_code
+                })
+            )
+            return OrderResult(
+                success=False,
+                status=OrderStatus.REJECTED,
+                error=error_message,
+                error_code=error_code,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key
+            )
 
         if self.paper_trading:
             order_id = f"paper_{uuid.uuid4().hex}"
@@ -694,12 +743,34 @@ class PolymarketClientV2:
                 size=str(size_dec),
                 correlation_id=correlation_id
             )
-            return {"success": True, "order_id": order_id, "paper": True}
+            return OrderResult(
+                success=True,
+                order_id=order_id,
+                status=OrderStatus.SUBMITTED,
+                filled_quantity=Decimal("0"),
+                filled_price=Decimal("0"),
+                fees=Decimal("0"),
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key
+            )
         
         # Check authentication for live trading
         if not self.authenticated or not self.client:
-            logger.error("cannot_place_order", reason="not_authenticated", correlation_id=correlation_id)
-            return {"success": False, "error": "not_authenticated", "error_code": "not_authenticated"}
+            logger.error(
+                "cannot_place_order",
+                **inject_correlation({
+                    "reason": "not_authenticated",
+                    "error_code": ErrorCode.NOT_AUTHENTICATED.value
+                })
+            )
+            return OrderResult(
+                success=False,
+                status=OrderStatus.REJECTED,
+                error="not_authenticated",
+                error_code=ErrorCode.NOT_AUTHENTICATED.value,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key
+            )
         
         try:
             logger.info(
@@ -711,6 +782,15 @@ class PolymarketClientV2:
                 size=str(size_dec),
                 correlation_id=correlation_id
             )
+
+            if idempotency_key:
+                try:
+                    if hasattr(self.client, "set_header"):
+                        self.client.set_header("Idempotency-Key", idempotency_key)
+                    elif hasattr(self.client, "session") and hasattr(self.client.session, "headers"):
+                        self.client.session.headers["Idempotency-Key"] = idempotency_key
+                except Exception:
+                    logger.debug("idempotency_header_set_failed", correlation_id=correlation_id)
             
             # Create order
             side_str = side.value if isinstance(side, OrderSide) else str(side)
@@ -739,7 +819,16 @@ class PolymarketClientV2:
             
             order_id = response.get('orderID') or response.get('order_id') or 'unknown'
             logger.info("order_placed_successfully", order_id=order_id)
-            return {"success": True, "order_id": order_id, "response": response}
+            return OrderResult(
+                success=True,
+                order_id=order_id,
+                status=OrderStatus.SUBMITTED,
+                filled_quantity=Decimal("0"),
+                filled_price=Decimal("0"),
+                fees=Decimal("0"),
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key
+            )
             
         except Exception as e:
             logger.error(
@@ -749,9 +838,17 @@ class PolymarketClientV2:
                 market=market_id,
                 token=token_id,
                 side=side,
+                error_code=ErrorCode.ORDER_SUBMISSION_FAILED.value,
                 correlation_id=correlation_id
             )
-            return {"success": False, "error": str(e), "error_code": "order_submission_failed"}
+            return OrderResult(
+                success=False,
+                status=OrderStatus.FAILED,
+                error=str(e),
+                error_code=ErrorCode.ORDER_SUBMISSION_FAILED.value,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key
+            )
     
     async def get_markets(
         self,
@@ -807,6 +904,104 @@ class PolymarketClientV2:
         except Exception as e:
             logger.error("markets_fetch_failed", error=str(e), exc_info=True)
             return []
+
+    async def get_active_markets(self, limit: int = 100) -> List[Dict]:
+        """Compatibility helper for strategy modules."""
+        return await self.get_markets(active=True, limit=limit)
+
+    async def get_positions(self) -> List[Dict]:
+        """Get open positions if available."""
+        if self.paper_trading:
+            return []
+        if not self.authenticated or not self.client:
+            logger.error("cannot_get_positions", reason="not_authenticated")
+            return []
+
+        try:
+            await self._throttle()
+            loop = asyncio.get_running_loop()
+            if hasattr(self.client, "get_positions"):
+                return await loop.run_in_executor(None, self.client.get_positions)
+            if hasattr(self.client, "list_positions"):
+                return await loop.run_in_executor(None, self.client.list_positions)
+            logger.warning("get_positions_not_available")
+            return []
+        except Exception as e:
+            logger.error("positions_fetch_failed", error=str(e))
+            return []
+
+    async def get_account_balance(self) -> Decimal:
+        """Return total USDC balance as Decimal."""
+        if self.paper_trading:
+            return Decimal("0")
+        try:
+            return await self.get_usdc_balance()
+        except Exception as e:
+            logger.error("balance_fetch_failed", error=str(e))
+            return Decimal("0")
+
+    def _parse_orderbook_side(self, entries: List[Dict], pick_max: bool) -> tuple:
+        best_price = None
+        total_size = Decimal("0")
+
+        for entry in entries or []:
+            try:
+                price_val = entry.get("price") if isinstance(entry, dict) else None
+                size_val = entry.get("size") if isinstance(entry, dict) else None
+                if price_val is None:
+                    continue
+                price_dec = Decimal(str(price_val)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+                size_dec = Decimal(str(size_val)) if size_val is not None else Decimal("0")
+                total_size += size_dec
+
+                if best_price is None:
+                    best_price = price_dec
+                else:
+                    if pick_max and price_dec > best_price:
+                        best_price = price_dec
+                    if not pick_max and price_dec < best_price:
+                        best_price = price_dec
+            except Exception:
+                continue
+
+        if best_price is None:
+            best_price = Decimal("0")
+        return best_price, total_size
+
+    async def get_market_orderbook_summary(self, market_id: str) -> Optional[Dict]:
+        """Return best bid/ask summary for a market (YES token)."""
+        market = await self.get_market(market_id)
+        if not market or market.get("error"):
+            return None
+        yes_token_id = market.get("yes_token_id")
+        if not yes_token_id:
+            return None
+        orderbook = await self.get_orderbook(yes_token_id)
+        if not orderbook:
+            yes_price = market.get("yes_price")
+            if yes_price is None:
+                return None
+            yes_price = Decimal(str(yes_price)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            return {
+                "market_id": market_id,
+                "bid": yes_price,
+                "ask": yes_price,
+                "bid_volume": Decimal("0"),
+                "ask_volume": Decimal("0"),
+            }
+        bids = orderbook.get("bids", [])
+        asks = orderbook.get("asks", [])
+
+        bid_price, bid_size = self._parse_orderbook_side(bids, pick_max=True)
+        ask_price, ask_size = self._parse_orderbook_side(asks, pick_max=False)
+
+        return {
+            "market_id": market_id,
+            "bid": bid_price,
+            "ask": ask_price,
+            "bid_volume": bid_size,
+            "ask_volume": ask_size,
+        }
     
     async def get_orderbook(self, token_id: str) -> Optional[Dict]:
         """

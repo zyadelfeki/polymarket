@@ -49,9 +49,18 @@ class Ledger:
         
         with self._get_connection() as conn:
             conn.executescript(schema)
+            self._ensure_position_columns(conn)
             conn.commit()
         
         logger.info(f"Ledger initialized at {self.db_path}")
+
+    def _ensure_position_columns(self, conn: sqlite3.Connection) -> None:
+        """Ensure positions table has expected columns for legacy DBs."""
+        cursor = conn.execute("PRAGMA table_info(positions)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        if "opened_at" not in columns:
+            conn.execute("ALTER TABLE positions ADD COLUMN opened_at TIMESTAMP")
     
     @contextmanager
     def _get_connection(self):
@@ -465,7 +474,7 @@ class Ledger:
                 JOIN transaction_lines tl ON t.id = tl.transaction_id
                 JOIN accounts a ON tl.account_id = a.id
                 WHERE t.transaction_type = 'TRADE_EXIT'
-                  AND t.timestamp >= datetime('now', ? || ' days')
+                  AND t.created_at >= datetime('now', ? || ' days')
             """,
                 (-days,)
             )

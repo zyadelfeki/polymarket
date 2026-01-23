@@ -18,12 +18,13 @@ Standards:
 """
 
 import asyncio
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 from dataclasses import dataclass
 from collections import deque
+from services.correlation_context import inject_correlation, CorrelationContext
 try:
     import structlog
     _structlog_available = True
@@ -43,6 +44,7 @@ else:
 
         def _log(self, level, event: str, **kwargs):
             exc_info = kwargs.pop("exc_info", None)
+            kwargs = inject_correlation(kwargs)
             message = f"{event} | {kwargs}" if kwargs else event
             self._logger.log(level, message, exc_info=exc_info)
 
@@ -57,6 +59,9 @@ else:
 
         def error(self, event: str, **kwargs):
             self._log(logging.ERROR, event, **kwargs)
+
+        def critical(self, event: str, **kwargs):
+            self._log(logging.CRITICAL, event, **kwargs)
 
     logger = _FallbackLogger(__name__)
 
@@ -119,7 +124,8 @@ class CircuitBreakerV2:
         daily_loss_limit_pct: float = 10.0,
         recovery_threshold_pct: float = 5.0,
         cooldown_minutes: int = 30,
-        half_open_max_position_pct: float = 2.0
+        half_open_max_position_pct: float = 2.0,
+        audit_logger: Optional[Any] = None
     ):
         """
         Initialize circuit breaker.
@@ -140,6 +146,7 @@ class CircuitBreakerV2:
         self.recovery_threshold_pct = recovery_threshold_pct
         self.cooldown_period = timedelta(minutes=cooldown_minutes)
         self.half_open_max_position_pct = half_open_max_position_pct
+        self.audit_logger = audit_logger
         
         # State
         self.state = CircuitState.CLOSED
@@ -181,6 +188,37 @@ class CircuitBreakerV2:
             max_loss_streak=max_loss_streak,
             daily_loss_limit_pct=daily_loss_limit_pct
         )
+
+    async def _record_audit_event(
+        self,
+        *,
+        old_state: CircuitState,
+        new_state: CircuitState,
+        reason: Optional[str] = None,
+        context: Optional[Dict] = None,
+    ) -> None:
+        if not self.audit_logger:
+            return
+        correlation_id = CorrelationContext.get()
+        payload = context or {}
+        if hasattr(self.audit_logger, "record_audit_event"):
+            await self.audit_logger.record_audit_event(
+                entity_type="circuit_breaker",
+                entity_id="circuit_breaker",
+                old_state=old_state.value,
+                new_state=new_state.value,
+                reason=reason,
+                context=payload,
+                correlation_id=correlation_id,
+            )
+        elif callable(self.audit_logger):
+            await self.audit_logger(
+                old_state=old_state.value,
+                new_state=new_state.value,
+                reason=reason,
+                context=payload,
+                correlation_id=correlation_id,
+            )
     
     async def can_trade(
         self,
@@ -348,6 +386,17 @@ class CircuitBreakerV2:
         
         self.state_history.append(event)
         self.trip_history.append(event)
+
+        await self._record_audit_event(
+            old_state=previous_state,
+            new_state=CircuitState.OPEN,
+            reason=reason.value,
+            context={
+                "equity": equity,
+                "drawdown_pct": drawdown_pct,
+                "consecutive_losses": self.consecutive_losses,
+            },
+        )
         
         logger.critical(
             "circuit_breaker_tripped",
@@ -393,6 +442,17 @@ class CircuitBreakerV2:
             )
             
             self.state_history.append(event)
+
+            await self._record_audit_event(
+                old_state=previous_state,
+                new_state=CircuitState.HALF_OPEN,
+                reason="recovery_attempt",
+                context={
+                    "equity": current_equity,
+                    "drawdown_pct": drawdown_pct,
+                    "recovery_attempt": self.recovery_attempts,
+                },
+            )
             
             logger.warning(
                 "circuit_breaker_half_open",
@@ -440,6 +500,19 @@ class CircuitBreakerV2:
             )
             
             self.state_history.append(event)
+
+            await self._record_audit_event(
+                old_state=previous_state,
+                new_state=CircuitState.CLOSED,
+                reason="recovered",
+                context={
+                    "equity": current_equity,
+                    "drawdown_pct": drawdown_pct,
+                    "half_open_trades": self.half_open_trades,
+                    "half_open_wins": self.half_open_wins,
+                    "win_rate": win_rate,
+                },
+            )
             
             logger.info(
                 "circuit_breaker_recovered",
@@ -471,6 +544,19 @@ class CircuitBreakerV2:
             )
             
             self.state_history.append(event)
+
+            await self._record_audit_event(
+                old_state=previous_state,
+                new_state=CircuitState.OPEN,
+                reason="recovery_failed",
+                context={
+                    "equity": current_equity,
+                    "drawdown_pct": drawdown_pct,
+                    "half_open_trades": self.half_open_trades,
+                    "half_open_wins": self.half_open_wins,
+                    "win_rate": win_rate,
+                },
+            )
             
             logger.warning(
                 "circuit_breaker_recovery_failed",
@@ -535,6 +621,13 @@ class CircuitBreakerV2:
             )
             
             self.state_history.append(event)
+
+            await self._record_audit_event(
+                old_state=previous_state,
+                new_state=CircuitState.CLOSED,
+                reason=TripReason.MANUAL.value,
+                context={},
+            )
             
             logger.warning("circuit_breaker_manual_reset")
     

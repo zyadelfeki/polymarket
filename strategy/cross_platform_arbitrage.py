@@ -367,7 +367,7 @@ class CrossPlatformArbitrageEngine:
         
         if not kalshi_order:
             logger.error("Failed to execute Kalshi order - attempting to unwind Polymarket")
-            # TODO: Unwind Polymarket position
+            await self._unwind_polymarket(poly_client, opportunity.poly_token_id, shares)
             return None
         
         # Calculate expected profit
@@ -403,6 +403,23 @@ class CrossPlatformArbitrageEngine:
         )
         
         return trade
+
+    async def _unwind_polymarket(self, client, token_id: str, shares: float) -> None:
+        """Best-effort unwind for Polymarket leg after Kalshi failure."""
+        if not token_id or not shares:
+            return
+        try:
+            result = None
+            if hasattr(client, "market_sell"):
+                result = client.market_sell(token_id, shares)
+            elif hasattr(client, "place_order"):
+                result = client.place_order(token_id=token_id, side="SELL", amount=shares, price=1.0)
+            if asyncio.iscoroutine(result):
+                result = await result
+            if not result or not result.get("success"):
+                logger.error("polymarket_unwind_failed", extra={"token_id": token_id, "shares": shares})
+        except Exception as e:
+            logger.error(f"Polymarket unwind error for token {token_id}: {e}")
     
     def _place_kalshi_order(self, ticker: str, side: str, shares: int, price: int) -> Optional[Dict]:
         """

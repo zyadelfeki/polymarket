@@ -22,11 +22,10 @@ Standards:
 
 import asyncio
 import time
-import uuid
 from typing import Dict, Optional, List, Any
-from decimal import Decimal
-from datetime import datetime, timedelta
-from dataclasses import dataclass, field, replace
+from decimal import Decimal, getcontext
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
 from enum import Enum
 try:
     import structlog
@@ -36,10 +35,23 @@ except ImportError:
     _structlog_available = False
 from collections import defaultdict
 
+getcontext().prec = 18
+
 from data_feeds.polymarket_client_v2 import PolymarketClientV2, OrderSide
 from database.ledger_async import AsyncLedger
-from services.error_codes import ErrorCode
+from services.error_codes import (
+    ErrorCode,
+    TradingException,
+    ValidationError,
+    OperationalError,
+    RETRYABLE_CODES,
+)
 from services.idempotency import IdempotencyCache, IdempotencyKeyBuilder
+from services.validators import BoundaryValidator
+from services.correlation_context import CorrelationContext, inject_correlation
+from logs.precision_monitor import PrecisionMonitor, PrecisionError
+from services.retry import RetryableOperation
+from utils.correlation_id import generate_correlation_id
 
 if _structlog_available:
     logger = structlog.get_logger(__name__)
@@ -53,6 +65,7 @@ else:
 
         def _log(self, level, event: str, **kwargs):
             exc_info = kwargs.pop("exc_info", None)
+            kwargs = inject_correlation(kwargs)
             message = f"{event} | {kwargs}" if kwargs else event
             self._logger.log(level, message, exc_info=exc_info)
 
@@ -96,6 +109,10 @@ class OrderRequest:
     metadata: Dict = field(default_factory=dict)
     
     def __post_init__(self):
+        if not isinstance(self.quantity, Decimal):
+            raise TypeError(f"Quantity must be Decimal: {type(self.quantity)}")
+        if not isinstance(self.price, Decimal):
+            raise TypeError(f"Price must be Decimal: {type(self.price)}")
         if self.quantity <= 0:
             raise ValueError(f"Invalid quantity: {self.quantity}")
         if not (Decimal('0.01') <= self.price <= Decimal('0.99')):
@@ -117,24 +134,53 @@ class Fill:
         return self.quantity * self.price + self.fee
 
 
-@dataclass
-class OrderResult:
-    """Order execution result"""
-    success: bool
-    order_id: Optional[str] = None
-    status: OrderStatus = OrderStatus.PENDING
-    filled_quantity: Decimal = Decimal('0')
-    filled_price: Decimal = Decimal('0')
-    fees: Decimal = Decimal('0')
-    fills: List[Fill] = field(default_factory=list)
-    error: Optional[str] = None
-    error_code: Optional[str] = None
-    correlation_id: Optional[str] = None
-    idempotency_key: Optional[str] = None
-    is_duplicate: bool = False
-    slippage_bps: float = 0.0
-    execution_time_ms: float = 0.0
-    
+class OrderResult(dict):
+    """Order execution result (dict-like for compatibility)."""
+
+    def __init__(
+        self,
+        *,
+        success: bool,
+        order_id: Optional[str] = None,
+        status: OrderStatus = OrderStatus.PENDING,
+        filled_quantity: Decimal = Decimal('0'),
+        filled_price: Decimal = Decimal('0'),
+        fees: Decimal = Decimal('0'),
+        fills: Optional[List[Fill]] = None,
+        error: Optional[str] = None,
+        error_code: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        is_duplicate: bool = False,
+        slippage_bps: Decimal = Decimal("0"),
+        execution_time_ms: float = 0.0,
+    ):
+        super().__init__(
+            success=success,
+            order_id=order_id,
+            status=status,
+            filled_quantity=filled_quantity,
+            filled_price=filled_price,
+            fees=fees,
+            fills=fills or [],
+            error=error,
+            error_code=error_code,
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key,
+            is_duplicate=is_duplicate,
+            slippage_bps=slippage_bps,
+            execution_time_ms=execution_time_ms,
+        )
+
+    def __getattr__(self, item: str):
+        try:
+            return self[item]
+        except KeyError as exc:
+            raise AttributeError(item) from exc
+
+    def __setattr__(self, key: str, value) -> None:
+        self[key] = value
+
     @property
     def is_complete(self) -> bool:
         return self.status in [
@@ -142,14 +188,8 @@ class OrderResult:
             OrderStatus.CANCELLED,
             OrderStatus.REJECTED,
             OrderStatus.FAILED,
-            OrderStatus.EXPIRED
+            OrderStatus.EXPIRED,
         ]
-
-    def __getitem__(self, item: str):
-        return getattr(self, item)
-
-    def get(self, item: str, default=None):
-        return getattr(self, item, default)
 
 
 
@@ -162,7 +202,7 @@ class OrderState:
         self.order_id = order_id
         self.status = OrderStatus.PENDING
         self.fills: List[Fill] = []
-        self.created_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc)
         self.updated_at = self.created_at
         self.retries = 0
         self.error_count = 0
@@ -189,12 +229,12 @@ class OrderState:
     
     @property
     def age_seconds(self) -> float:
-        return (datetime.utcnow() - self.created_at).total_seconds()
+        return (datetime.now(timezone.utc) - self.created_at).total_seconds()
     
     def add_fill(self, fill: Fill):
         """Add a fill to this order."""
         self.fills.append(fill)
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(timezone.utc)
         
         if self.filled_quantity >= self.request.quantity:
             self.status = OrderStatus.FILLED
@@ -203,12 +243,12 @@ class OrderState:
     
     def mark_submitted(self):
         self.status = OrderStatus.SUBMITTED
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(timezone.utc)
     
     def mark_failed(self, error: str):
         self.status = OrderStatus.FAILED
         self.error_count += 1
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(timezone.utc)
         logger.error(
             "order_failed",
             order_id=self.order_id,
@@ -261,11 +301,12 @@ class ExecutionServiceV2:
         self.orders_placed = 0
         self.orders_filled = 0
         self.orders_failed = 0
-        self.total_slippage_bps = 0.0
+        self.total_slippage_bps = Decimal("0")
         self.total_fees = Decimal('0')
         self.execution_times_ms: List[float] = []
 
-        self._idempotency_cache = idempotency_cache or IdempotencyCache(ttl_seconds=300)
+        self._idempotency_cache = idempotency_cache or IdempotencyCache()
+        self.precision_monitor = PrecisionMonitor()
         
         self._monitor_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -282,6 +323,52 @@ class ExecutionServiceV2:
         self._monitor_task = asyncio.create_task(self._fill_monitor_loop())
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         logger.info("execution_service_started")
+
+    @staticmethod
+    def _resolve_error_code(value: Optional[str]) -> ErrorCode:
+        if not value:
+            return ErrorCode.UNKNOWN
+        for code in ErrorCode:
+            if code.value == value:
+                return code
+        return ErrorCode.UNKNOWN
+
+    async def _record_order_audit(
+        self,
+        *,
+        order_id: str,
+        old_state: Optional[str],
+        new_state: str,
+        reason: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        correlation_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> None:
+        if not hasattr(self.ledger, "record_audit_event"):
+            return
+        await self.ledger.record_audit_event(
+            entity_type="order",
+            entity_id=order_id,
+            old_state=old_state,
+            new_state=new_state,
+            reason=reason,
+            context={
+                **(context or {}),
+                "idempotency_key": idempotency_key,
+            },
+            correlation_id=correlation_id,
+        )
+
+    @staticmethod
+    def calculate_profit_loss(
+        quantity: Decimal,
+        entry_price: Decimal,
+        exit_price: Decimal,
+        fees: Decimal = Decimal("0")
+    ) -> Decimal:
+        if not all(isinstance(value, Decimal) for value in [quantity, entry_price, exit_price, fees]):
+            raise TypeError("Profit/loss inputs must be Decimal")
+        return (quantity * exit_price) - (quantity * entry_price) - fees
     
     async def stop(self):
         """Stop background tasks."""
@@ -305,224 +392,402 @@ class ExecutionServiceV2:
         idempotency_key: Optional[str] = None
     ) -> OrderResult:
         start_time = time.time()
-        correlation_id = correlation_id or str(uuid.uuid4())
+        correlation_id = correlation_id or generate_correlation_id()
         is_paper_trading = getattr(self.client, "paper_trading", False)
 
-        idempotency_key = IdempotencyKeyBuilder.build(
-            strategy=strategy,
-            market_id=market_id,
-            side=str(side),
-            quantity=quantity,
-            price=price,
-            override_key=idempotency_key
-        )
-
-        cached_result = self._idempotency_cache.get(idempotency_key)
-        if cached_result is not None:
-            cached_copy = replace(
-                cached_result,
-                correlation_id=correlation_id,
-                idempotency_key=idempotency_key,
-                is_duplicate=True
-            )
-            logger.info(
-                "order_deduplicated_cache_hit",
-                correlation_id=correlation_id,
-                idempotency_key=idempotency_key,
-                cached_order_id=cached_copy.order_id,
-                cached_success=cached_copy.success,
-                strategy=strategy,
-                market_id=market_id,
-                side=side,
-                quantity=str(quantity),
-                price=str(price)
-            )
-            return cached_copy
-        
-        try:
-            side_str = side.value if isinstance(side, OrderSide) else str(side)
-            order_side = OrderSide.SELL if side_str.upper() == 'SELL' else OrderSide.BUY
-            request = OrderRequest(
-                strategy=strategy,
-                market_id=market_id,
-                token_id=token_id,
-                side=order_side,
-                quantity=quantity,
-                price=price,
-                order_type=order_type,
-                metadata={
-                    **(metadata or {}),
-                    "correlation_id": correlation_id,
-                    "idempotency_key": idempotency_key,
-                }
-            )
-        except ValueError as e:
-            logger.error("invalid_order_request", error=str(e))
-            result = OrderResult(
-                success=False,
-                status=OrderStatus.REJECTED,
-                error=str(e),
-                error_code=ErrorCode.INVALID_PRICE.value if "price" in str(e).lower() else ErrorCode.INVALID_QUANTITY.value,
-                correlation_id=correlation_id,
-                idempotency_key=idempotency_key,
-                is_duplicate=False
-            )
-            self._idempotency_cache.set(idempotency_key, result)
-            return result
-        
-        for attempt in range(self.max_retries):
+        with CorrelationContext.use(correlation_id):
             try:
-                response = await self.client.place_order(
-                    token_id=token_id,
-                    side=order_side,
-                    price=price,
-                    size=quantity,
-                    order_type=order_type,
-                    market_id=market_id,
-                    correlation_id=correlation_id
-                )
-                
-                if not response or not isinstance(response, dict) or not response.get('success'):
-                    if attempt < self.max_retries - 1:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                    else:
-                        self.orders_failed += 1
-                        result = OrderResult(
-                            success=False,
-                            status=OrderStatus.FAILED,
-                            error=response.get('error') if isinstance(response, dict) else "Order submission failed",
-                            error_code=ErrorCode.ORDER_SUBMISSION_FAILED.value,
-                            correlation_id=correlation_id,
-                            idempotency_key=idempotency_key,
-                            is_duplicate=False
-                        )
-                        self._idempotency_cache.set(idempotency_key, result)
-                        return result
-                
-                order_id = response['order_id']
-                
-                order_state = OrderState(request, order_id)
-                order_state.mark_submitted()
-                
-                async with self.order_lock:
-                    self.orders[order_id] = order_state
-                
-                self.orders_placed += 1
-                
-                # PAPER TRADING: Simulate instant fill
-                if is_paper_trading:
-                    fill = Fill(
-                        fill_id=f"fill_{order_id}",
-                        order_id=order_id,
-                        quantity=quantity,
-                        price=price,
-                        fee=quantity * price * Decimal('0.002'),  # 0.2% fee
-                        timestamp=datetime.utcnow()
-                    )
-                    order_state.add_fill(fill)
-                    
-                    logger.info(
-                        "paper_fill_simulated",
-                        order_id=order_id,
-                        quantity=float(quantity),
-                        price=float(price),
-                        correlation_id=correlation_id
-                    )
+                if not token_id or not isinstance(token_id, str):
+                    raise ValueError("Invalid token_id")
+                market_id = BoundaryValidator.validate_market_id(market_id)
+                side_str = BoundaryValidator.validate_side(side)
+                quantity = BoundaryValidator.validate_quantity(quantity)
+                price = BoundaryValidator.validate_price(price)
+            except ValueError as e:
+                error_message = str(e)
+                if "price" in error_message.lower():
+                    error_code = ErrorCode.INVALID_PRICE.value
+                elif "quantity" in error_message.lower():
+                    error_code = ErrorCode.INVALID_QUANTITY.value
+                elif "token_id" in error_message.lower():
+                    error_code = ErrorCode.INVALID_ORDER.value
+                elif "market_id" in error_message.lower():
+                    error_code = ErrorCode.MARKET_NOT_FOUND.value
                 else:
-                    # LIVE TRADING: Wait for real fills
-                    await self._wait_for_fills(
-                        order_state,
-                        timeout=self.timeout_seconds
-                    )
-                
-                execution_time_ms = (time.time() - start_time) * 1000
-                self.execution_times_ms.append(execution_time_ms)
-                
-                slippage_bps = 0.0
-                if order_state.avg_fill_price > 0:
-                    slippage_bps = float(
-                        (order_state.avg_fill_price - price) / price * 10000
-                    )
-                    self.total_slippage_bps += abs(slippage_bps)
-                
-                self.total_fees += order_state.total_fees
-                
-                if order_state.filled_quantity > 0:
-                    await self._record_trade_in_ledger(
-                        order_state,
-                        correlation_id=correlation_id,
-                        idempotency_key=idempotency_key
-                    )
-                    if order_state.status == OrderStatus.FILLED:
-                        self.orders_filled += 1
-                
-                result = OrderResult(
-                    success=(order_state.filled_quantity > 0),
-                    order_id=order_id,
-                    status=order_state.status,
-                    filled_quantity=order_state.filled_quantity,
-                    filled_price=order_state.avg_fill_price,
-                    fees=order_state.total_fees,
-                    fills=order_state.fills,
-                    slippage_bps=slippage_bps,
-                    execution_time_ms=execution_time_ms,
+                    error_code = ErrorCode.INVALID_STATE.value
+                logger.error("invalid_order_request", **inject_correlation({"error": error_message, "error_code": error_code}))
+                return OrderResult(
+                    success=False,
+                    status=OrderStatus.REJECTED,
+                    error=error_message,
+                    error_code=error_code,
                     correlation_id=correlation_id,
                     idempotency_key=idempotency_key,
                     is_duplicate=False
                 )
-                
-                logger.info(
-                    "order_executed",
-                    order_id=order_id,
-                    status=order_state.status.value,
-                    filled_quantity=float(order_state.filled_quantity),
-                    avg_price=float(order_state.avg_fill_price),
-                    fees=float(order_state.total_fees),
-                    slippage_bps=slippage_bps,
-                    execution_time_ms=execution_time_ms,
-                    correlation_id=correlation_id
+
+            idempotency_key = IdempotencyKeyBuilder.build(
+                strategy=strategy,
+                market_id=market_id,
+                token_id=token_id,
+                side=side_str,
+                quantity=quantity,
+                price=price,
+                order_type=order_type,
+                override_key=idempotency_key
+            )
+
+            existing_record = await self._get_idempotency_record(idempotency_key)
+            if existing_record is not None:
+                status_value = existing_record.get("status") or OrderStatus.PENDING.value
+                try:
+                    existing_status = OrderStatus(status_value)
+                except ValueError:
+                    existing_status = OrderStatus.PENDING
+                duplicate_result = OrderResult(
+                    success=status_value in {OrderStatus.FILLED.value, OrderStatus.SUBMITTED.value, OrderStatus.PENDING.value},
+                    order_id=existing_record.get("order_id"),
+                    status=existing_status,
+                    filled_quantity=existing_record.get("filled_quantity", Decimal("0")),
+                    filled_price=existing_record.get("filled_price", Decimal("0")),
+                    fees=existing_record.get("fees", Decimal("0")),
+                    error=None,
+                    error_code=None,
+                    correlation_id=correlation_id,
+                    idempotency_key=idempotency_key,
+                    is_duplicate=True
                 )
-                
+                self._idempotency_cache.set(idempotency_key, duplicate_result)
+                logger.info(
+                    "order_deduplicated_db_hit",
+                    **inject_correlation({
+                        "idempotency_key": idempotency_key,
+                        "order_id": duplicate_result.order_id,
+                        "status": duplicate_result.status.value
+                    })
+                )
+                return duplicate_result
+
+            cached_result = self._idempotency_cache.get(idempotency_key)
+            if cached_result is not None:
+                cached_payload = dict(cached_result)
+                cached_payload.update(
+                    correlation_id=correlation_id,
+                    idempotency_key=idempotency_key,
+                    is_duplicate=True
+                )
+                cached_copy = OrderResult(**cached_payload)
+                logger.info(
+                    "order_deduplicated_cache_hit",
+                    **inject_correlation({
+                        "idempotency_key": idempotency_key,
+                        "cached_order_id": cached_copy.order_id,
+                        "cached_success": cached_copy.success,
+                        "strategy": strategy,
+                        "market_id": market_id,
+                        "side": side_str,
+                        "quantity": str(quantity),
+                        "price": str(price)
+                    })
+                )
+                return cached_copy
+
+            try:
+                order_side = OrderSide.SELL if side_str == "SELL" else OrderSide.BUY
+                request = OrderRequest(
+                    strategy=strategy,
+                    market_id=market_id,
+                    token_id=token_id,
+                    side=order_side,
+                    quantity=quantity,
+                    price=price,
+                    order_type=order_type,
+                    metadata={
+                        **(metadata or {}),
+                        "correlation_id": correlation_id,
+                        "idempotency_key": idempotency_key,
+                    }
+                )
+            except ValueError as e:
+                error_message = str(e)
+                if "price" in error_message.lower():
+                    error_code = ErrorCode.INVALID_PRICE.value
+                elif "quantity" in error_message.lower():
+                    error_code = ErrorCode.INVALID_QUANTITY.value
+                else:
+                    error_code = ErrorCode.INVALID_STATE.value
+                logger.error("invalid_order_request", **inject_correlation({"error": error_message, "error_code": error_code}))
+                result = OrderResult(
+                    success=False,
+                    status=OrderStatus.REJECTED,
+                    error=error_message,
+                    error_code=error_code,
+                    correlation_id=correlation_id,
+                    idempotency_key=idempotency_key,
+                    is_duplicate=False
+                )
                 self._idempotency_cache.set(idempotency_key, result)
                 return result
-            
+
+            async def submit_order() -> str:
+                try:
+                    response = await self.client.place_order(
+                        token_id=token_id,
+                        side=order_side,
+                        price=price,
+                        size=quantity,
+                        order_type=order_type,
+                        market_id=market_id,
+                        correlation_id=correlation_id,
+                        idempotency_key=idempotency_key
+                    )
+                except Exception as exc:
+                    raise OperationalError(
+                        ErrorCode.NETWORK_ERROR,
+                        str(exc),
+                        metadata={"stage": "client.place_order"}
+                    ) from exc
+
+                if isinstance(response, OrderResult):
+                    if not response.success:
+                        error_code = self._resolve_error_code(response.error_code)
+                        error_message = response.error or "Order submission failed"
+                        if error_code in RETRYABLE_CODES:
+                            raise OperationalError(error_code, error_message)
+                        raise ValidationError(error_code, error_message)
+                    return response.order_id
+
+                if not response or not isinstance(response, dict) or not response.get("success"):
+                    error_message = response.get("error") if isinstance(response, dict) else "Order submission failed"
+                    error_code_value = response.get("error_code") if isinstance(response, dict) else ErrorCode.ORDER_SUBMISSION_FAILED.value
+                    error_code = self._resolve_error_code(error_code_value)
+                    if error_code in RETRYABLE_CODES:
+                        raise OperationalError(error_code, error_message)
+                    raise ValidationError(error_code, error_message)
+
+                return response["order_id"]
+
+            try:
+                order_id = await RetryableOperation.run(
+                    submit_order,
+                    max_retries=self.max_retries
+                )
+            except TradingException as e:
+                status = OrderStatus.REJECTED if isinstance(e, ValidationError) else OrderStatus.FAILED
+                logger.error(
+                    "order_execution_error",
+                    **inject_correlation({
+                        "error": str(e),
+                        "error_code": e.code.value,
+                        "retryable": e.retryable
+                    })
+                )
+                self.orders_failed += 1
+                await self._record_order_audit(
+                    order_id=idempotency_key,
+                    old_state=None,
+                    new_state=status.value,
+                    reason="submission_failed",
+                    context=e.to_dict(),
+                    correlation_id=correlation_id,
+                    idempotency_key=idempotency_key
+                )
+                result = OrderResult(
+                    success=False,
+                    status=status,
+                    error=str(e),
+                    error_code=e.code.value,
+                    correlation_id=correlation_id,
+                    idempotency_key=idempotency_key,
+                    is_duplicate=False
+                )
+                self._idempotency_cache.set(idempotency_key, result)
+                return result
             except Exception as e:
                 logger.error(
                     "order_execution_error",
-                    error=str(e),
-                    attempt=attempt + 1,
-                    correlation_id=correlation_id
+                    **inject_correlation({
+                        "error": str(e),
+                        "error_code": ErrorCode.UNKNOWN.value
+                    })
                 )
-                
-                if attempt < self.max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    self.orders_failed += 1
-                    result = OrderResult(
-                        success=False,
-                        status=OrderStatus.FAILED,
-                        error=str(e),
-                        error_code=ErrorCode.NETWORK_ERROR.value,
+                self.orders_failed += 1
+                result = OrderResult(
+                    success=False,
+                    status=OrderStatus.FAILED,
+                    error=str(e),
+                    error_code=ErrorCode.UNKNOWN.value,
+                    correlation_id=correlation_id,
+                    idempotency_key=idempotency_key,
+                    is_duplicate=False
+                )
+                self._idempotency_cache.set(idempotency_key, result)
+                return result
+
+            await self._record_idempotency(
+                idempotency_key=idempotency_key,
+                order_id=order_id,
+                correlation_id=correlation_id,
+                status=OrderStatus.PENDING.value
+            )
+
+            order_state = OrderState(request, order_id)
+            await self._record_order_audit(
+                order_id=order_id,
+                old_state=None,
+                new_state=OrderStatus.PENDING.value,
+                reason="order_created",
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key
+            )
+            previous_status = order_state.status
+            order_state.mark_submitted()
+            await self._record_order_audit(
+                order_id=order_id,
+                old_state=previous_status.value,
+                new_state=order_state.status.value,
+                reason="order_submitted",
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key
+            )
+
+            async with self.order_lock:
+                self.orders[order_id] = order_state
+
+            self.orders_placed += 1
+
+            if is_paper_trading:
+                fill = Fill(
+                    fill_id=f"fill_{order_id}",
+                    order_id=order_id,
+                    quantity=quantity,
+                    price=price,
+                    fee=quantity * price * Decimal("0.002"),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                previous_status = order_state.status
+                order_state.add_fill(fill)
+                if previous_status != order_state.status:
+                    await self._record_order_audit(
+                        order_id=order_id,
+                        old_state=previous_status.value,
+                        new_state=order_state.status.value,
+                        reason="paper_fill",
                         correlation_id=correlation_id,
-                        idempotency_key=idempotency_key,
-                        is_duplicate=False
+                        idempotency_key=idempotency_key
                     )
-                    self._idempotency_cache.set(idempotency_key, result)
-                    return result
-        
-        result = OrderResult(
-            success=False,
-            status=OrderStatus.FAILED,
-            error="Unknown error",
-            error_code=ErrorCode.UNKNOWN.value,
-            correlation_id=correlation_id,
-            idempotency_key=idempotency_key,
-            is_duplicate=False
-        )
-        self._idempotency_cache.set(idempotency_key, result)
-        return result
+
+                logger.info(
+                    "paper_fill_simulated",
+                    **inject_correlation({
+                        "order_id": order_id,
+                        "quantity": str(quantity),
+                        "price": str(price)
+                    })
+                )
+            else:
+                await self._wait_for_fills(
+                    order_state,
+                    timeout=self.timeout_seconds
+                )
+
+            execution_time_ms = (time.time() - start_time) * 1000
+            self.execution_times_ms.append(execution_time_ms)
+
+            slippage_bps = Decimal("0")
+            if order_state.avg_fill_price > 0:
+                slippage_bps = (order_state.avg_fill_price - price) / price * Decimal("10000")
+                self.total_slippage_bps += abs(slippage_bps)
+
+            self.total_fees += order_state.total_fees
+
+            if order_state.filled_quantity > 0:
+                await self._record_trade_in_ledger(
+                    order_state,
+                    correlation_id=correlation_id,
+                    idempotency_key=idempotency_key
+                )
+                if order_state.status == OrderStatus.FILLED:
+                    self.orders_filled += 1
+
+            await self._update_idempotency(
+                idempotency_key=idempotency_key,
+                status=order_state.status.value,
+                filled_quantity=order_state.filled_quantity,
+                filled_price=order_state.avg_fill_price,
+                fees=order_state.total_fees
+            )
+
+            result = OrderResult(
+                success=(order_state.filled_quantity > 0),
+                order_id=order_id,
+                status=order_state.status,
+                filled_quantity=order_state.filled_quantity,
+                filled_price=order_state.avg_fill_price,
+                fees=order_state.total_fees,
+                fills=order_state.fills,
+                slippage_bps=slippage_bps,
+                execution_time_ms=execution_time_ms,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
+                is_duplicate=False
+            )
+
+            logger.info(
+                "order_executed",
+                **inject_correlation({
+                    "order_id": order_id,
+                    "status": order_state.status.value,
+                    "filled_quantity": str(order_state.filled_quantity),
+                    "avg_price": str(order_state.avg_fill_price),
+                    "fees": str(order_state.total_fees),
+                    "slippage_bps": str(slippage_bps),
+                    "execution_time_ms": execution_time_ms
+                })
+            )
+
+            self._idempotency_cache.set(idempotency_key, result)
+            return result
     
+    async def _get_idempotency_record(self, idempotency_key: str) -> Optional[Dict]:
+        if not hasattr(self.ledger, "get_idempotency_record"):
+            return None
+        return await self.ledger.get_idempotency_record(idempotency_key)
+
+    async def _record_idempotency(
+        self,
+        idempotency_key: str,
+        order_id: str,
+        correlation_id: Optional[str],
+        status: str
+    ) -> None:
+        if not hasattr(self.ledger, "record_idempotency"):
+            return
+        await self.ledger.record_idempotency(
+            idempotency_key=idempotency_key,
+            order_id=order_id,
+            correlation_id=correlation_id,
+            status=status
+        )
+
+    async def _update_idempotency(
+        self,
+        idempotency_key: str,
+        status: str,
+        filled_quantity: Decimal,
+        filled_price: Decimal,
+        fees: Decimal
+    ) -> None:
+        if not hasattr(self.ledger, "update_idempotency"):
+            return
+        await self.ledger.update_idempotency(
+            idempotency_key=idempotency_key,
+            status=status,
+            filled_quantity=filled_quantity,
+            filled_price=filled_price,
+            fees=fees
+        )
+
     async def _wait_for_fills(
         self,
         order_state: OrderState,
@@ -538,22 +803,35 @@ class ExecutionServiceV2:
                 for fill_data in fills:
                     fill_id = fill_data.get('id')
                     if not any(f.fill_id == fill_id for f in order_state.fills):
+                        previous_status = order_state.status
                         fill = Fill(
                             fill_id=fill_id,
                             order_id=order_state.order_id,
                             quantity=Decimal(str(fill_data.get('size', 0))),
                             price=Decimal(str(fill_data.get('price', 0))),
                             fee=Decimal(str(fill_data.get('fee', 0))),
-                            timestamp=datetime.utcnow()
+                            timestamp=datetime.now(timezone.utc)
                         )
                         order_state.add_fill(fill)
+
+                        if previous_status != order_state.status:
+                            await self._record_order_audit(
+                                order_id=order_state.order_id,
+                                old_state=previous_status.value,
+                                new_state=order_state.status.value,
+                                reason="fill_update",
+                                correlation_id=order_state.request.metadata.get("correlation_id") if order_state.request.metadata else None,
+                                idempotency_key=order_state.request.metadata.get("idempotency_key") if order_state.request.metadata else None,
+                            )
                         
                         logger.info(
                             "fill_received",
-                            order_id=order_state.order_id,
-                            fill_id=fill_id,
-                            quantity=float(fill.quantity),
-                            price=float(fill.price)
+                            **inject_correlation({
+                                "order_id": order_state.order_id,
+                                "fill_id": fill_id,
+                                "quantity": str(fill.quantity),
+                                "price": str(fill.price)
+                            })
                         )
                 
                 if order_state.status == OrderStatus.FILLED:
@@ -562,11 +840,22 @@ class ExecutionServiceV2:
             await asyncio.sleep(self.fill_check_interval)
         
         if order_state.status not in [OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED]:
+            previous_status = order_state.status
             order_state.status = OrderStatus.EXPIRED
             logger.warning(
                 "order_expired",
+                **inject_correlation({
+                    "order_id": order_state.order_id,
+                    "age_seconds": order_state.age_seconds
+                })
+            )
+            await self._record_order_audit(
                 order_id=order_state.order_id,
-                age_seconds=order_state.age_seconds
+                old_state=previous_status.value,
+                new_state=order_state.status.value,
+                reason="order_expired",
+                correlation_id=order_state.request.metadata.get("correlation_id") if order_state.request.metadata else None,
+                idempotency_key=order_state.request.metadata.get("idempotency_key") if order_state.request.metadata else None,
             )
         
         return order_state.status == OrderStatus.FILLED
@@ -579,33 +868,52 @@ class ExecutionServiceV2:
     ):
         try:
             position_id = await self.ledger.record_trade_entry(
+                order_id=order_state.order_id,
                 market_id=order_state.request.market_id,
                 token_id=order_state.request.token_id,
                 strategy=order_state.request.strategy,
-                entry_price=order_state.avg_fill_price,
+                side=order_state.request.side.value if hasattr(order_state.request.side, "value") else str(order_state.request.side),
                 quantity=order_state.filled_quantity,
-                fees=order_state.total_fees,
-                order_id=order_state.order_id,
+                price=order_state.avg_fill_price,
+                correlation_id=correlation_id,
                 metadata={
                     **(order_state.request.metadata or {}),
                     "correlation_id": correlation_id,
                     "idempotency_key": idempotency_key,
                 }
             )
+
+            equity = await self.ledger.get_equity()
+            self.precision_monitor.check_equity(equity, correlation_id=correlation_id)
             
             logger.info(
                 "trade_recorded_in_ledger",
-                position_id=position_id,
-                order_id=order_state.order_id,
-                correlation_id=correlation_id,
-                idempotency_key=idempotency_key
+                **inject_correlation({
+                    "position_id": position_id,
+                    "order_id": order_state.order_id,
+                    "idempotency_key": idempotency_key
+                })
             )
         
+        except PrecisionError as e:
+            logger.error(
+                "precision_monitor_failed",
+                **inject_correlation({
+                    "order_id": order_state.order_id,
+                    "error": str(e),
+                    "error_code": ErrorCode.INVALID_STATE.value
+                })
+            )
+            self.dlq.append(order_state)
+
         except Exception as e:
             logger.error(
                 "ledger_recording_failed",
-                order_id=order_state.order_id,
-                error=str(e)
+                **inject_correlation({
+                    "order_id": order_state.order_id,
+                    "error": str(e),
+                    "error_code": ErrorCode.UNKNOWN.value
+                })
             )
             self.dlq.append(order_state)
     
@@ -697,7 +1005,7 @@ class ExecutionServiceV2:
         
         avg_slippage = (
             self.total_slippage_bps / self.orders_filled
-            if self.orders_filled > 0 else 0.0
+            if self.orders_filled > 0 else Decimal("0")
         )
         
         return {
@@ -707,7 +1015,7 @@ class ExecutionServiceV2:
             "fill_rate": fill_rate,
             "avg_execution_time_ms": avg_execution_time,
             "avg_slippage_bps": avg_slippage,
-            "total_fees": float(self.total_fees),
+            "total_fees": self.total_fees,
             "active_orders": len(self.orders),
             "dlq_size": len(self.dlq)
         }

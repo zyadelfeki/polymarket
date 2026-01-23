@@ -23,11 +23,17 @@ Risk:
 
 import asyncio
 import logging
+import io
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import List, Dict, Optional
 import signal
 import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 from config.settings import settings
 from database.ledger import Ledger
@@ -39,12 +45,16 @@ from strategy.latency_arbitrage_engine import LatencyArbitrageEngine
 from risk.kelly_sizer import AdaptiveKellySizer
 from risk.circuit_breaker import CircuitBreaker
 
+_stream = sys.stdout
+if hasattr(sys.stdout, "buffer"):
+    _stream = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
-        logging.FileHandler('logs/production.log'),
-        logging.StreamHandler()
+        logging.FileHandler('logs/production.log', encoding='utf-8'),
+        logging.StreamHandler(_stream)
     ]
 )
 logger = logging.getLogger(__name__)
@@ -106,6 +116,7 @@ class MarketDataService:
         async with self.fetch_semaphore:
             try:
                 markets = await self.polymarket.get_markets(limit=50)
+                markets = [m for m in markets if isinstance(m, dict)]
                 self.markets_cache = markets
                 self.markets_cache_time = datetime.utcnow()
                 self.last_markets_fetch = datetime.utcnow()
@@ -179,6 +190,7 @@ class ProductionTradingBot:
         self.ledger = Ledger(db_path="data/trading.db")
         self.polymarket_client = PolymarketClient()
         self.binance_ws = BinanceWebSocketFeed()
+        self.binance_ws.on_price_update = self._on_binance_price_update
         
         self.execution = ExecutionService(
             polymarket_client=self.polymarket_client,
@@ -213,13 +225,13 @@ class ProductionTradingBot:
         })
         
         self.circuit_breaker = CircuitBreaker(
-            initial_equity=Decimal(str(settings.INITIAL_CAPITAL)),
-            max_drawdown_pct=15.0
+            initial_capital=Decimal(str(settings.INITIAL_CAPITAL))
         )
         
         # State
         self.running = False
         self.tasks = []
+        self.binance_listen_task = None
         
         # Stats
         self.cycles = 0
@@ -250,6 +262,12 @@ class ProductionTradingBot:
         except Exception as e:
             logger.error(f"Ledger initialization error: {e}")
             return
+
+        try:
+            current_equity = self.ledger.get_equity()
+            self.circuit_breaker.reset_baseline(current_equity)
+        except Exception as e:
+            logger.warning(f"Circuit breaker baseline reset failed: {e}")
         
         # Validate ledger
         try:
@@ -265,6 +283,7 @@ class ProductionTradingBot:
             return
         
         logger.info("✅ Binance WebSocket connected")
+        self.binance_listen_task = asyncio.create_task(self.binance_ws.listen())
         
         # Start health monitor
         await self.health_monitor.start()
@@ -562,7 +581,13 @@ class ProductionTradingBot:
         """Graceful shutdown"""
         logger.info("\nStopping bot...")
         self.running = False
-        
+        if self.binance_listen_task and not self.binance_listen_task.done():
+            self.binance_listen_task.cancel()
+            try:
+                await self.binance_listen_task
+            except asyncio.CancelledError:
+                pass
+
         await self.health_monitor.stop()
         await self.binance_ws.close()
         
@@ -572,6 +597,10 @@ class ProductionTradingBot:
         """Handle shutdown signals"""
         logger.info(f"\nReceived signal {signum}")
         self.running = False
+
+    async def _on_binance_price_update(self, symbol: str, price: float, data: dict):
+        """Handle Binance price updates"""
+        self.health_monitor.record_binance_tick()
 
 async def main():
     bot = ProductionTradingBot()

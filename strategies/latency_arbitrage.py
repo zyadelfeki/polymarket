@@ -31,6 +31,8 @@ except ImportError:
 from data_feeds.binance_websocket_v2 import BinanceWebSocketV2
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
 from services.execution_service_v2 import ExecutionServiceV2
+from services.correlation_context import CorrelationContext
+from utils.correlation_id import generate_correlation_id
 from risk.circuit_breaker_v2 import CircuitBreakerV2
 from database.ledger_async import AsyncLedger
 
@@ -38,6 +40,7 @@ if _structlog_available:
     logger = structlog.get_logger(__name__)
 else:
     import logging
+    from services.correlation_context import inject_correlation
 
     logging.basicConfig(level=logging.INFO)
     class _FallbackLogger:
@@ -46,6 +49,7 @@ else:
 
         def _log(self, level, event: str, **kwargs):
             exc_info = kwargs.pop("exc_info", None)
+            kwargs = inject_correlation(kwargs)
             message = f"{event} | {kwargs}" if kwargs else event
             self._logger.log(level, message, exc_info=exc_info)
 
@@ -333,7 +337,8 @@ class LatencyArbitrageEngine:
             'implied_probability': implied_probability,
             'polymarket_odds': self.latest_polymarket_odds,
             'btc_price': self.latest_btc_price,
-            'confidence': min(1.0, abs(float(spread_bps)) / 100)  # 1 bps = 1% confidence
+            'confidence': min(1.0, abs(float(spread_bps)) / 100),  # 1 bps = 1% confidence
+            'correlation_id': generate_correlation_id()
         }
         
         logger.info(
@@ -396,24 +401,29 @@ class LatencyArbitrageEngine:
                 max_allowed=float(max_position_value)
             )
             
+            correlation_id = signal.get("correlation_id") if isinstance(signal, dict) else None
+
             # Place order
-            result = await self.execution.place_order(
-                strategy="latency_arbitrage",
-                market_id=self.market_id,
-                token_id=token_id,
-                side="BUY",
-                quantity=quantity,
-                price=target_price,
-                metadata={
-                    'outcome': signal['side'],
-                    'spread_bps': signal['spread_bps'],
-                    'btc_price': float(signal['btc_price']),
-                    'implied_prob': float(signal['implied_probability']),
-                    'polymarket_odds': float(signal['polymarket_odds']),
-                    'confidence': signal['confidence']
-                },
-                idempotency_key=signal.get('idempotency_key') if isinstance(signal, dict) else None
-            )
+            with CorrelationContext.use(correlation_id):
+                result = await self.execution.place_order(
+                    strategy="latency_arbitrage",
+                    market_id=self.market_id,
+                    token_id=token_id,
+                    side="BUY",
+                    quantity=quantity,
+                    price=target_price,
+                    metadata={
+                        'outcome': signal['side'],
+                        'spread_bps': signal['spread_bps'],
+                        'btc_price': str(signal['btc_price']),
+                        'implied_prob': str(signal['implied_probability']),
+                        'polymarket_odds': str(signal['polymarket_odds']),
+                        'confidence': signal['confidence'],
+                        'correlation_id': correlation_id,
+                    },
+                    correlation_id=correlation_id,
+                    idempotency_key=signal.get('idempotency_key') if isinstance(signal, dict) else None
+                )
             
             if result.success:
                 self.trades_executed += 1

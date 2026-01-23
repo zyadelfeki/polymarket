@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     transaction_type TEXT,
     strategy TEXT,
     reference_id TEXT,
+    correlation_id TEXT,
     metadata TEXT,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -55,10 +56,10 @@ CREATE TABLE IF NOT EXISTS positions (
     token_id TEXT NOT NULL,
     strategy TEXT NOT NULL,
     side TEXT,
-    entry_price DECIMAL(10, 6) NOT NULL,
+    entry_price DECIMAL(10, 8) NOT NULL,
     quantity DECIMAL(20, 8) NOT NULL,
-    current_price DECIMAL(10, 6),
-    exit_price DECIMAL(10, 6),
+    current_price DECIMAL(10, 8),
+    exit_price DECIMAL(10, 8),
     unrealized_pnl DECIMAL(20, 8) DEFAULT 0,
     realized_pnl DECIMAL(20, 8) DEFAULT 0,
     fees DECIMAL(20, 8) DEFAULT 0,
@@ -110,10 +111,32 @@ CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     operation TEXT NOT NULL,
     entity_type TEXT NOT NULL,
-    entity_id INTEGER,
+    entity_id TEXT,
+    old_state TEXT,
+    new_state TEXT,
+    reason TEXT,
+    context TEXT,
+    correlation_id TEXT,
     details TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_time ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id);
+
+-- Idempotency log for order deduplication
+CREATE TABLE IF NOT EXISTS idempotency_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    order_id TEXT,
+    correlation_id TEXT,
+    status TEXT,
+    filled_quantity DECIMAL(20, 8) DEFAULT 0,
+    filled_price DECIMAL(10, 8) DEFAULT 0,
+    fees DECIMAL(20, 8) DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency_key ON idempotency_log(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_idempotency_order ON idempotency_log(order_id);
