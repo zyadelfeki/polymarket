@@ -18,6 +18,7 @@ Standards:
 """
 
 import asyncio
+import inspect
 from typing import Dict, Optional, List, Any
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -25,6 +26,7 @@ from enum import Enum
 from dataclasses import dataclass
 from collections import deque
 from services.correlation_context import inject_correlation, CorrelationContext
+from services.alert_service import AlertService
 try:
     import structlog
     _structlog_available = True
@@ -125,7 +127,8 @@ class CircuitBreakerV2:
         recovery_threshold_pct: float = 5.0,
         cooldown_minutes: int = 30,
         half_open_max_position_pct: float = 2.0,
-        audit_logger: Optional[Any] = None
+        audit_logger: Optional[Any] = None,
+        alert_service: Optional[AlertService] = None
     ):
         """
         Initialize circuit breaker.
@@ -147,6 +150,7 @@ class CircuitBreakerV2:
         self.cooldown_period = timedelta(minutes=cooldown_minutes)
         self.half_open_max_position_pct = half_open_max_position_pct
         self.audit_logger = audit_logger
+        self.alert_service = alert_service or AlertService()
         
         # State
         self.state = CircuitState.CLOSED
@@ -196,29 +200,43 @@ class CircuitBreakerV2:
         new_state: CircuitState,
         reason: Optional[str] = None,
         context: Optional[Dict] = None,
+        correlation_id: Optional[str] = None,
     ) -> None:
         if not self.audit_logger:
             return
-        correlation_id = CorrelationContext.get()
         payload = context or {}
         if hasattr(self.audit_logger, "record_audit_event"):
-            await self.audit_logger.record_audit_event(
-                entity_type="circuit_breaker",
-                entity_id="circuit_breaker",
-                old_state=old_state.value,
-                new_state=new_state.value,
-                reason=reason,
-                context=payload,
-                correlation_id=correlation_id,
-            )
+            record = self.audit_logger.record_audit_event
+            if inspect.iscoroutinefunction(record):
+                await record(
+                    entity_type="circuit_breaker",
+                    entity_id="circuit_breaker",
+                    old_state=old_state.value,
+                    new_state=new_state.value,
+                    reason=reason,
+                    context=payload,
+                    correlation_id=correlation_id,
+                )
+            else:
+                record(
+                    entity_type="circuit_breaker",
+                    entity_id="circuit_breaker",
+                    old_state=old_state.value,
+                    new_state=new_state.value,
+                    reason=reason,
+                    context=payload,
+                    correlation_id=correlation_id,
+                )
         elif callable(self.audit_logger):
-            await self.audit_logger(
+            result = self.audit_logger(
                 old_state=old_state.value,
                 new_state=new_state.value,
                 reason=reason,
                 context=payload,
                 correlation_id=correlation_id,
             )
+            if inspect.isawaitable(result):
+                await result
     
     async def can_trade(
         self,
@@ -405,6 +423,18 @@ class CircuitBreakerV2:
             drawdown_pct=drawdown_pct,
             consecutive_losses=self.consecutive_losses
         )
+
+        alert_title = "Circuit Breaker Tripped"
+        alert_message = (
+            f"Reason: {reason.value}\n"
+            f"Equity: ${equity}\n"
+            f"Drawdown: {drawdown_pct:.1%}\n"
+            f"State: {self.state.value}"
+        )
+        try:
+            await self.alert_service.send_critical_alert(alert_title, alert_message)
+        except Exception as e:
+            logger.error("circuit_breaker_alert_failed", error=str(e))
     
     async def _check_recovery(self, current_equity: Decimal, drawdown_pct: float):
         """

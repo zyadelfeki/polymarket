@@ -42,6 +42,7 @@ class TradingBot:
         self._health_task = None
         self._stats_task = None
         self._heartbeat_task = None
+        self._market_task = None
     
     async def initialize(self):
         logger.info("startup_banner", mode=self.config["mode"], capital=str(self.config["initial_capital"]), debug=self.config.get("debug", False))
@@ -165,6 +166,12 @@ class TradingBot:
             audit_logger=self.ledger
         )
         logger.info("circuit_breaker_ready", max_drawdown_pct=self.config.get('max_drawdown_pct', 15.0))
+
+        async def _auth_failure_handler(reason: str) -> None:
+            logger.critical("auth_failure_handler", reason=reason)
+            await self.circuit_breaker.manual_trip(reason)
+
+        self.polymarket_client.set_auth_failure_handler(_auth_failure_handler)
         
         # STEP 6: Strategy
         logger.info("init_step", step="6/6", action="initializing_strategy")
@@ -198,11 +205,14 @@ class TradingBot:
     async def start(self):
         self.running = True
         logger.info("starting_strategy")
+
+        await self._reconcile_positions_on_startup()
         
         heartbeat_interval = 10 if self.config.get('debug', False) else 30
         self._heartbeat_task = asyncio.create_task(self._heartbeat_monitor(heartbeat_interval))
         self._health_task = asyncio.create_task(self._health_monitor())
         self._stats_task = asyncio.create_task(self._stats_reporter())
+        self._market_task = asyncio.create_task(self._market_resolution_monitor())
         
         try:
             await self.strategy.start()
@@ -222,6 +232,8 @@ class TradingBot:
             self._health_task.cancel()
         if self._stats_task:
             self._stats_task.cancel()
+        if self._market_task:
+            self._market_task.cancel()
         if self.strategy:
             await self.strategy.stop()
         if self.execution_service:
@@ -232,6 +244,118 @@ class TradingBot:
             await self.ledger.close()
         
         logger.info("bot_stopped")
+
+    async def _reconcile_positions_on_startup(self) -> None:
+        logger.info("position_reconciliation_start")
+        try:
+            exchange_positions = await self.polymarket_client.get_open_positions()
+            local_positions = await self.ledger.get_open_positions()
+
+            local_token_ids = {p.token_id for p in local_positions}
+            exchange_token_ids = {p.get("token_id") for p in exchange_positions if isinstance(p, dict)}
+
+            orphaned = exchange_token_ids - local_token_ids
+            if orphaned:
+                logger.critical("orphaned_positions_detected", tokens=list(orphaned))
+
+            for token_id in orphaned:
+                match = next((p for p in exchange_positions if p.get("token_id") == token_id), None)
+                if not match:
+                    continue
+                market_id = match.get("market_id") or match.get("condition_id") or "unknown_market"
+                side = match.get("side") or "BUY"
+                quantity = Decimal(str(match.get("quantity") or match.get("size") or "0"))
+                entry_price = Decimal(str(match.get("entry_price") or match.get("price") or "0.5"))
+                order_id = match.get("order_id") or match.get("id") or f"reconciled_{token_id}"
+
+                correlation_id = f"reconcile_{token_id}"
+                await self.ledger.record_trade_entry(
+                    order_id=order_id,
+                    market_id=market_id,
+                    token_id=token_id,
+                    strategy="reconciled",
+                    side=str(side),
+                    quantity=quantity,
+                    price=entry_price,
+                    correlation_id=correlation_id,
+                    metadata={"source": "reconciliation", "raw": match}
+                )
+                await self.ledger.record_audit_event(
+                    entity_type="position",
+                    entity_id=str(token_id),
+                    old_state=None,
+                    new_state="OPEN",
+                    reason="orphaned_position_imported",
+                    context={"market_id": market_id, "token_id": token_id},
+                    correlation_id=correlation_id,
+                )
+
+            logger.info("position_reconciliation_complete", count=len(exchange_positions))
+        except Exception as e:
+            logger.error("position_reconciliation_failed", error=str(e))
+
+    async def _market_resolution_monitor(self) -> None:
+        interval = float(self.config.get("market_monitor_interval", 60))
+        while self.running:
+            try:
+                positions = await self.ledger.get_open_positions()
+                for position in positions:
+                    market = await self.polymarket_client.get_market(position.market_id)
+                    if not market:
+                        continue
+
+                    status = (market.get("status") or "ACTIVE").upper()
+                    end_date_iso = market.get("end_date") or market.get("end_date_iso")
+
+                    if end_date_iso:
+                        end_date = datetime.fromisoformat(end_date_iso.replace('Z', '+00:00'))
+                        time_to_close = (end_date - datetime.utcnow().replace(tzinfo=end_date.tzinfo)).total_seconds()
+                        if time_to_close < 3600:
+                            logger.warning(
+                                "market_closing_soon",
+                                market_id=position.market_id,
+                                minutes_remaining=round(time_to_close / 60)
+                            )
+                            close_result = await self.execution_service.close_position(
+                                position_id=position.id,
+                                exit_reason="MARKET_CLOSING",
+                            )
+                            if self.strategy and close_result.success and close_result.filled_price:
+                                try:
+                                    roi = (close_result.filled_price - position.entry_price) / position.entry_price
+                                    self.strategy.record_trade_outcome(win=(roi > 0), roi=roi)
+                                except Exception:
+                                    pass
+
+                    if status in {"RESOLVED", "CLOSED", "FINALIZED"}:
+                        logger.critical("market_already_resolved", market_id=position.market_id)
+                        await self._handle_resolved_position(position)
+                        if self.strategy:
+                            try:
+                                roi = (Decimal("0") - Decimal("0"))
+                                self.strategy.record_trade_outcome(win=False, roi=roi)
+                            except Exception:
+                                pass
+
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("market_resolution_monitor_error", error=str(e))
+                await asyncio.sleep(interval)
+
+    async def _handle_resolved_position(self, position) -> None:
+        try:
+            await self.ledger.record_trade_exit(
+                position_id=position.id,
+                exit_price=position.entry_price,
+                fees=Decimal("0"),
+                exit_reason="MARKET_RESOLVED",
+                correlation_id=f"resolved_{position.id}",
+                exit_order_id=None,
+            )
+        except Exception as e:
+            logger.error("resolved_position_handling_failed", error=str(e), position_id=position.id)
     
     async def _heartbeat_monitor(self, interval: int):
         """Periodic heartbeat to show the bot is alive"""

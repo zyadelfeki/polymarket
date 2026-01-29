@@ -234,6 +234,30 @@ class AdaptiveKellySizer:
             effective_fraction=bet_fraction,
             warnings=warnings if warnings else None
         )
+
+    def calculate_real_edge(
+        self,
+        market_price: Decimal,
+        true_probability: Decimal,
+        orderbook_spread: Decimal,
+        latency_advantage_seconds: float,
+        fee_rate: Decimal = Decimal("0.02"),
+    ) -> Decimal:
+        """
+        Calculate true edge accounting for spread, fees, and latency decay.
+        """
+        if not isinstance(market_price, Decimal) or not isinstance(true_probability, Decimal):
+            raise TypeError("market_price and true_probability must be Decimal")
+        if not isinstance(orderbook_spread, Decimal):
+            raise TypeError("orderbook_spread must be Decimal")
+
+        theoretical_edge = true_probability - market_price
+        spread_cost = orderbook_spread / Decimal("2")
+        fee_cost = market_price * fee_rate
+
+        decay_factor = Decimal(str(0.5 ** (latency_advantage_seconds / 10.0)))
+        real_edge = (theoretical_edge - spread_cost - fee_cost) * decay_factor
+        return max(Decimal("0"), real_edge)
     
     def record_trade_result(
         self,

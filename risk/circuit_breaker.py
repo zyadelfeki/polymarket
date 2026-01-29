@@ -1,12 +1,15 @@
 from decimal import Decimal
 from datetime import datetime, timedelta
+import asyncio
 import logging
+from typing import Optional
 from config.settings import settings
+from services.alert_service import AlertService
 
 logger = logging.getLogger(__name__)
 
 class CircuitBreaker:
-    def __init__(self, initial_capital: Decimal):
+    def __init__(self, initial_capital: Decimal, alert_service: Optional[AlertService] = None):
         self.initial_capital = initial_capital
         self.current_capital = initial_capital
         self.peak_capital = initial_capital
@@ -20,6 +23,8 @@ class CircuitBreaker:
         self.breaker_triggered = False
         self.breaker_reason = None
         self.breaker_until = None
+
+        self.alert_service = alert_service or AlertService()
     
     def update_capital(self, new_capital: Decimal):
         self.current_capital = new_capital
@@ -74,6 +79,21 @@ class CircuitBreaker:
         
         logger.critical(f"CIRCUIT BREAKER TRIGGERED: {reason}")
         logger.critical(f"Trading paused until: {self.breaker_until}")
+
+        self._dispatch_alert(
+            title="Circuit Breaker Tripped",
+            message=f"Reason: {reason}\nResume: {self.breaker_until.isoformat()}"
+        )
+
+    def _dispatch_alert(self, title: str, message: str) -> None:
+        if not self.alert_service:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self.alert_service.send_critical_alert(title, message))
+            return
+        loop.create_task(self.alert_service.send_critical_alert(title, message))
     
     def is_trading_allowed(self) -> bool:
         if not self.breaker_triggered:

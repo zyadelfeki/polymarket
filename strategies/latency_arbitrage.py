@@ -35,6 +35,7 @@ from services.correlation_context import CorrelationContext
 from utils.correlation_id import generate_correlation_id
 from risk.circuit_breaker_v2 import CircuitBreakerV2
 from database.ledger_async import AsyncLedger
+from services.strategy_health import StrategyHealthMonitor
 
 if _structlog_available:
     logger = structlog.get_logger(__name__)
@@ -108,6 +109,9 @@ class LatencyArbitrageEngine:
         self.max_position_pct = self.config.get('max_position_pct', 10.0)  # 10% of equity
         self.poll_interval = self.config.get('poll_interval', 2.0)  # Poll Polymarket every 2s
         self.btc_target = self.config.get('btc_target', 100000)  # Target price
+        self.fee_rate = Decimal(str(self.config.get('fee_rate', 0.02)))
+        self.min_profit_buffer_pct = Decimal(str(self.config.get('min_profit_buffer_pct', 0.05)))
+        self.health_pause_seconds = int(self.config.get('health_pause_seconds', 3600))
         
         # State
         self.running = False
@@ -118,6 +122,10 @@ class LatencyArbitrageEngine:
         self.latest_polymarket_timestamp: Optional[datetime] = None
         self.yes_token_id: Optional[str] = None
         self.no_token_id: Optional[str] = None
+        self.latest_spread: Optional[Decimal] = None
+        self._paused_until: Optional[datetime] = None
+
+        self.strategy_health = StrategyHealthMonitor("latency_arbitrage")
         
         # Metrics
         self.signals_generated = 0
@@ -194,6 +202,17 @@ class LatencyArbitrageEngine:
         
         while self.running:
             try:
+                if self._is_paused():
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+
+                healthy, reason = self._evaluate_strategy_health()
+                if not healthy:
+                    logger.critical("strategy_health_failed", reason=reason)
+                    self._pause_strategy(self.health_pause_seconds)
+                    await asyncio.sleep(self.health_pause_seconds)
+                    continue
+
                 # Wait for initial Binance price
                 if self.latest_btc_price is None:
                     await asyncio.sleep(0.5)
@@ -258,6 +277,15 @@ class LatencyArbitrageEngine:
             if yes_price is not None:
                 self.latest_polymarket_odds = Decimal(str(yes_price))
                 self.latest_polymarket_timestamp = datetime.utcnow()
+
+            summary = await self.polymarket_client.get_market_orderbook_summary(self.market_id)
+            if summary and summary.get("ask") is not None and summary.get("bid") is not None:
+                try:
+                    ask = Decimal(str(summary.get("ask")))
+                    bid = Decimal(str(summary.get("bid")))
+                    self.latest_spread = max(Decimal("0"), ask - bid)
+                except Exception:
+                    self.latest_spread = None
                 
                 logger.debug(
                     "polymarket_odds_fetched",
@@ -386,6 +414,18 @@ class LatencyArbitrageEngine:
                 logger.warning("quantity_too_small", quantity=float(quantity))
                 return
 
+            spread = self.latest_spread or Decimal("0")
+            breakeven = self._calculate_breakeven_with_costs(target_price, quantity, spread)
+            min_target_price = breakeven * (Decimal("1") + self.min_profit_buffer_pct)
+            expected_price = signal["implied_probability"] if signal["side"] == "YES" else (Decimal("1") - signal["implied_probability"])
+            if expected_price < min_target_price:
+                logger.debug(
+                    "skipping_below_breakeven",
+                    expected_price=float(expected_price),
+                    min_target_price=float(min_target_price),
+                )
+                return
+
             token_id = self.yes_token_id if signal['side'] == 'YES' else self.no_token_id
             if not token_id:
                 logger.error("token_id_missing_for_trade", side=signal['side'])
@@ -466,6 +506,33 @@ class LatencyArbitrageEngine:
             )
             self.trades_blocked += 1
     
+    def record_trade_outcome(self, win: bool, roi: Decimal) -> None:
+        self.strategy_health.record_trade(win=win, roi=roi)
+
+    def _evaluate_strategy_health(self) -> tuple[bool, str]:
+        return self.strategy_health.check_health()
+
+    def _pause_strategy(self, duration_seconds: int) -> None:
+        self._paused_until = datetime.utcnow() + timedelta(seconds=duration_seconds)
+
+    def _is_paused(self) -> bool:
+        if not self._paused_until:
+            return False
+        if datetime.utcnow() >= self._paused_until:
+            self._paused_until = None
+            return False
+        return True
+
+    def _calculate_breakeven_with_costs(
+        self,
+        entry_price: Decimal,
+        quantity: Decimal,
+        spread: Decimal,
+    ) -> Decimal:
+        spread_cost = spread / Decimal("2")
+        adjusted_entry = entry_price + spread_cost
+        return self.ledger.calculate_breakeven_price(adjusted_entry, quantity, self.fee_rate)
+
     def get_metrics(self) -> Dict:
         """Get strategy metrics."""
         return {

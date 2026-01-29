@@ -17,7 +17,9 @@ class ErrorCode(Enum):
     API_UNAVAILABLE = "api_unavailable"
     API_5XX = "api_5xx"
     NETWORK_ERROR = "network_error"
+    NETWORK_PARTITION = "network_partition"
     NOT_AUTHENTICATED = "not_authenticated"
+    SLIPPAGE_VIOLATION = "slippage_violation"
     CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"
     INVALID_STATE = "invalid_state"
     UNKNOWN = "unknown"
@@ -30,6 +32,7 @@ RETRYABLE_CODES = {
     ErrorCode.API_UNAVAILABLE,
     ErrorCode.API_5XX,
     ErrorCode.ORDER_SUBMISSION_FAILED,
+    ErrorCode.NETWORK_PARTITION,
 }
 
 

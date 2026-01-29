@@ -14,7 +14,7 @@ import time
 import json
 import uuid
 from decimal import Decimal, ROUND_HALF_UP, getcontext
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Callable, Awaitable, TypeVar
 from enum import Enum
 try:
     import structlog
@@ -75,11 +75,17 @@ else:
         def error(self, event: str, **kwargs):
             self._log(logging.ERROR, event, **kwargs)
 
+        def critical(self, event: str, **kwargs):
+            self._log(logging.CRITICAL, event, **kwargs)
+
     logger = _FallbackLogger(__name__)
 
 from services.error_codes import ErrorCode
 from services.correlation_context import CorrelationContext, inject_correlation
 from services.validators import BoundaryValidator
+from services.network_health import NetworkHealthMonitor
+
+T = TypeVar("T")
 
 
 class OrderSide(Enum):
@@ -166,7 +172,8 @@ class PolymarketClientV2:
         rate_limit: float = 8.0,
         max_retries: int = 3,
         timeout: float = 10.0,
-        paper_trading: bool = True
+        paper_trading: bool = True,
+        retry_backoff_base: float = 1.0
     ):
         """
         Initialize client with IMMEDIATE authentication.
@@ -187,6 +194,7 @@ class PolymarketClientV2:
         self.max_retries = max_retries
         self.timeout = timeout
         self.rate_limit = max(rate_limit, 0.1)
+        self.retry_backoff_base = max(retry_backoff_base, 0.0)
         
         # Load proxy address from environment
         self.proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
@@ -206,6 +214,16 @@ class PolymarketClientV2:
         self._last_request_ts = 0.0
         self.rate_limiter = TokenBucket(rate=self.rate_limit, capacity=1.0)
         self.metrics = RequestMetrics()
+        self.network_monitor = NetworkHealthMonitor()
+
+        # Auth retry + key rotation
+        self.auth_retry_count = 0
+        self.max_auth_retries = 3
+        self.api_key_rotation_enabled = os.getenv('API_KEY_ROTATION', 'false').lower() == 'true'
+        self.backup_api_keys: List[Dict[str, str]] = self._load_backup_api_keys()
+        self._active_backup_key_index = 0
+        self.emergency_shutdown_reason: Optional[str] = None
+        self._auth_failure_handler: Optional[Callable[[str], Awaitable[None]]] = None
         
         # Initialize client NOW (synchronously)
         self._force_authentication()
@@ -220,6 +238,140 @@ class PolymarketClientV2:
             has_client=bool(self.client),
             web3_connected=self.w3.is_connected() if self.w3 else False
         )
+
+    def _load_backup_api_keys(self) -> List[Dict[str, str]]:
+        """Load backup API keys from environment as JSON array."""
+        raw = os.getenv("POLYMARKET_BACKUP_API_KEYS", "")
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                keys: List[Dict[str, str]] = []
+                for entry in data:
+                    if isinstance(entry, dict):
+                        if entry.get("api_key") and entry.get("secret") and entry.get("passphrase"):
+                            keys.append(entry)
+                return keys
+            return []
+        except Exception:
+            logger.warning("backup_api_keys_parse_failed")
+            return []
+
+    def _rotate_api_key(self) -> bool:
+        """Rotate to the next API key in the backup list."""
+        if not self.backup_api_keys or not self.client:
+            return False
+        self._active_backup_key_index = (self._active_backup_key_index + 1) % len(self.backup_api_keys)
+        creds = self.backup_api_keys[self._active_backup_key_index]
+        try:
+            if hasattr(self.client, "set_api_creds"):
+                self.client.set_api_creds(creds)
+                logger.warning("api_key_rotated", index=self._active_backup_key_index)
+                return True
+        except Exception as e:
+            logger.error("api_key_rotation_failed", error=str(e))
+        return False
+
+    @staticmethod
+    def _extract_http_status(error: Exception) -> Optional[int]:
+        for attr in ("status_code", "status", "code"):
+            if hasattr(error, attr):
+                try:
+                    value = getattr(error, attr)
+                    if isinstance(value, int):
+                        return value
+                except Exception:
+                    continue
+        message = str(error).lower()
+        if "401" in message:
+            return 401
+        if "403" in message:
+            return 403
+        return None
+
+    @staticmethod
+    def _classify_error(status_code: Optional[int], error: Exception) -> str:
+        if status_code in (401, 403):
+            return "auth"
+        if status_code is not None and 500 <= status_code <= 599:
+            return "server"
+        if isinstance(error, (asyncio.TimeoutError, OSError)):
+            return "network"
+        message = str(error).lower()
+        if "timeout" in message or "connection" in message or "network" in message:
+            return "network"
+        return "unknown"
+
+    async def _execute_with_retries(
+        self,
+        operation: str,
+        func: Callable[[], Awaitable[T]]
+    ) -> Optional[T]:
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                start = time.monotonic()
+                result = await func()
+                latency_ms = (time.monotonic() - start) * 1000
+                self.metrics.record_request(True, latency_ms)
+                self.network_monitor.record_success()
+                self.auth_retry_count = 0
+                return result
+            except Exception as exc:
+                last_error = exc
+                status_code = self._extract_http_status(exc)
+                category = self._classify_error(status_code, exc)
+                self.metrics.record_request(False, 0.0)
+                self.network_monitor.record_failure(str(exc))
+
+                if category == "auth" and status_code is not None:
+                    should_retry = await self._handle_auth_error(status_code)
+                    if not should_retry:
+                        break
+                elif category in {"server", "network"}:
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(self.retry_backoff_base * (2 ** attempt))
+                        continue
+                break
+
+        if last_error is not None:
+            logger.error("request_failed", operation=operation, error=str(last_error))
+        return None
+
+    async def _handle_auth_error(self, error_code: int) -> bool:
+        """Handle 401/403 with exponential backoff and optional key rotation."""
+        self.auth_retry_count += 1
+
+        if error_code == 401:
+            logger.error("api_key_invalid_attempting_rotation")
+            if self.api_key_rotation_enabled and self.backup_api_keys:
+                rotated = self._rotate_api_key()
+                if rotated:
+                    return True
+
+        if self.auth_retry_count >= self.max_auth_retries:
+            await self._emergency_shutdown("AUTH_FAILURE_CRITICAL")
+            return False
+
+        await asyncio.sleep(2 ** self.auth_retry_count)
+        return True
+
+    async def _emergency_shutdown(self, reason: str) -> None:
+        """Disable trading on critical auth failures."""
+        self.can_trade = False
+        self.authenticated = False
+        self.emergency_shutdown_reason = reason
+        logger.critical("emergency_shutdown", reason=reason)
+        if self._auth_failure_handler:
+            try:
+                await self._auth_failure_handler(reason)
+            except Exception as exc:
+                logger.error("auth_failure_handler_failed", error=str(exc))
+
+    def set_auth_failure_handler(self, handler: Callable[[str], Awaitable[None]]) -> None:
+        """Register async handler for critical auth failures."""
+        self._auth_failure_handler = handler
     
     def _force_authentication(self):
         """
@@ -389,7 +541,7 @@ class PolymarketClientV2:
             logger.error("no_web3_connection")
             return Decimal('0')
         
-        try:
+        async def _fetch_balance() -> Decimal:
             logger.debug("fetching_balance_via_web3_dual_usdc_check")
             
             # Define BOTH USDC contract addresses on Polygon
@@ -448,18 +600,13 @@ class PolymarketClientV2:
                 native=str(native_decimal),
                 total=str(total_decimal)
             )
-            
+
             return total_decimal
-            
-        except Exception as e:
-            logger.error(
-                "web3_balance_fetch_failed",
-                error=str(e),
-                error_type=type(e).__name__,
-                proxy=self.proxy_address,
-                exc_info=True
-            )
-            return Decimal('0')
+
+        result = await self._execute_with_retries("get_usdc_balance", _fetch_balance)
+        if result is None:
+            logger.error("web3_balance_fetch_failed", proxy=self.proxy_address)
+        return result if result is not None else Decimal('0')
     
     async def get_market(self, market_id: str) -> Optional[Dict]:
         """
@@ -491,7 +638,7 @@ class PolymarketClientV2:
                 "mock": True
             }
         
-        try:
+        async def _fetch_market() -> Optional[Dict]:
             await self._throttle()
             logger.debug("fetching_market_via_direct_lookup", market_id=market_id)
             market = None
@@ -501,15 +648,13 @@ class PolymarketClientV2:
                     None,
                     lambda: self.client.get_market(market_id)
                 )
-            
+
             logger.debug("direct_market_lookup_response_type", type=type(market).__name__)
-            
-            # Validate response
+
             if not isinstance(market, dict):
                 logger.warning("market_response_not_dict", type=type(market).__name__)
                 market = None
-            
-            # Fallback to Gamma API if needed
+
             if not market or 'tokens' not in market:
                 market = await self._fetch_market_via_gamma(market_id)
             if not market or 'tokens' not in market:
@@ -536,7 +681,7 @@ class PolymarketClientV2:
             market['no_price'] = no_price
             market['yes_token_id'] = yes_token_id
             market['no_token_id'] = no_token_id
-            
+
             logger.info(
                 "market_found_via_direct_lookup",
                 market_id=market_id,
@@ -544,11 +689,15 @@ class PolymarketClientV2:
                 has_tokens=bool(market.get('tokens')),
                 token_count=len(market.get('tokens', []))
             )
-            
+
             return market
-            
+
+        try:
+            market = await self._execute_with_retries("get_market", _fetch_market)
+            if market is None:
+                return {"tokens": [], "error": "market_not_found", "market_id": market_id}
+            return market
         except AttributeError as e:
-            # Method doesn't exist - fallback not implemented
             logger.error(
                 "get_market_method_not_available",
                 error=str(e),
@@ -556,34 +705,12 @@ class PolymarketClientV2:
                 message="get_market() not found in ClobClient"
             )
             return {"tokens": [], "error": "method_not_available", "market_id": market_id}
-            
-        except Exception as e:
-            error_str = str(e).lower()
-            
-            # Check for 404 / not found errors
-            if '404' in error_str or 'not found' in error_str:
-                logger.warning(
-                    "market_not_found_via_direct_lookup",
-                    market_id=market_id,
-                    error=str(e)
-                )
-            else:
-                logger.error(
-                    "market_fetch_failed",
-                    market_id=market_id,
-                    error=str(e),
-                    error_type=type(e).__name__,
-                    exc_info=True
-                )
-            
-            # Return safe default
-            return {"tokens": [], "error": str(e), "market_id": market_id}
 
     async def _fetch_market_via_gamma(self, condition_id: str) -> Optional[Dict]:
         """Fallback market lookup using Gamma API by condition id."""
-        try:
-            import httpx
+        import httpx
 
+        async def _fetch_gamma() -> Optional[Dict]:
             await self._throttle()
             base_url = "https://gamma-api.polymarket.com/markets"
             candidates = [
@@ -604,9 +731,11 @@ class PolymarketClientV2:
                         if isinstance(items, list) and items:
                             return items[0]
             return None
-        except Exception as e:
-            logger.error("gamma_market_lookup_failed", error=str(e), condition_id=condition_id)
-            return None
+
+        result = await self._execute_with_retries("get_market_gamma", _fetch_gamma)
+        if result is None:
+            logger.error("gamma_market_lookup_failed", condition_id=condition_id)
+        return result
 
     def _infer_yes_no_tokens(self, tokens: List[Dict]) -> tuple:
         """Infer YES/NO tokens from token metadata."""
@@ -772,7 +901,7 @@ class PolymarketClientV2:
                 idempotency_key=idempotency_key
             )
         
-        try:
+        async def _submit_order() -> Dict:
             logger.info(
                 "placing_live_order",
                 market=market_id,
@@ -791,8 +920,7 @@ class PolymarketClientV2:
                         self.client.session.headers["Idempotency-Key"] = idempotency_key
                 except Exception:
                     logger.debug("idempotency_header_set_failed", correlation_id=correlation_id)
-            
-            # Create order
+
             side_str = side.value if isinstance(side, OrderSide) else str(side)
             order_side = SELL if side_str.upper() == "SELL" else BUY
             order = OrderArgs(
@@ -801,54 +929,45 @@ class PolymarketClientV2:
                 size=float(size_dec),
                 side=order_side
             )
-            
-            # Sign and post
+
             loop = asyncio.get_running_loop()
             signed_order = await loop.run_in_executor(
                 None,
                 self.client.create_order,
                 order
             )
-            
+
             response = await loop.run_in_executor(
                 None,
                 self.client.post_order,
                 signed_order,
                 OrderType.GTC if order_type.upper() == "GTC" else OrderType.GTC
             )
-            
-            order_id = response.get('orderID') or response.get('order_id') or 'unknown'
-            logger.info("order_placed_successfully", order_id=order_id)
-            return OrderResult(
-                success=True,
-                order_id=order_id,
-                status=OrderStatus.SUBMITTED,
-                filled_quantity=Decimal("0"),
-                filled_price=Decimal("0"),
-                fees=Decimal("0"),
-                correlation_id=correlation_id,
-                idempotency_key=idempotency_key
-            )
-            
-        except Exception as e:
-            logger.error(
-                "order_placement_failed",
-                error=str(e),
-                error_type=type(e).__name__,
-                market=market_id,
-                token=token_id,
-                side=side,
-                error_code=ErrorCode.ORDER_SUBMISSION_FAILED.value,
-                correlation_id=correlation_id
-            )
+            return response
+
+        response = await self._execute_with_retries("place_order", _submit_order)
+        if response is None:
             return OrderResult(
                 success=False,
                 status=OrderStatus.FAILED,
-                error=str(e),
-                error_code=ErrorCode.ORDER_SUBMISSION_FAILED.value,
+                error="auth_retry_exhausted",
+                error_code=ErrorCode.NOT_AUTHENTICATED.value,
                 correlation_id=correlation_id,
                 idempotency_key=idempotency_key
             )
+
+        order_id = response.get('orderID') or response.get('order_id') or 'unknown'
+        logger.info("order_placed_successfully", order_id=order_id)
+        return OrderResult(
+            success=True,
+            order_id=order_id,
+            status=OrderStatus.SUBMITTED,
+            filled_quantity=Decimal("0"),
+            filled_price=Decimal("0"),
+            fees=Decimal("0"),
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key
+        )
     
     async def get_markets(
         self,
@@ -867,43 +986,40 @@ class PolymarketClientV2:
         """
         if not self.client:
             return []
-        
-        try:
+
+        async def _fetch_markets() -> Any:
             await self._throttle()
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
+            return await loop.run_in_executor(
                 None,
                 self.client.get_markets
             )
-            
-            logger.debug("get_markets_raw_response_type", type=type(response).__name__)
-            
-            # Handle dict response (paginated API)
-            if isinstance(response, dict):
-                logger.debug("get_markets_response_is_dict", keys=list(response.keys()))
-                # Try common pagination keys
-                markets_list = response.get('data') or response.get('markets') or []
-            elif isinstance(response, list):
-                markets_list = response
-            else:
-                logger.warning("get_markets_unexpected_type", type=type(response).__name__)
-                return []
-            
-            # Validate we have a list
-            if not isinstance(markets_list, list):
-                logger.warning("get_markets_list_not_list_after_extraction", type=type(markets_list).__name__)
-                return []
-            
-            logger.debug("get_markets_parsed", total_count=len(markets_list))
-            
-            if active:
-                markets_list = [m for m in markets_list if isinstance(m, dict) and not m.get("closed", False)]
-            
-            return markets_list[:limit]
-            
-        except Exception as e:
-            logger.error("markets_fetch_failed", error=str(e), exc_info=True)
+
+        response = await self._execute_with_retries("get_markets", _fetch_markets)
+        if response is None:
             return []
+
+        logger.debug("get_markets_raw_response_type", type=type(response).__name__)
+
+        if isinstance(response, dict):
+            logger.debug("get_markets_response_is_dict", keys=list(response.keys()))
+            markets_list = response.get('data') or response.get('markets') or []
+        elif isinstance(response, list):
+            markets_list = response
+        else:
+            logger.warning("get_markets_unexpected_type", type=type(response).__name__)
+            return []
+
+        if not isinstance(markets_list, list):
+            logger.warning("get_markets_list_not_list_after_extraction", type=type(markets_list).__name__)
+            return []
+
+        logger.debug("get_markets_parsed", total_count=len(markets_list))
+
+        if active:
+            markets_list = [m for m in markets_list if isinstance(m, dict) and not m.get("closed", False)]
+
+        return markets_list[:limit]
 
     async def get_active_markets(self, limit: int = 100) -> List[Dict]:
         """Compatibility helper for strategy modules."""
@@ -917,7 +1033,7 @@ class PolymarketClientV2:
             logger.error("cannot_get_positions", reason="not_authenticated")
             return []
 
-        try:
+        async def _fetch_positions() -> Any:
             await self._throttle()
             loop = asyncio.get_running_loop()
             if hasattr(self.client, "get_positions"):
@@ -926,9 +1042,16 @@ class PolymarketClientV2:
                 return await loop.run_in_executor(None, self.client.list_positions)
             logger.warning("get_positions_not_available")
             return []
-        except Exception as e:
-            logger.error("positions_fetch_failed", error=str(e))
-            return []
+
+        positions = await self._execute_with_retries("get_positions", _fetch_positions)
+        return positions if isinstance(positions, list) else []
+
+    async def get_open_positions(self) -> List[Dict]:
+        """Alias for get_positions with safe defaults."""
+        positions = await self.get_positions()
+        if isinstance(positions, list):
+            return positions
+        return []
 
     async def get_account_balance(self) -> Decimal:
         """Return total USDC balance as Decimal."""
@@ -1015,20 +1138,20 @@ class PolymarketClientV2:
         """
         if not self.client:
             return None
-        
-        try:
+
+        async def _fetch_orderbook() -> Any:
             await self._throttle()
             loop = asyncio.get_running_loop()
-            orderbook = await loop.run_in_executor(
+            return await loop.run_in_executor(
                 None,
                 self.client.get_order_book,
                 token_id
             )
-            return orderbook
-            
-        except Exception as e:
-            logger.warning("orderbook_fetch_failed", token_id=token_id, error=str(e))
-            return None
+
+        orderbook = await self._execute_with_retries("get_orderbook", _fetch_orderbook)
+        if orderbook is None:
+            logger.warning("orderbook_fetch_failed", token_id=token_id)
+        return orderbook
     
     async def cancel_order(self, order_id: str) -> bool:
         """
@@ -1048,6 +1171,23 @@ class PolymarketClientV2:
             logger.error("cannot_cancel_order", reason="not_authenticated")
             return False
 
+        async def _cancel() -> bool:
+            await self._throttle()
+            loop = asyncio.get_running_loop()
+            if hasattr(self.client, "cancel"):
+                await loop.run_in_executor(None, self.client.cancel, order_id)
+            elif hasattr(self.client, "cancel_order"):
+                await loop.run_in_executor(None, self.client.cancel_order, order_id)
+            else:
+                logger.warning("cancel_order_not_available")
+                return False
+            return True
+
+        result = await self._execute_with_retries("cancel_order", _cancel)
+        if result:
+            logger.info("order_cancelled_successfully", order_id=order_id)
+        return bool(result)
+
     async def get_order_status(self, order_id: str) -> Optional[Dict]:
         """Get order status for an order ID."""
         if self.paper_trading:
@@ -1057,7 +1197,7 @@ class PolymarketClientV2:
             logger.error("cannot_get_order_status", reason="not_authenticated")
             return None
 
-        try:
+        async def _fetch_status() -> Any:
             await self._throttle()
             loop = asyncio.get_running_loop()
             if hasattr(self.client, "get_order"):
@@ -1066,24 +1206,11 @@ class PolymarketClientV2:
                 return await loop.run_in_executor(None, self.client.get_order_status, order_id)
             logger.warning("get_order_status_not_available")
             return None
-        except Exception as e:
-            logger.error("order_status_fetch_failed", order_id=order_id, error=str(e))
-            return None
-        
-        try:
-            await self._throttle()
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                self.client.cancel,
-                order_id
-            )
-            logger.info("order_cancelled_successfully", order_id=order_id)
-            return True
-            
-        except Exception as e:
-            logger.error("order_cancellation_failed", order_id=order_id, error=str(e))
-            return False
+
+        result = await self._execute_with_retries("get_order_status", _fetch_status)
+        if result is None:
+            logger.error("order_status_fetch_failed", order_id=order_id)
+        return result
     
     async def health_check(self) -> bool:
         """

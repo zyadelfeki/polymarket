@@ -588,27 +588,42 @@ class AsyncLedger:
             if db_dir and not os.path.exists(db_dir):
                 os.makedirs(db_dir, exist_ok=True)
                 logger.info("database_directory_created", path=db_dir)
-        
+
         self.db_path = db_path
         self.pool = ConnectionPool(db_path, pool_size)
-        
+
         # Caches
         self.equity_cache = TTLCache(maxsize=1, ttl=cache_ttl)
         self.position_cache = TTLCache(maxsize=100, ttl=cache_ttl)
-        
+
         # Metrics
         self.queries_executed = 0
         self.cache_hits = 0
         self.cache_misses = 0
         self.total_query_time_ms = 0.0
         self._write_lock = asyncio.Lock()
-        
+
         logger.info(
             "async_ledger_initialized",
             db_path=db_path,
             pool_size=pool_size,
             cache_ttl=cache_ttl
         )
+
+    @staticmethod
+    def calculate_breakeven_price(
+        entry_price: Decimal,
+        quantity: Decimal,
+        fee_rate: Decimal = Decimal("0.02"),
+    ) -> Decimal:
+        """Calculate breakeven price after fees."""
+        if not isinstance(entry_price, Decimal) or not isinstance(quantity, Decimal):
+            raise TypeError("entry_price and quantity must be Decimal")
+        if entry_price <= 0 or quantity <= 0:
+            raise ValueError("entry_price and quantity must be positive")
+        buy_cost = entry_price * (Decimal("1") + fee_rate)
+        breakeven = buy_cost / (Decimal("1") - fee_rate)
+        return breakeven
 
     DECIMAL_COLUMNS = {
         "balance",
@@ -1005,6 +1020,147 @@ class AsyncLedger:
                 )
                 raise
 
+            finally:
+                await self.pool.release(conn)
+
+    async def record_trade_exit(
+        self,
+        position_id: int,
+        exit_price: Decimal,
+        fees: Decimal = Decimal("0"),
+        exit_reason: str = "exit",
+        correlation_id: Optional[str] = None,
+        exit_order_id: Optional[str] = None,
+    ) -> None:
+        """Close an open position and record exit in ledger."""
+        if exit_price <= 0:
+            raise ValueError("exit_price must be positive")
+
+        async with self._write_lock:
+            conn = await self.pool.acquire()
+            try:
+                await conn.execute("BEGIN TRANSACTION")
+
+                cursor = await conn.execute(
+                    """
+                    SELECT market_id, token_id, strategy, side, entry_price, quantity
+                    FROM positions
+                    WHERE id = ? AND status = 'OPEN'
+                    """,
+                    (position_id,)
+                )
+                row = await cursor.fetchone()
+                if not row:
+                    raise ValueError("position_not_found")
+
+                market_id, token_id, strategy, side, entry_price, quantity = row
+                entry_price = Decimal(str(entry_price))
+                quantity = Decimal(str(quantity))
+                exit_price = Decimal(str(exit_price))
+                fees = Decimal(str(fees))
+
+                entry_value = entry_price * quantity
+                exit_value = exit_price * quantity
+                pnl = exit_value - entry_value - fees
+
+                cursor = await conn.execute(
+                    """
+                    INSERT INTO transactions (description, transaction_type, strategy, reference_id, timestamp)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (f"Exit {side} position {position_id}", "TRADE_EXIT", strategy, exit_order_id or str(position_id))
+                )
+                tx_id = cursor.lastrowid
+
+                cursor = await conn.execute(
+                    "SELECT id FROM accounts WHERE account_name = 'Positions' LIMIT 1"
+                )
+                positions_account = (await cursor.fetchone())[0]
+
+                cursor = await conn.execute(
+                    "SELECT id FROM accounts WHERE account_name = 'Cash' LIMIT 1"
+                )
+                cash_account = (await cursor.fetchone())[0]
+
+                cursor = await conn.execute(
+                    "SELECT id FROM accounts WHERE account_name = 'Trading Revenue' LIMIT 1"
+                )
+                revenue_account = (await cursor.fetchone())[0]
+
+                cursor = await conn.execute(
+                    "SELECT id FROM accounts WHERE account_name = 'Trading Loss' LIMIT 1"
+                )
+                loss_account = (await cursor.fetchone())[0]
+
+                await conn.execute(
+                    "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
+                    (tx_id, cash_account, str(exit_value - fees))
+                )
+
+                await conn.execute(
+                    "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
+                    (tx_id, positions_account, str(-entry_value))
+                )
+
+                if pnl >= 0:
+                    await conn.execute(
+                        "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
+                        (tx_id, revenue_account, str(-pnl))
+                    )
+                else:
+                    await conn.execute(
+                        "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
+                        (tx_id, loss_account, str(abs(pnl)))
+                    )
+
+                await conn.execute(
+                    """
+                    UPDATE positions
+                    SET exit_price = ?, exit_timestamp = CURRENT_TIMESTAMP,
+                        realized_pnl = ?, status = 'CLOSED',
+                        exit_order_id = ?, exit_fees = ?
+                    WHERE id = ?
+                    """,
+                    (str(exit_price), str(pnl), exit_order_id, str(fees), position_id)
+                )
+
+                await conn.execute(
+                    """
+                    INSERT INTO audit_log
+                    (operation, entity_type, entity_id, old_state, new_state, reason, context, correlation_id, details)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "STATE_CHANGE",
+                        "position",
+                        str(position_id),
+                        "OPEN",
+                        "CLOSED",
+                        exit_reason,
+                        decimal_dumps({
+                            "market_id": market_id,
+                            "token_id": token_id,
+                            "exit_price": str(exit_price),
+                            "quantity": str(quantity),
+                            "pnl": str(pnl),
+                        }),
+                        correlation_id,
+                        decimal_dumps({
+                            "exit_order_id": exit_order_id,
+                            "fees": str(fees),
+                            "exit_reason": exit_reason,
+                        }),
+                    )
+                )
+
+                await conn.commit()
+
+                self.equity_cache.clear()
+                self.position_cache.clear()
+
+            except Exception:
+                await conn.rollback()
+                raise
             finally:
                 await self.pool.release(conn)
 

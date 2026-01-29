@@ -20,6 +20,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 import time
 from dataclasses import dataclass
+from services.network_health import NetworkHealthMonitor, NetworkPartitionError
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +33,13 @@ class OrderResult:
     filled_quantity: Optional[Decimal]
     fees: Optional[Decimal]
     error: Optional[str]
+    error_code: Optional[str] = None
     latency_ms: int
     retries: int
+
+
+class SlippageError(RuntimeError):
+    """Raised when fill price exceeds slippage tolerance."""
 
 class RateLimiter:
     """
@@ -91,6 +97,9 @@ class ExecutionService:
         # Concurrency control
         self.rate_limiter = RateLimiter(requests_per_second=8.0)
         self.order_semaphore = asyncio.Semaphore(5)  # Max 5 concurrent orders
+
+        partition_threshold = int(config.get('partition_threshold_seconds', 15))
+        self.network_monitor = NetworkHealthMonitor(partition_threshold_seconds=partition_threshold)
         
         # Order tracking
         self.active_orders = {}  # order_id -> metadata
@@ -107,7 +116,11 @@ class ExecutionService:
         quantity: Decimal,
         price: Decimal,
         order_type: str = 'GTC',
-        metadata: Optional[Dict] = None
+        metadata: Optional[Dict] = None,
+        expected_price: Optional[Decimal] = None,
+        min_profit_buffer_pct: Decimal = Decimal("0.05"),
+        fee_rate: Decimal = Decimal("0.02"),
+        max_slippage_bps: int = 50
     ) -> OrderResult:
         """
         Place order with full execution lifecycle:
@@ -130,10 +143,29 @@ class ExecutionService:
         Returns:
             OrderResult with fill details or error
         """
+        if expected_price is not None:
+            if not isinstance(expected_price, Decimal):
+                raise TypeError("expected_price must be Decimal")
+            breakeven = self.ledger.calculate_breakeven_price(price, quantity, fee_rate)
+            min_target_price = breakeven * (Decimal("1") + min_profit_buffer_pct)
+            if expected_price < min_target_price:
+                logger.debug(
+                    f"Skipping order: expected price {expected_price} below breakeven buffer {min_target_price}"
+                )
+                return OrderResult(
+                    success=False,
+                    order_id=None,
+                    filled_price=None,
+                    filled_quantity=None,
+                    fees=None,
+                    error="below_breakeven",
+                    latency_ms=0,
+                    retries=0
+                )
         async with self.order_semaphore:
             return await self._execute_order(
                 strategy, market_id, token_id, side,
-                quantity, price, order_type, metadata
+                quantity, price, order_type, metadata, max_slippage_bps
             )
     
     async def _execute_order(
@@ -145,12 +177,26 @@ class ExecutionService:
         quantity: Decimal,
         price: Decimal,
         order_type: str,
-        metadata: Optional[Dict]
+        metadata: Optional[Dict],
+        max_slippage_bps: int
     ) -> OrderResult:
         """
         Internal order execution with retry logic.
         """
         start_time = time.monotonic()
+
+        if self.network_monitor.check_partition():
+            return OrderResult(
+                success=False,
+                order_id=None,
+                filled_price=None,
+                filled_quantity=None,
+                fees=None,
+                error="network_partition",
+                error_code="NETWORK_PARTITION",
+                latency_ms=int((time.monotonic() - start_time) * 1000),
+                retries=0
+            )
         
         for attempt in range(self.max_retries):
             try:
@@ -172,6 +218,7 @@ class ExecutionService:
                     ),
                     timeout=self.timeout_seconds
                 )
+                self.network_monitor.record_success()
                 
                 if not order_response or not order_response.get('success'):
                     error = order_response.get('error', 'Unknown error') if order_response else 'No response'
@@ -198,7 +245,9 @@ class ExecutionService:
                 # Wait for fill (poll order status)
                 filled_price, filled_quantity, fees = await self._wait_for_fill(
                     order_id,
-                    max_wait_seconds=30
+                    max_wait_seconds=30,
+                    target_price=price,
+                    max_slippage_bps=max_slippage_bps
                 )
                 
                 if filled_quantity is None or filled_quantity == 0:
@@ -210,6 +259,7 @@ class ExecutionService:
                         filled_quantity=None,
                         fees=None,
                         error="Order not filled (timeout)",
+                        error_code="ORDER_TIMEOUT",
                         latency_ms=int((time.monotonic() - start_time) * 1000),
                         retries=attempt + 1
                     )
@@ -249,6 +299,19 @@ class ExecutionService:
                 self.order_history.append(result)
                 return result
             
+            except SlippageError as e:
+                logger.error(f"Slippage violation: {e}")
+                return OrderResult(
+                    success=False,
+                    order_id=None,
+                    filled_price=None,
+                    filled_quantity=None,
+                    fees=None,
+                    error="slippage_violation",
+                    error_code="SLIPPAGE_VIOLATION",
+                    latency_ms=int((time.monotonic() - start_time) * 1000),
+                    retries=attempt + 1
+                )
             except asyncio.TimeoutError:
                 logger.warning(f"Order timeout (attempt {attempt+1}/{self.max_retries})")
                 if attempt < self.max_retries - 1:
@@ -262,11 +325,13 @@ class ExecutionService:
                         filled_quantity=None,
                         fees=None,
                         error="Timeout",
+                        error_code="ORDER_TIMEOUT",
                         latency_ms=int((time.monotonic() - start_time) * 1000),
                         retries=attempt + 1
                     )
             
             except Exception as e:
+                self.network_monitor.record_failure(str(e))
                 logger.error(f"Order execution error (attempt {attempt+1}/{self.max_retries}): {e}", exc_info=True)
                 if attempt < self.max_retries - 1:
                     backoff = self.initial_backoff * (2 ** attempt)
@@ -279,6 +344,7 @@ class ExecutionService:
                         filled_quantity=None,
                         fees=None,
                         error=str(e),
+                        error_code="EXECUTION_ERROR",
                         latency_ms=int((time.monotonic() - start_time) * 1000),
                         retries=attempt + 1
                     )
@@ -291,6 +357,7 @@ class ExecutionService:
             filled_quantity=None,
             fees=None,
             error="Max retries exceeded",
+            error_code="MAX_RETRIES",
             latency_ms=int((time.monotonic() - start_time) * 1000),
             retries=self.max_retries
         )
@@ -299,7 +366,9 @@ class ExecutionService:
         self,
         order_id: str,
         max_wait_seconds: int = 30,
-        poll_interval: float = 0.5
+        poll_interval: float = 0.5,
+        target_price: Optional[Decimal] = None,
+        max_slippage_bps: int = 50
     ) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
         """
         Poll order status until filled or timeout.
@@ -314,12 +383,27 @@ class ExecutionService:
                 await self.rate_limiter.acquire()
                 
                 status = await self.client.get_order_status(order_id)
+                if status:
+                    self.network_monitor.record_success()
                 
                 if status and status.get('status') == 'MATCHED':
                     filled_price = Decimal(str(status['filled_price']))
                     filled_quantity = Decimal(str(status['filled_quantity']))
                     fees = Decimal(str(status.get('fees', 0)))
-                    
+
+                    if target_price is not None:
+                        max_slippage = Decimal(str(max_slippage_bps)) / Decimal("10000")
+                        max_fill_price = target_price * (Decimal("1") + max_slippage)
+                        min_fill_price = target_price * (Decimal("1") - max_slippage)
+                        if filled_price > max_fill_price or filled_price < min_fill_price:
+                            try:
+                                if hasattr(self.client, "cancel_order"):
+                                    await self.client.cancel_order(order_id)
+                            finally:
+                                raise SlippageError(
+                                    f"Fill price {filled_price} outside tolerance for target {target_price}"
+                                )
+
                     return filled_price, filled_quantity, fees
                 
                 elif status and status.get('status') in ['CANCELLED', 'FAILED']:
@@ -329,10 +413,16 @@ class ExecutionService:
                 await asyncio.sleep(poll_interval)
             
             except Exception as e:
+                self.network_monitor.record_failure(str(e))
                 logger.error(f"Error checking order status: {e}")
                 await asyncio.sleep(poll_interval)
         
         logger.warning(f"Order {order_id} fill timeout after {max_wait_seconds}s")
+        if hasattr(self.client, "cancel_order"):
+            try:
+                await self.client.cancel_order(order_id)
+            except Exception:
+                pass
         return None, None, None
     
     async def close_position(

@@ -7,6 +7,7 @@ import logging
 from collections import deque
 from config.settings import settings
 from config.markets import CRYPTO_SYMBOLS
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -143,3 +144,69 @@ class BinanceWebSocketFeed:
         self.running = False
         if self.websocket:
             await self.websocket.close()
+
+
+class BinanceWebSocketV2(BinanceWebSocketFeed):
+    """Enhanced WebSocket with REST API fallback."""
+
+    def __init__(self):
+        super().__init__()
+        self.rest_api_fallback = True
+        self.rest_api_interval = 1.0
+        self.fallback_active = False
+        self._fallback_task: Optional[asyncio.Task] = None
+
+    async def connect(self):
+        connected = await super().connect()
+        if connected and self.rest_api_fallback and not self._fallback_task:
+            self._fallback_task = asyncio.create_task(self._price_fallback_loop())
+        return connected
+
+    async def close(self):
+        self.running = False
+        if self._fallback_task and not self._fallback_task.done():
+            self._fallback_task.cancel()
+            try:
+                await self._fallback_task
+            except asyncio.CancelledError:
+                pass
+        await super().close()
+
+    async def _fetch_rest_prices(self) -> Dict[str, float]:
+        symbols = [v["binance_symbol"] for v in CRYPTO_SYMBOLS.values()]
+        url = "https://api.binance.com/api/v3/ticker/price"
+        params = {"symbols": json.dumps(symbols)}
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with session.get(url, params=params) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+        price_map: Dict[str, float] = {}
+        for entry in data:
+            symbol = entry.get("symbol")
+            price = entry.get("price")
+            if symbol and price is not None:
+                price_map[symbol] = float(price)
+        return price_map
+
+    async def _price_fallback_loop(self):
+        while self.running:
+            websocket_closed = not self.websocket or getattr(self.websocket, "closed", True)
+            if websocket_closed:
+                if not self.fallback_active:
+                    logger.warning("Activating REST API fallback for prices")
+                    self.fallback_active = True
+                try:
+                    response = await self._fetch_rest_prices()
+                    for key, config in CRYPTO_SYMBOLS.items():
+                        symbol = config["binance_symbol"]
+                        if symbol in response:
+                            await self._update_price(key, response[symbol], 0.0)
+                    await asyncio.sleep(self.rest_api_interval)
+                except Exception as e:
+                    logger.error(f"REST API fallback error: {e}")
+                    await asyncio.sleep(5)
+            else:
+                self.fallback_active = False
+                await asyncio.sleep(10)

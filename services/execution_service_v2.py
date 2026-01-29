@@ -52,6 +52,7 @@ from services.correlation_context import CorrelationContext, inject_correlation
 from logs.precision_monitor import PrecisionMonitor, PrecisionError
 from services.retry import RetryableOperation
 from utils.correlation_id import generate_correlation_id
+from services.network_health import NetworkHealthMonitor, NetworkPartitionError
 
 if _structlog_available:
     logger = structlog.get_logger(__name__)
@@ -80,6 +81,9 @@ else:
 
         def error(self, event: str, **kwargs):
             self._log(logging.ERROR, event, **kwargs)
+
+        def critical(self, event: str, **kwargs):
+            self._log(logging.CRITICAL, event, **kwargs)
 
     logger = _FallbackLogger(__name__)
 
@@ -307,6 +311,9 @@ class ExecutionServiceV2:
 
         self._idempotency_cache = idempotency_cache or IdempotencyCache()
         self.precision_monitor = PrecisionMonitor()
+
+        partition_threshold = int(self.config.get("partition_threshold_seconds", 15))
+        self.network_monitor = NetworkHealthMonitor(partition_threshold_seconds=partition_threshold)
         
         self._monitor_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -389,7 +396,9 @@ class ExecutionServiceV2:
         order_type: str = "GTC",
         metadata: Optional[Dict] = None,
         correlation_id: Optional[str] = None,
-        idempotency_key: Optional[str] = None
+        idempotency_key: Optional[str] = None,
+        max_slippage_bps: int = 50,
+        record_in_ledger: bool = True
     ) -> OrderResult:
         start_time = time.time()
         correlation_id = correlation_id or generate_correlation_id()
@@ -397,12 +406,30 @@ class ExecutionServiceV2:
 
         with CorrelationContext.use(correlation_id):
             try:
+                if self.network_monitor.check_partition():
+                    raise NetworkPartitionError("Trading halted: network partition detected")
                 if not token_id or not isinstance(token_id, str):
                     raise ValueError("Invalid token_id")
                 market_id = BoundaryValidator.validate_market_id(market_id)
                 side_str = BoundaryValidator.validate_side(side)
                 quantity = BoundaryValidator.validate_quantity(quantity)
                 price = BoundaryValidator.validate_price(price)
+            except NetworkPartitionError as e:
+                logger.critical(
+                    "network_partition_blocked_order",
+                    **inject_correlation({"error": str(e), "error_code": ErrorCode.NETWORK_PARTITION.value})
+                )
+                result = OrderResult(
+                    success=False,
+                    status=OrderStatus.FAILED,
+                    error=str(e),
+                    error_code=ErrorCode.NETWORK_PARTITION.value,
+                    correlation_id=correlation_id,
+                    idempotency_key=idempotency_key,
+                    is_duplicate=False,
+                )
+                self._idempotency_cache.set(idempotency_key, result)
+                return result
             except ValueError as e:
                 error_message = str(e)
                 if "price" in error_message.lower():
@@ -555,6 +582,7 @@ class ExecutionServiceV2:
                         if error_code in RETRYABLE_CODES:
                             raise OperationalError(error_code, error_message)
                         raise ValidationError(error_code, error_message)
+                    self.network_monitor.record_success()
                     return response.order_id
 
                 if not response or not isinstance(response, dict) or not response.get("success"):
@@ -564,7 +592,7 @@ class ExecutionServiceV2:
                     if error_code in RETRYABLE_CODES:
                         raise OperationalError(error_code, error_message)
                     raise ValidationError(error_code, error_message)
-
+                self.network_monitor.record_success()
                 return response["order_id"]
 
             try:
@@ -572,6 +600,22 @@ class ExecutionServiceV2:
                     submit_order,
                     max_retries=self.max_retries
                 )
+            except NetworkPartitionError as e:
+                logger.critical(
+                    "network_partition_blocked_order",
+                    **inject_correlation({"error": str(e), "error_code": ErrorCode.NETWORK_PARTITION.value})
+                )
+                result = OrderResult(
+                    success=False,
+                    status=OrderStatus.FAILED,
+                    error=str(e),
+                    error_code=ErrorCode.NETWORK_PARTITION.value,
+                    correlation_id=correlation_id,
+                    idempotency_key=idempotency_key,
+                    is_duplicate=False,
+                )
+                self._idempotency_cache.set(idempotency_key, result)
+                return result
             except TradingException as e:
                 status = OrderStatus.REJECTED if isinstance(e, ValidationError) else OrderStatus.FAILED
                 logger.error(
@@ -686,10 +730,30 @@ class ExecutionServiceV2:
                     })
                 )
             else:
-                await self._wait_for_fills(
+                fill_success = await self._wait_for_fills(
                     order_state,
-                    timeout=self.timeout_seconds
+                    timeout=self.timeout_seconds,
+                    target_price=price,
+                    max_slippage_bps=max_slippage_bps,
+                    correlation_id=correlation_id,
+                    idempotency_key=idempotency_key
                 )
+                if not fill_success and order_state.status == OrderStatus.FAILED:
+                    result = OrderResult(
+                        success=False,
+                        order_id=order_id,
+                        status=order_state.status,
+                        filled_quantity=order_state.filled_quantity,
+                        filled_price=order_state.avg_fill_price,
+                        fees=order_state.total_fees,
+                        error="slippage_violation",
+                        error_code=ErrorCode.SLIPPAGE_VIOLATION.value,
+                        correlation_id=correlation_id,
+                        idempotency_key=idempotency_key,
+                        is_duplicate=False,
+                    )
+                    self._idempotency_cache.set(idempotency_key, result)
+                    return result
 
             execution_time_ms = (time.time() - start_time) * 1000
             self.execution_times_ms.append(execution_time_ms)
@@ -702,11 +766,12 @@ class ExecutionServiceV2:
             self.total_fees += order_state.total_fees
 
             if order_state.filled_quantity > 0:
-                await self._record_trade_in_ledger(
-                    order_state,
-                    correlation_id=correlation_id,
-                    idempotency_key=idempotency_key
-                )
+                if record_in_ledger:
+                    await self._record_trade_in_ledger(
+                        order_state,
+                        correlation_id=correlation_id,
+                        idempotency_key=idempotency_key
+                    )
                 if order_state.status == OrderStatus.FILLED:
                     self.orders_filled += 1
 
@@ -791,12 +856,22 @@ class ExecutionServiceV2:
     async def _wait_for_fills(
         self,
         order_state: OrderState,
-        timeout: float
+        timeout: float,
+        target_price: Decimal,
+        max_slippage_bps: int,
+        correlation_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> bool:
         start_time = time.time()
+
+        max_slippage = Decimal(str(max_slippage_bps)) / Decimal("10000")
+        max_fill_price = target_price * (Decimal("1") + max_slippage)
+        min_fill_price = target_price * (Decimal("1") - max_slippage)
         
         while (time.time() - start_time) < timeout:
             status_response = await self.client.get_order_status(order_state.order_id)
+            if status_response:
+                self.network_monitor.record_success()
             
             if status_response:
                 fills = status_response.get('fills', [])
@@ -812,6 +887,28 @@ class ExecutionServiceV2:
                             fee=Decimal(str(fill_data.get('fee', 0))),
                             timestamp=datetime.now(timezone.utc)
                         )
+                        if fill.price > max_fill_price or fill.price < min_fill_price:
+                            logger.error(
+                                "slippage_violation",
+                                **inject_correlation({
+                                    "order_id": order_state.order_id,
+                                    "fill_price": str(fill.price),
+                                    "target_price": str(target_price),
+                                    "max_slippage_bps": max_slippage_bps,
+                                })
+                            )
+                            await self.client.cancel_order(order_state.order_id)
+                            previous_status = order_state.status
+                            order_state.status = OrderStatus.FAILED
+                            await self._record_order_audit(
+                                order_id=order_state.order_id,
+                                old_state=previous_status.value,
+                                new_state=order_state.status.value,
+                                reason="slippage_violation",
+                                correlation_id=correlation_id,
+                                idempotency_key=idempotency_key,
+                            )
+                            return False
                         order_state.add_fill(fill)
 
                         if previous_status != order_state.status:
@@ -854,8 +951,8 @@ class ExecutionServiceV2:
                 old_state=previous_status.value,
                 new_state=order_state.status.value,
                 reason="order_expired",
-                correlation_id=order_state.request.metadata.get("correlation_id") if order_state.request.metadata else None,
-                idempotency_key=order_state.request.metadata.get("idempotency_key") if order_state.request.metadata else None,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
             )
         
         return order_state.status == OrderStatus.FILLED
@@ -906,6 +1003,67 @@ class ExecutionServiceV2:
             )
             self.dlq.append(order_state)
 
+    async def close_position(
+        self,
+        position_id: int,
+        exit_reason: str,
+        exit_price: Optional[Decimal] = None,
+        max_slippage_bps: int = 50,
+    ) -> OrderResult:
+        correlation_id = generate_correlation_id()
+
+        positions = await self.ledger.get_open_positions()
+        position = next((p for p in positions if p.id == position_id), None)
+        if not position:
+            return OrderResult(
+                success=False,
+                order_id=None,
+                status=OrderStatus.FAILED,
+                error="position_not_found",
+                error_code=ErrorCode.INVALID_STATE.value,
+                correlation_id=correlation_id,
+            )
+
+        if exit_price is None:
+            orderbook = await self.client.get_orderbook(position.token_id)
+            if orderbook:
+                bids = orderbook.get("bids", [])
+                asks = orderbook.get("asks", [])
+                try:
+                    bid = Decimal(str(bids[0].get("price"))) if bids else position.entry_price
+                    ask = Decimal(str(asks[0].get("price"))) if asks else position.entry_price
+                    exit_price = (bid + ask) / Decimal("2")
+                except Exception:
+                    exit_price = position.entry_price
+            else:
+                exit_price = position.entry_price
+
+        result = await self.place_order(
+            strategy=position.strategy,
+            market_id=position.market_id,
+            token_id=position.token_id,
+            side="SELL",
+            quantity=position.quantity,
+            price=exit_price,
+            order_type="FOK",
+            metadata={"exit_reason": exit_reason, "position_id": position_id},
+            correlation_id=correlation_id,
+            max_slippage_bps=max_slippage_bps,
+            record_in_ledger=False,
+        )
+
+        if result.success and result.filled_quantity > 0:
+            await self.ledger.record_trade_exit(
+                position_id=position_id,
+                exit_price=result.filled_price,
+                fees=result.fees,
+                exit_reason=exit_reason,
+                correlation_id=correlation_id,
+                exit_order_id=result.order_id,
+            )
+
+        return result
+
         except Exception as e:
             logger.error(
                 "ledger_recording_failed",
@@ -934,7 +1092,14 @@ class ExecutionServiceV2:
                     ]
                 
                 for order in pending_orders:
-                    await self._wait_for_fills(order, timeout=0.1)
+                    await self._wait_for_fills(
+                        order,
+                        timeout=0.1,
+                        target_price=order.request.price,
+                        max_slippage_bps=50,
+                        correlation_id=order.request.metadata.get("correlation_id") if order.request.metadata else None,
+                        idempotency_key=order.request.metadata.get("idempotency_key") if order.request.metadata else None,
+                    )
             
             except asyncio.CancelledError:
                 logger.info("fill_monitor_stopped")

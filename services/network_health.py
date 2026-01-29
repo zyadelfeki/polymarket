@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""
+Network health monitoring for detecting partitions.
+
+Tracks the time since the last successful API call and flags
+network partitions when the threshold is exceeded.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Optional
+
+try:
+    import structlog
+    _structlog_available = True
+except ImportError:
+    structlog = None
+    _structlog_available = False
+
+from services.correlation_context import inject_correlation
+
+if _structlog_available:
+    logger = structlog.get_logger(__name__)
+else:
+    import logging
+
+    logging.basicConfig(level=logging.INFO)
+    class _FallbackLogger:
+        def __init__(self, name: str):
+            self._logger = logging.getLogger(name)
+
+        def _log(self, level, event: str, **kwargs):
+            exc_info = kwargs.pop("exc_info", None)
+            kwargs = inject_correlation(kwargs)
+            message = f"{event} | {kwargs}" if kwargs else event
+            self._logger.log(level, message, exc_info=exc_info)
+
+        def debug(self, event: str, **kwargs):
+            self._log(logging.DEBUG, event, **kwargs)
+
+        def info(self, event: str, **kwargs):
+            self._log(logging.INFO, event, **kwargs)
+
+        def warning(self, event: str, **kwargs):
+            self._log(logging.WARNING, event, **kwargs)
+
+        def error(self, event: str, **kwargs):
+            self._log(logging.ERROR, event, **kwargs)
+
+        def critical(self, event: str, **kwargs):
+            self._log(logging.CRITICAL, event, **kwargs)
+
+    logger = _FallbackLogger(__name__)
+
+
+@dataclass
+class NetworkPartitionState:
+    last_successful_api_call: datetime
+    partition_threshold_seconds: int
+    is_partitioned: bool = False
+    last_failure: Optional[str] = None
+
+
+class NetworkPartitionError(RuntimeError):
+    """Raised when a network partition is detected and trading is halted."""
+
+
+class NetworkHealthMonitor:
+    """Detect network partitions before trading on stale data."""
+
+    def __init__(self, partition_threshold_seconds: int = 15):
+        self.state = NetworkPartitionState(
+            last_successful_api_call=datetime.utcnow(),
+            partition_threshold_seconds=partition_threshold_seconds,
+        )
+
+    def record_success(self) -> None:
+        self.state.last_successful_api_call = datetime.utcnow()
+        if self.state.is_partitioned:
+            logger.info("network_recovered")
+            self.state.is_partitioned = False
+            self.state.last_failure = None
+
+    def record_failure(self, reason: Optional[str] = None) -> None:
+        self.state.last_failure = reason
+
+    def check_partition(self) -> bool:
+        elapsed = (datetime.utcnow() - self.state.last_successful_api_call).total_seconds()
+        if elapsed > self.state.partition_threshold_seconds and not self.state.is_partitioned:
+            logger.critical(
+                "network_partition_detected",
+                elapsed_seconds=elapsed,
+                threshold_seconds=self.state.partition_threshold_seconds,
+                last_failure=self.state.last_failure,
+            )
+            self.state.is_partitioned = True
+        return self.state.is_partitioned
+
+    def time_since_success(self) -> timedelta:
+        return datetime.utcnow() - self.state.last_successful_api_call

@@ -61,6 +61,58 @@ class Ledger:
 
         if "opened_at" not in columns:
             conn.execute("ALTER TABLE positions ADD COLUMN opened_at TIMESTAMP")
+
+    def record_audit_event(
+        self,
+        *,
+        operation: str,
+        entity_type: str,
+        entity_id: Optional[str] = None,
+        old_state: Optional[str] = None,
+        new_state: Optional[str] = None,
+        reason: Optional[str] = None,
+        context: Optional[Dict] = None,
+        correlation_id: Optional[str] = None,
+        details: Optional[str] = None,
+    ) -> int:
+        """Record an audit log entry."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO audit_log (
+                    operation, entity_type, entity_id, old_state, new_state,
+                    reason, context, correlation_id, details
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation,
+                    entity_type,
+                    entity_id,
+                    old_state,
+                    new_state,
+                    reason,
+                    json.dumps(context) if context else None,
+                    correlation_id,
+                    details,
+                ),
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    @staticmethod
+    def calculate_breakeven_price(
+        entry_price: Decimal,
+        quantity: Decimal,
+        fee_rate: Decimal = Decimal("0.02"),
+    ) -> Decimal:
+        """Calculate breakeven price after fees."""
+        if not isinstance(entry_price, Decimal) or not isinstance(quantity, Decimal):
+            raise TypeError("entry_price and quantity must be Decimal")
+        if entry_price <= 0 or quantity <= 0:
+            raise ValueError("entry_price and quantity must be positive")
+        buy_cost = entry_price * (Decimal("1") + fee_rate)
+        breakeven = buy_cost / (Decimal("1") - fee_rate)
+        return breakeven
     
     @contextmanager
     def _get_connection(self):
@@ -259,6 +311,101 @@ class Ledger:
                 f"Cost: ${total_cost} | Position ID: {txn_id}"
             )
             
+            return txn_id
+
+    def record_reconciled_position(
+        self,
+        market_id: str,
+        side: str,
+        quantity: Decimal,
+        entry_price: Decimal,
+        strategy: str = "reconciled",
+        token_id: str = "",
+        order_id: str = "",
+        metadata: Optional[Dict] = None,
+        correlation_id: Optional[str] = None,
+    ) -> int:
+        """
+        Record an externally discovered position without touching cash.
+
+        Double-entry:
+        - DR Positions (asset)
+        - CR Owner Equity (equity)
+        """
+        if quantity <= 0:
+            raise ValueError(f"Quantity must be positive: {quantity}")
+        if entry_price <= 0 or entry_price > 1:
+            raise ValueError(f"Invalid entry price: {entry_price}")
+
+        cost = quantity * entry_price
+
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO transactions (transaction_type, description, metadata, correlation_id)
+                VALUES ('POSITION_RECONCILE', ?, ?, ?)
+                """,
+                (
+                    f"Reconcile {side} position on {market_id[:20]}",
+                    json.dumps(metadata) if metadata else None,
+                    correlation_id,
+                ),
+            )
+            txn_id = cursor.lastrowid
+
+            positions_id = self._get_account_id(conn, 'Positions')
+            equity_id = self._get_account_id(conn, 'Owner Equity')
+
+            conn.execute(
+                """
+                INSERT INTO transaction_lines (transaction_id, account_id, amount)
+                VALUES (?, ?, ?)
+                """,
+                (txn_id, positions_id, _format_amount(cost)),
+            )
+            conn.execute(
+                """
+                INSERT INTO transaction_lines (transaction_id, account_id, amount)
+                VALUES (?, ?, ?)
+                """,
+                (txn_id, equity_id, _format_amount(-cost)),
+            )
+
+            conn.execute(
+                """
+                INSERT INTO positions (
+                    position_id, market_id, token_id, strategy, side,
+                    entry_price, quantity, current_price, status,
+                    entry_timestamp, opened_at, entry_order_id, entry_fees, metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)
+                """,
+                (
+                    txn_id,
+                    market_id,
+                    token_id,
+                    strategy,
+                    side,
+                    str(entry_price),
+                    str(quantity),
+                    str(entry_price),
+                    datetime.utcnow().isoformat(),
+                    datetime.utcnow().isoformat(),
+                    order_id,
+                    _format_amount(Decimal("0")),
+                    json.dumps(metadata) if metadata else None,
+                ),
+            )
+
+            conn.commit()
+
+            logger.warning(
+                "Reconciled external position: %s | %s %s @ %s",
+                strategy,
+                side,
+                quantity,
+                entry_price,
+            )
             return txn_id
     
     def record_trade_exit(
