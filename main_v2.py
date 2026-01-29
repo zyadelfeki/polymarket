@@ -75,7 +75,7 @@ class TradingBot:
                 cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 tables = await cursor.fetchall()
                 table_names = [t[0] for t in tables]
-            logger.info("database_tables_found", tables=table_names)
+                logger.info("database_tables_found", tables=table_names)
                 
                 if 'transactions' not in table_names:
                     raise RuntimeError("transactions table missing after schema init!")

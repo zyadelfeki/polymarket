@@ -1063,17 +1063,6 @@ class ExecutionServiceV2:
             )
 
         return result
-
-        except Exception as e:
-            logger.error(
-                "ledger_recording_failed",
-                **inject_correlation({
-                    "order_id": order_state.order_id,
-                    "error": str(e),
-                    "error_code": ErrorCode.UNKNOWN.value
-                })
-            )
-            self.dlq.append(order_state)
     
     async def _fill_monitor_loop(self):
         logger.info("fill_monitor_started")
