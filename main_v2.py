@@ -15,6 +15,7 @@ import os
 import logging
 from dotenv import load_dotenv
 from utils.correlation_id import CorrelationIdFilter, structlog_correlation_processor
+from utils.json_helpers import dumps
 
 # Load environment variables BEFORE any config initialization
 load_dotenv(override=True)
@@ -22,12 +23,24 @@ load_dotenv(override=True)
 sys.path.insert(0, str(Path(__file__).parent))
 
 from database.ledger_async import AsyncLedger
+from config.settings import settings
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
 from services.execution_service_v2 import ExecutionServiceV2
 from risk.circuit_breaker_v2 import CircuitBreakerV2
 from strategies.latency_arbitrage import LatencyArbitrageEngine
+from strategies.latency_arbitrage_btc import LatencyArbitrageEngine as MultiTimeframeLatencyArbitrageEngine
 
 logger = structlog.get_logger(__name__)
+
+
+class _StrategyPriceAdapter:
+    def __init__(self, strategy: LatencyArbitrageEngine):
+        self.strategy = strategy
+
+    def get_current_price(self, symbol: str):
+        if symbol != "BTC":
+            return None
+        return getattr(self.strategy, "latest_btc_price", None)
 
 
 class TradingBot:
@@ -39,10 +52,13 @@ class TradingBot:
         self.execution_service: ExecutionServiceV2 = None
         self.circuit_breaker: CircuitBreakerV2 = None
         self.strategy: LatencyArbitrageEngine = None
+        self.multi_tf_strategy: MultiTimeframeLatencyArbitrageEngine = None
         self._health_task = None
         self._stats_task = None
+        self._metrics_task = None
         self._heartbeat_task = None
         self._market_task = None
+        self._multi_tf_scan_task = None
     
     async def initialize(self):
         logger.info("startup_banner", mode=self.config["mode"], capital=str(self.config["initial_capital"]), debug=self.config.get("debug", False))
@@ -102,6 +118,7 @@ class TradingBot:
             paper_trading=(self.config['mode'] == 'paper'),
             rate_limit=10.0
         )
+        self._validate_polymarket_client()
         logger.info("client_ready", paper_trading=(self.config["mode"] == "paper"))
         
         # STEP 2.5: Sync wallet balance for live mode
@@ -193,6 +210,17 @@ class TradingBot:
             }
         )
         logger.info("strategy_ready")
+
+        self.multi_tf_strategy = MultiTimeframeLatencyArbitrageEngine(
+            binance_ws=_StrategyPriceAdapter(self.strategy),
+            polymarket_client=self.polymarket_client,
+            charlie_predictor=None,
+            config=settings.get_latency_arb_config(),
+            execution_service=None,
+            kelly_sizer=None,
+            redis_subscriber=None,
+        )
+        logger.info("multi_timeframe_strategy_ready")
         
         logger.info(
             "initialization_complete",
@@ -212,7 +240,9 @@ class TradingBot:
         self._heartbeat_task = asyncio.create_task(self._heartbeat_monitor(heartbeat_interval))
         self._health_task = asyncio.create_task(self._health_monitor())
         self._stats_task = asyncio.create_task(self._stats_reporter())
+        self._metrics_task = asyncio.create_task(self._write_metrics_to_file())
         self._market_task = asyncio.create_task(self._market_resolution_monitor())
+        self._multi_tf_scan_task = asyncio.create_task(self._run_multi_tf_scan_loop())
         
         try:
             await self.strategy.start()
@@ -232,8 +262,12 @@ class TradingBot:
             self._health_task.cancel()
         if self._stats_task:
             self._stats_task.cancel()
+        if self._metrics_task:
+            self._metrics_task.cancel()
         if self._market_task:
             self._market_task.cancel()
+        if self._multi_tf_scan_task:
+            self._multi_tf_scan_task.cancel()
         if self.strategy:
             await self.strategy.stop()
         if self.execution_service:
@@ -244,6 +278,38 @@ class TradingBot:
             await self.ledger.close()
         
         logger.info("bot_stopped")
+
+    def _validate_polymarket_client(self) -> None:
+        if self.polymarket_client is None:
+            raise RuntimeError("Polymarket client initialization failed: client is None")
+
+        required_methods = ["get_markets", "get_active_markets", "get_orderbook", "get_market"]
+        available = any(hasattr(self.polymarket_client, method) for method in required_methods)
+        if not available:
+            raise RuntimeError("Polymarket client missing market-fetch methods")
+
+    async def _run_multi_tf_scan_loop(self) -> None:
+        while self.running:
+            try:
+                if not self.multi_tf_strategy:
+                    await asyncio.sleep(10)
+                    continue
+
+                opportunity = await self.multi_tf_strategy.scan_opportunities()
+                if opportunity:
+                    logger.info(
+                        "multi_tf_opportunity_detected",
+                        market_id=opportunity.get("market_id"),
+                        timeframe=opportunity.get("timeframe"),
+                        edge=str(opportunity.get("edge")),
+                    )
+
+                await asyncio.sleep(15)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("multi_tf_scan_error", error=str(e), exc_info=True)
+                await asyncio.sleep(15)
 
     async def _reconcile_positions_on_startup(self) -> None:
         logger.info("position_reconciliation_start")
@@ -428,6 +494,43 @@ class TradingBot:
             except Exception as e:
                 logger.error("stats_reporter_error", error=str(e))
 
+    async def _write_metrics_to_file(self):
+        """Write metrics to JSON file every 5 minutes for monitoring."""
+        Path('data').mkdir(exist_ok=True)
+
+        while self.running:
+            try:
+                await asyncio.sleep(300)
+
+                equity = await self.ledger.get_equity()
+                positions = await self.ledger.get_open_positions()
+                strategy_metrics = self.strategy.get_metrics() if self.strategy else {}
+                execution_metrics = self.execution_service.get_metrics()
+                cb_status = self.circuit_breaker.get_status()
+
+                metrics = {
+                    "timestamp": datetime.now().isoformat(),
+                    "equity": float(equity),
+                    "open_positions": len(positions),
+                    "trades_executed": strategy_metrics.get('trades_executed', 0),
+                    "win_rate": strategy_metrics.get('win_rate', 0.0),
+                    "sharpe_ratio": strategy_metrics.get('sharpe_ratio', 0.0),
+                    "max_drawdown_pct": strategy_metrics.get('max_drawdown_pct', 0.0),
+                    "avg_execution_ms": execution_metrics.get('avg_execution_time_ms', 0.0),
+                    "circuit_breaker": cb_status['state'],
+                    "signals_generated": strategy_metrics.get('signals_generated', 0),
+                }
+
+                with open('data/metrics.jsonl', 'a') as f:
+                    f.write(dumps(metrics))
+
+                logger.info("metrics_written", equity=float(equity))
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("metrics_writer_error", error=str(e))
+
 
 async def main():
     parser = argparse.ArgumentParser(description='Polymarket Latency Arbitrage Bot')
@@ -461,7 +564,7 @@ async def main():
     
     logging.basicConfig(
         level=log_level,
-        format='%(asctime)s | %(levelname)s | %(name)s | %(correlation_id)s | %(message)s'
+        format='%(asctime)s | %(levelname)s | %(name)s | %(message)s'
     )
     logging.getLogger().addFilter(CorrelationIdFilter())
     

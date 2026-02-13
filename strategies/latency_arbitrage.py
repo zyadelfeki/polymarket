@@ -36,6 +36,7 @@ from utils.correlation_id import generate_correlation_id
 from risk.circuit_breaker_v2 import CircuitBreakerV2
 from database.ledger_async import AsyncLedger
 from services.strategy_health import StrategyHealthMonitor
+from utils.decimal_helpers import to_decimal, quantize_price, quantize_quantity, to_timeout_float
 
 if _structlog_available:
     logger = structlog.get_logger(__name__)
@@ -104,13 +105,13 @@ class LatencyArbitrageEngine:
         self.config = config or {}
         self.market_id = self.config.get('market_id', 'btc_to_100k')
         self.token_id = self.config.get('token_id')
-        self.min_spread_bps = self.config.get('min_spread_bps', 50)  # 0.5%
-        self.max_spread_bps = self.config.get('max_spread_bps', 500)  # 5% (sanity)
-        self.max_position_pct = self.config.get('max_position_pct', 10.0)  # 10% of equity
-        self.poll_interval = self.config.get('poll_interval', 2.0)  # Poll Polymarket every 2s
-        self.btc_target = self.config.get('btc_target', 100000)  # Target price
-        self.fee_rate = Decimal(str(self.config.get('fee_rate', 0.02)))
-        self.min_profit_buffer_pct = Decimal(str(self.config.get('min_profit_buffer_pct', 0.05)))
+        self.min_spread_bps = to_decimal(self.config.get('min_spread_bps', '50'))  # 0.5%
+        self.max_spread_bps = to_decimal(self.config.get('max_spread_bps', '500'))  # 5% (sanity)
+        self.max_position_pct = to_decimal(self.config.get('max_position_pct', '10.0'))  # 10% of equity
+        self.poll_interval = to_decimal(self.config.get('poll_interval', '2.0'))  # Poll Polymarket every 2s
+        self.btc_target = to_decimal(self.config.get('btc_target', '100000'))  # Target price
+        self.fee_rate = to_decimal(self.config.get('fee_rate', '0.02'))
+        self.min_profit_buffer_pct = to_decimal(self.config.get('min_profit_buffer_pct', '0.05'))
         self.health_pause_seconds = int(self.config.get('health_pause_seconds', 3600))
         
         # State
@@ -183,13 +184,13 @@ class LatencyArbitrageEngine:
         if symbol != 'BTC':
             return
         
-        self.latest_btc_price = price_data.price
+        self.latest_btc_price = quantize_price(to_decimal(price_data.price))
         self.latest_btc_timestamp = price_data.timestamp
         
         logger.debug(
             "binance_price_update",
             symbol=symbol,
-            price=float(price_data.price)
+            price=str(self.latest_btc_price)
         )
     
     async def _strategy_loop(self):
@@ -203,19 +204,19 @@ class LatencyArbitrageEngine:
         while self.running:
             try:
                 if self._is_paused():
-                    await asyncio.sleep(self.poll_interval)
+                    await asyncio.sleep(to_timeout_float(self.poll_interval))
                     continue
 
                 healthy, reason = self._evaluate_strategy_health()
                 if not healthy:
                     logger.critical("strategy_health_failed", reason=reason)
                     self._pause_strategy(self.health_pause_seconds)
-                    await asyncio.sleep(self.health_pause_seconds)
+                    await asyncio.sleep(to_timeout_float(self.health_pause_seconds))
                     continue
 
                 # Wait for initial Binance price
                 if self.latest_btc_price is None:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(to_timeout_float(Decimal("0.5")))
                     continue
                 
                 # Poll Polymarket odds
@@ -223,7 +224,7 @@ class LatencyArbitrageEngine:
                 
                 # Check if we have both prices
                 if self.latest_polymarket_odds is None:
-                    await asyncio.sleep(self.poll_interval)
+                    await asyncio.sleep(to_timeout_float(self.poll_interval))
                     continue
                 
                 # Calculate opportunity
@@ -234,7 +235,7 @@ class LatencyArbitrageEngine:
                     await self._execute_signal(signal)
                 
                 # Sleep until next poll
-                await asyncio.sleep(self.poll_interval)
+                await asyncio.sleep(to_timeout_float(self.poll_interval))
             
             except asyncio.CancelledError:
                 logger.info("strategy_loop_cancelled")
@@ -247,7 +248,7 @@ class LatencyArbitrageEngine:
                     error_type=type(e).__name__,
                     exc_info=True
                 )
-                await asyncio.sleep(self.poll_interval)
+                await asyncio.sleep(to_timeout_float(self.poll_interval))
         
         logger.info("strategy_loop_stopped")
     
@@ -275,7 +276,7 @@ class LatencyArbitrageEngine:
                 return
             
             if yes_price is not None:
-                self.latest_polymarket_odds = Decimal(str(yes_price))
+                self.latest_polymarket_odds = quantize_price(to_decimal(yes_price))
                 self.latest_polymarket_timestamp = datetime.utcnow()
 
             summary = await self.polymarket_client.get_market_orderbook_summary(self.market_id)
@@ -290,8 +291,8 @@ class LatencyArbitrageEngine:
                 logger.debug(
                     "polymarket_odds_fetched",
                     market_id=self.market_id,
-                    yes_price=float(yes_price),
-                    no_price=float(no_price) if no_price is not None else None
+                    yes_price=str(yes_price),
+                    no_price=str(no_price) if no_price is not None else None
                 )
         
         except Exception as e:
@@ -312,7 +313,7 @@ class LatencyArbitrageEngine:
         # If BTC is at $95k and target is $100k, probability should be ~95%
         implied_probability = min(
             Decimal('0.99'),
-            max(Decimal('0.01'), self.latest_btc_price / Decimal(str(self.btc_target)))
+            max(Decimal('0.01'), self.latest_btc_price / self.btc_target)
         )
         
         # Calculate spread
@@ -323,10 +324,10 @@ class LatencyArbitrageEngine:
         
         logger.debug(
             "signal_calculation",
-            btc_price=float(self.latest_btc_price),
-            implied_prob=float(implied_probability),
-            polymarket_odds=float(self.latest_polymarket_odds),
-            spread_bps=float(spread_bps)
+            btc_price=str(self.latest_btc_price),
+            implied_prob=str(implied_probability),
+            polymarket_odds=str(self.latest_polymarket_odds),
+            spread_bps=str(spread_bps)
         )
         
         # Check if spread exceeds threshold
@@ -337,8 +338,8 @@ class LatencyArbitrageEngine:
         if abs(spread_bps) > self.max_spread_bps:
             logger.warning(
                 "spread_too_large",
-                spread_bps=float(spread_bps),
-                max_spread_bps=self.max_spread_bps,
+                spread_bps=str(spread_bps),
+                max_spread_bps=str(self.max_spread_bps),
                 action="skipping"
             )
             return None
@@ -348,24 +349,30 @@ class LatencyArbitrageEngine:
             # Polymarket underpriced -> BUY YES
             action = 'BUY_YES'
             side = 'YES'
-            target_price = self.latest_polymarket_odds + (spread / Decimal('2'))  # Mid spread
+            target_price = quantize_price(
+                self.latest_polymarket_odds + (spread / Decimal('2'))
+            )  # Mid spread
         else:
             # Polymarket overpriced -> BUY NO
             action = 'BUY_NO'
             side = 'NO'
-            target_price = self.latest_polymarket_odds - (abs(spread) / Decimal('2'))
+            target_price = quantize_price(
+                self.latest_polymarket_odds - (abs(spread) / Decimal('2'))
+            )
         
         self.signals_generated += 1
         
+        confidence = min(Decimal("1"), (abs(spread_bps) / Decimal("100")))
+
         signal = {
             'action': action,
             'side': side,
-            'spread_bps': float(spread_bps),
+            'spread_bps': spread_bps,
             'target_price': target_price,
             'implied_probability': implied_probability,
             'polymarket_odds': self.latest_polymarket_odds,
             'btc_price': self.latest_btc_price,
-            'confidence': min(1.0, abs(float(spread_bps)) / 100),  # 1 bps = 1% confidence
+            'confidence': confidence,  # 1 bps = 1% confidence
             'correlation_id': generate_correlation_id()
         }
         
@@ -373,8 +380,8 @@ class LatencyArbitrageEngine:
             "signal_generated",
             action=action,
             side=side,
-            spread_bps=float(spread_bps),
-            confidence=signal['confidence']
+            spread_bps=str(spread_bps),
+            confidence=str(signal['confidence'])
         )
         
         return signal
@@ -403,15 +410,12 @@ class LatencyArbitrageEngine:
                 return
             
             # Calculate position size
-            max_position_value = equity * (Decimal(str(self.max_position_pct)) / Decimal('100'))
+            max_position_value = equity * (self.max_position_pct / Decimal('100'))
             target_price = signal['target_price']
-            quantity = max_position_value / target_price
-            
-            # Round to 2 decimals
-            quantity = quantity.quantize(Decimal('0.01'))
+            quantity = quantize_quantity(max_position_value / target_price)
             
             if quantity <= 0:
-                logger.warning("quantity_too_small", quantity=float(quantity))
+                logger.warning("quantity_too_small", quantity=str(quantity))
                 return
 
             spread = self.latest_spread or Decimal("0")
@@ -421,8 +425,8 @@ class LatencyArbitrageEngine:
             if expected_price < min_target_price:
                 logger.debug(
                     "skipping_below_breakeven",
-                    expected_price=float(expected_price),
-                    min_target_price=float(min_target_price),
+                    expected_price=str(expected_price),
+                    min_target_price=str(min_target_price),
                 )
                 return
 
@@ -435,10 +439,10 @@ class LatencyArbitrageEngine:
                 "executing_trade",
                 action=signal['action'],
                 side=signal['side'],
-                quantity=float(quantity),
-                price=float(target_price),
-                position_value=float(quantity * target_price),
-                max_allowed=float(max_position_value)
+                quantity=str(quantity),
+                price=str(target_price),
+                position_value=str(quantity * target_price),
+                max_allowed=str(max_position_value)
             )
             
             correlation_id = signal.get("correlation_id") if isinstance(signal, dict) else None
@@ -454,11 +458,11 @@ class LatencyArbitrageEngine:
                     price=target_price,
                     metadata={
                         'outcome': signal['side'],
-                        'spread_bps': signal['spread_bps'],
+                        'spread_bps': str(signal['spread_bps']),
                         'btc_price': str(signal['btc_price']),
                         'implied_prob': str(signal['implied_probability']),
                         'polymarket_odds': str(signal['polymarket_odds']),
-                        'confidence': signal['confidence'],
+                        'confidence': str(signal['confidence']),
                         'correlation_id': correlation_id,
                     },
                     correlation_id=correlation_id,
@@ -471,15 +475,15 @@ class LatencyArbitrageEngine:
                 logger.info(
                     "trade_executed_successfully",
                     order_id=result.order_id,
-                    filled_quantity=float(result.filled_quantity),
-                    filled_price=float(result.filled_price),
-                    fees=float(result.fees),
+                    filled_quantity=str(result.filled_quantity),
+                    filled_price=str(result.filled_price),
+                    fees=str(result.fees),
                     execution_time_ms=result.execution_time_ms
                 )
                 
                 # Update circuit breaker (simulate small profit)
                 new_equity = await self.ledger.get_equity()
-                pnl = Decimal(str(signal['spread_bps'])) / Decimal('10000') * quantity * target_price
+                pnl = signal['spread_bps'] / Decimal('10000') * quantity * target_price
                 await self.circuit_breaker.record_trade_result(new_equity, pnl)
             
             else:
@@ -540,9 +544,9 @@ class LatencyArbitrageEngine:
             'trades_executed': self.trades_executed,
             'trades_blocked': self.trades_blocked,
             'execution_rate': (
-                self.trades_executed / self.signals_generated
-                if self.signals_generated > 0 else 0.0
+                (Decimal(self.trades_executed) / Decimal(self.signals_generated))
+                if self.signals_generated > 0 else Decimal("0")
             ),
-            'latest_btc_price': float(self.latest_btc_price) if self.latest_btc_price else None,
-            'latest_polymarket_odds': float(self.latest_polymarket_odds) if self.latest_polymarket_odds else None
+            'latest_btc_price': str(self.latest_btc_price) if self.latest_btc_price else None,
+            'latest_polymarket_odds': str(self.latest_polymarket_odds) if self.latest_polymarket_odds else None
         }

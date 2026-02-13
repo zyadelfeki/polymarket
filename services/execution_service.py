@@ -20,7 +20,13 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 import time
 from dataclasses import dataclass
+import json
+import os
+import tempfile
+from pathlib import Path
 from services.network_health import NetworkHealthMonitor, NetworkPartitionError
+from exports.positions_publisher import build_positions_from_ledger, PolymarketPositionsPublisher
+from shared.risk_aggregator import Position, UnifiedRiskAggregator
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +39,9 @@ class OrderResult:
     filled_quantity: Optional[Decimal]
     fees: Optional[Decimal]
     error: Optional[str]
-    error_code: Optional[str] = None
     latency_ms: int
     retries: int
+    error_code: Optional[str] = None
 
 
 class SlippageError(RuntimeError):
@@ -104,6 +110,9 @@ class ExecutionService:
         # Order tracking
         self.active_orders = {}  # order_id -> metadata
         self.order_history = []  # Recent order results
+
+        self.max_btc_exposure_usd = Decimal(str(config.get('max_btc_exposure_usd', '1000')))
+        self.positions_publisher = PolymarketPositionsPublisher(self.ledger)
         
         logger.info("ExecutionService initialized with rate limiting and retry logic")
     
@@ -162,6 +171,10 @@ class ExecutionService:
                     latency_ms=0,
                     retries=0
                 )
+
+        risk_blocked = self._check_unified_risk(side, quantity, price, metadata)
+        if risk_blocked is not None:
+            return risk_blocked
         async with self.order_semaphore:
             return await self._execute_order(
                 strategy, market_id, token_id, side,
@@ -263,6 +276,13 @@ class ExecutionService:
                         latency_ms=int((time.monotonic() - start_time) * 1000),
                         retries=attempt + 1
                     )
+
+                # Publish positions after fill for unified risk
+                try:
+                    self.positions_publisher.publish_positions()
+                except Exception as exc:
+                    logger.warning(f"Failed to publish positions: {exc}")
+
                 
                 # Record in ledger
                 txn_id, position_id = self.ledger.record_trade_entry(
@@ -362,6 +382,113 @@ class ExecutionService:
             retries=self.max_retries
         )
     
+    def _check_unified_risk(
+        self,
+        side: str,
+        quantity: Decimal,
+        price: Decimal,
+        metadata: Optional[Dict]
+    ) -> Optional[OrderResult]:
+        if not self._is_btc_market(metadata):
+            return None
+
+        direction = self._infer_position_direction(side, metadata)
+        if direction is None:
+            return None
+
+        size_usd = quantity * price
+
+        aggregator = UnifiedRiskAggregator(max_btc_exposure_usd=self.max_btc_exposure_usd)
+        positions = self._load_unified_positions()
+        aggregator.update_positions(positions)
+
+        can_open, reason = aggregator.can_open_btc_position(size_usd, direction)
+        if not can_open:
+            logger.warning(f"⚠️ Order blocked by unified risk: {reason}")
+            return OrderResult(
+                success=False,
+                order_id=None,
+                filled_price=None,
+                filled_quantity=None,
+                fees=None,
+                error="risk_blocked",
+                error_code="RISK_LIMIT",
+                latency_ms=0,
+                retries=0
+            )
+
+        return None
+
+    def _load_unified_positions(self) -> List[Position]:
+        positions: List[Position] = []
+
+        # Local positions from ledger
+        try:
+            positions.extend(build_positions_from_ledger(self.ledger))
+        except Exception as exc:
+            logger.warning(f"Failed to load ledger positions: {exc}")
+
+        # External crypto positions from shared file
+        crypto_path = self._positions_file("CHARLIE_POSITIONS_FILE", "crypto_positions.json")
+        try:
+            if crypto_path.exists():
+                raw = json.loads(crypto_path.read_text())
+                for item in raw:
+                    positions.append(
+                        Position(
+                            bot=item["bot"],
+                            asset=item["asset"],
+                            direction=item["direction"],
+                            notional_value=Decimal(str(item["notional_value"])),
+                            source=item.get("source", "bitget"),
+                        )
+                    )
+        except Exception as exc:
+            logger.warning(f"Failed to load crypto positions: {exc}")
+
+        return positions
+
+    def _is_btc_market(self, metadata: Optional[Dict]) -> bool:
+        if not metadata:
+            return False
+
+        symbol = str(metadata.get("symbol", "")).upper()
+        if symbol == "BTC":
+            return True
+
+        question = str(metadata.get("question") or metadata.get("market_question") or "").lower()
+        return "btc" in question or "bitcoin" in question
+
+    def _infer_position_direction(self, side: str, metadata: Optional[Dict]) -> Optional[str]:
+        side = side.upper()
+        if side not in {"YES", "NO"}:
+            return None
+
+        question = ""
+        if metadata:
+            question = str(metadata.get("question") or metadata.get("market_question") or "").lower()
+
+        is_below = any(word in question for word in ["below", "under", "less than", "<"])
+
+        if is_below:
+            yes_direction = "SHORT"
+            no_direction = "LONG"
+        else:
+            yes_direction = "LONG"
+            no_direction = "SHORT"
+
+        return yes_direction if side == "YES" else no_direction
+
+    def _positions_file(self, env_key: str, filename: str) -> Path:
+        env_path = os.getenv(env_key)
+        if env_path:
+            return Path(env_path)
+
+        if os.name == "nt":
+            return Path(tempfile.gettempdir()) / filename
+
+        return Path(f"/tmp/{filename}")
+
     async def _wait_for_fill(
         self,
         order_id: str,

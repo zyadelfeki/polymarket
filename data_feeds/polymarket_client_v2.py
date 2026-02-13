@@ -13,8 +13,9 @@ import asyncio
 import time
 import json
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, getcontext
-from typing import Optional, Dict, List, Any, Callable, Awaitable, TypeVar
+from typing import Optional, Dict, List, Any, Callable, Awaitable, TypeVar, TypedDict
 from enum import Enum
 try:
     import structlog
@@ -84,6 +85,7 @@ from services.error_codes import ErrorCode
 from services.correlation_context import CorrelationContext, inject_correlation
 from services.validators import BoundaryValidator
 from services.network_health import NetworkHealthMonitor
+from utils.decimal_helpers import to_decimal, safe_decimal, quantize_price, quantize_quantity
 
 T = TypeVar("T")
 
@@ -92,6 +94,48 @@ class OrderSide(Enum):
     """Order side enum"""
     BUY = "BUY"
     SELL = "SELL"
+
+
+class OrderResult(TypedDict):
+    """Immutable execution contract - enforced on ALL code paths."""
+    success: bool
+    order_id: Optional[str]
+    error: Optional[str]
+    filled_size: Optional[Decimal]
+    avg_price: Optional[Decimal]
+    timestamp: float
+
+
+class OrderResultDict(dict):
+    """Runtime dict with attribute access for OrderResult compatibility."""
+
+    def __getattr__(self, item: str):
+        try:
+            return self[item]
+        except KeyError as exc:
+            raise AttributeError(item) from exc
+
+    def __bool__(self) -> bool:
+        return bool(self.get("success", False))
+
+
+def _make_order_result(
+    *,
+    success: bool,
+    order_id: Optional[str],
+    error: Optional[str],
+    filled_size: Optional[Decimal],
+    avg_price: Optional[Decimal],
+    timestamp: float,
+) -> OrderResult:
+    return OrderResultDict(
+        success=success,
+        order_id=order_id,
+        error=error,
+        filled_size=filled_size,
+        avg_price=avg_price,
+        timestamp=timestamp,
+    )
 
 
 class TokenBucket:
@@ -139,7 +183,7 @@ class RequestMetrics:
             self.successful_requests += 1
         else:
             self.failed_requests += 1
-        self.total_latency_ms += float(latency_ms)
+        self.total_latency_ms += latency_ms
 
     def get_metrics(self) -> Dict:
         avg_latency = 0.0
@@ -621,22 +665,9 @@ class PolymarketClientV2:
         Returns:
             Market dict or safe default with tokens field
         """
-        if self.paper_trading or not self.client:
-            # Return mock data for paper trading
-            logger.debug("returning_mock_market_data", market_id=market_id)
-            return {
-                "market_id": market_id,
-                "question": f"Mock market: {market_id}",
-                "tokens": [
-                    {"token_id": "yes", "outcome": "YES", "price": Decimal("0.50")},
-                    {"token_id": "no", "outcome": "NO", "price": Decimal("0.50")}
-                ],
-                "yes_price": Decimal("0.50"),
-                "no_price": Decimal("0.50"),
-                "yes_token_id": "yes",
-                "no_token_id": "no",
-                "mock": True
-            }
+        if not self.client:
+            logger.error("cannot_fetch_market", reason="client_uninitialized", market_id=market_id)
+            return {"tokens": [], "error": "client_uninitialized", "market_id": market_id}
         
         async def _fetch_market() -> Optional[Dict]:
             await self._throttle()
@@ -789,14 +820,14 @@ class PolymarketClientV2:
     async def place_order(
         self,
         token_id: str,
-        side: Any,
-        price: Any,
-        size: Any,
+        side: str,
+        size: Decimal,
+        price: Decimal,
         order_type: str = "GTC",
         market_id: Optional[str] = None,
         correlation_id: Optional[str] = None,
         idempotency_key: Optional[str] = None
-    ):
+    ) -> OrderResult:
         """
         Place an order.
         
@@ -813,30 +844,28 @@ class PolymarketClientV2:
         # Paper trading simulation
         await self._throttle()
 
-        from services.execution_service_v2 import OrderResult, OrderStatus
-
         correlation_id = correlation_id or CorrelationContext.get()
-
-        if isinstance(price, float) or isinstance(size, float):
+        side_str = side.value if isinstance(side, OrderSide) else str(side)
+        if side_str.upper() not in {"BUY", "SELL"}:
             logger.error(
-                "invalid_decimal_input",
+                "invalid_order_input",
                 **inject_correlation({
-                    "error": "float_not_allowed",
+                    "error": f"invalid_side:{side_str}",
                     "error_code": ErrorCode.INVALID_ORDER.value
                 })
             )
-            return OrderResult(
+            return _make_order_result(
                 success=False,
-                status=OrderStatus.REJECTED,
-                error="float_not_allowed",
-                error_code=ErrorCode.INVALID_ORDER.value,
-                correlation_id=correlation_id,
-                idempotency_key=idempotency_key
+                order_id=None,
+                error=f"invalid_side:{side_str}",
+                filled_size=None,
+                avg_price=None,
+                timestamp=time.time(),
             )
 
         try:
-            price_dec = BoundaryValidator.validate_price(price)
-            size_dec = BoundaryValidator.validate_quantity(size)
+            price_dec = quantize_price(BoundaryValidator.validate_price(to_decimal(price)))
+            size_dec = quantize_quantity(BoundaryValidator.validate_quantity(to_decimal(size)))
         except ValueError as exc:
             error_message = str(exc)
             error_code = ErrorCode.INVALID_ORDER.value
@@ -851,13 +880,33 @@ class PolymarketClientV2:
                     "error_code": error_code
                 })
             )
-            return OrderResult(
+            return _make_order_result(
                 success=False,
-                status=OrderStatus.REJECTED,
+                order_id=None,
                 error=error_message,
-                error_code=error_code,
-                correlation_id=correlation_id,
-                idempotency_key=idempotency_key
+                filled_size=None,
+                avg_price=None,
+                timestamp=time.time(),
+            )
+
+        if size_dec <= Decimal("0"):
+            return _make_order_result(
+                success=False,
+                order_id=None,
+                error="size_must_be_positive",
+                filled_size=None,
+                avg_price=None,
+                timestamp=time.time(),
+            )
+
+        if not (Decimal("0") < price_dec < Decimal("1")):
+            return _make_order_result(
+                success=False,
+                order_id=None,
+                error="price_out_of_range",
+                filled_size=None,
+                avg_price=None,
+                timestamp=time.time(),
             )
 
         if self.paper_trading:
@@ -872,15 +921,13 @@ class PolymarketClientV2:
                 size=str(size_dec),
                 correlation_id=correlation_id
             )
-            return OrderResult(
+            return _make_order_result(
                 success=True,
                 order_id=order_id,
-                status=OrderStatus.SUBMITTED,
-                filled_quantity=Decimal("0"),
-                filled_price=Decimal("0"),
-                fees=Decimal("0"),
-                correlation_id=correlation_id,
-                idempotency_key=idempotency_key
+                error=None,
+                filled_size=Decimal("0"),
+                avg_price=price_dec,
+                timestamp=time.time(),
             )
         
         # Check authentication for live trading
@@ -892,13 +939,13 @@ class PolymarketClientV2:
                     "error_code": ErrorCode.NOT_AUTHENTICATED.value
                 })
             )
-            return OrderResult(
+            return _make_order_result(
                 success=False,
-                status=OrderStatus.REJECTED,
+                order_id=None,
                 error="not_authenticated",
-                error_code=ErrorCode.NOT_AUTHENTICATED.value,
-                correlation_id=correlation_id,
-                idempotency_key=idempotency_key
+                filled_size=None,
+                avg_price=None,
+                timestamp=time.time(),
             )
         
         async def _submit_order() -> Dict:
@@ -921,12 +968,11 @@ class PolymarketClientV2:
                 except Exception:
                     logger.debug("idempotency_header_set_failed", correlation_id=correlation_id)
 
-            side_str = side.value if isinstance(side, OrderSide) else str(side)
             order_side = SELL if side_str.upper() == "SELL" else BUY
             order = OrderArgs(
                 token_id=token_id,
-                price=float(price_dec),
-                size=float(size_dec),
+                price=price_dec.__float__(),
+                size=size_dec.__float__(),
                 side=order_side
             )
 
@@ -945,34 +991,87 @@ class PolymarketClientV2:
             )
             return response
 
-        response = await self._execute_with_retries("place_order", _submit_order)
-        if response is None:
-            return OrderResult(
+        try:
+            response = await self._execute_with_retries("place_order", _submit_order)
+        except Exception as exc:
+            logger.exception("order_exception", error=str(exc))
+            return _make_order_result(
                 success=False,
-                status=OrderStatus.FAILED,
+                order_id=None,
+                error=f"Exception: {str(exc)}",
+                filled_size=None,
+                avg_price=None,
+                timestamp=time.time(),
+            )
+        if response is None:
+            return _make_order_result(
+                success=False,
+                order_id=None,
                 error="auth_retry_exhausted",
-                error_code=ErrorCode.NOT_AUTHENTICATED.value,
-                correlation_id=correlation_id,
-                idempotency_key=idempotency_key
+                filled_size=None,
+                avg_price=None,
+                timestamp=time.time(),
             )
 
-        order_id = response.get('orderID') or response.get('order_id') or 'unknown'
+        if not isinstance(response, dict):
+            return _make_order_result(
+                success=False,
+                order_id=None,
+                error=f"invalid_api_response:{type(response).__name__}",
+                filled_size=None,
+                avg_price=None,
+                timestamp=time.time(),
+            )
+
+        order_id = response.get("orderID") or response.get("order_id")
+        if not order_id:
+            return _make_order_result(
+                success=False,
+                order_id=None,
+                error=f"invalid_api_response:{response}",
+                filled_size=None,
+                avg_price=None,
+                timestamp=time.time(),
+            )
+
+        filled_size = response.get("filled") or response.get("filled_size")
+        avg_price = response.get("avgPrice") or response.get("avg_price") or price_dec
         logger.info("order_placed_successfully", order_id=order_id)
-        return OrderResult(
+        return _make_order_result(
             success=True,
             order_id=order_id,
-            status=OrderStatus.SUBMITTED,
-            filled_quantity=Decimal("0"),
-            filled_price=Decimal("0"),
-            fees=Decimal("0"),
-            correlation_id=correlation_id,
-            idempotency_key=idempotency_key
+            error=None,
+            filled_size=safe_decimal(filled_size) if filled_size is not None else Decimal("0"),
+            avg_price=safe_decimal(avg_price) if avg_price is not None else price_dec,
+            timestamp=time.time(),
         )
+
+    async def get_wallet_balance(self) -> Optional[Dict[str, Any]]:
+        """Fetch wallet balance from client or fallback sources."""
+        if self.paper_trading:
+            balance = os.getenv("PAPER_TRADING_BALANCE") or os.getenv("INITIAL_CAPITAL") or "0"
+            return {"balance": balance}
+
+        if not self.client:
+            logger.error("wallet_balance_unavailable", reason="client_uninitialized")
+            return None
+
+        if hasattr(self.client, "get_wallet_balance"):
+            try:
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(None, self.client.get_wallet_balance)
+            except Exception as exc:
+                logger.error("wallet_balance_fetch_failed", error=str(exc))
+                return None
+
+        logger.error("wallet_balance_unavailable", reason="unsupported_client")
+        return None
     
     async def get_markets(
         self,
         active: bool = True,
-        limit: int = 100
+        limit: int = 100,
+        **filters: Any
     ) -> List[Dict]:
         """
         Get list of markets.
@@ -987,43 +1086,703 @@ class PolymarketClientV2:
         if not self.client:
             return []
 
+        gamma_markets = await self._fetch_markets_via_gamma(active=active, limit=limit)
+        if gamma_markets:
+            logger.info("markets_fetched_gamma", total=len(gamma_markets), active=active)
+            return gamma_markets[:limit]
+
+        filters_payload = dict(filters) if filters else {}
+        next_cursor = filters_payload.get("next_cursor")
+        if len(filters_payload) > 1 or (filters_payload and next_cursor is None):
+            logger.warning("unsupported_get_markets_filters", filters=list(filters_payload.keys()))
+            next_cursor = None
+
         async def _fetch_markets() -> Any:
             await self._throttle()
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                None,
-                self.client.get_markets
-            )
+            def _call():
+                if next_cursor is not None:
+                    return self.client.get_markets(next_cursor)
+                return self.client.get_markets()
+            return await loop.run_in_executor(None, _call)
 
         response = await self._execute_with_retries("get_markets", _fetch_markets)
-        if response is None:
+        markets_list = self._parse_markets_response(response, operation="get_markets")
+        if not markets_list:
             return []
-
-        logger.debug("get_markets_raw_response_type", type=type(response).__name__)
-
-        if isinstance(response, dict):
-            logger.debug("get_markets_response_is_dict", keys=list(response.keys()))
-            markets_list = response.get('data') or response.get('markets') or []
-        elif isinstance(response, list):
-            markets_list = response
-        else:
-            logger.warning("get_markets_unexpected_type", type=type(response).__name__)
-            return []
-
-        if not isinstance(markets_list, list):
-            logger.warning("get_markets_list_not_list_after_extraction", type=type(markets_list).__name__)
-            return []
-
-        logger.debug("get_markets_parsed", total_count=len(markets_list))
 
         if active:
-            markets_list = [m for m in markets_list if isinstance(m, dict) and not m.get("closed", False)]
+            markets_list = self._filter_live_markets(markets_list)
 
         return markets_list[:limit]
 
+    async def _fetch_markets_via_gamma(self, *, active: bool, limit: int) -> List[Dict]:
+        """Fetch markets from Gamma API with explicit active/closed/archived filters."""
+        try:
+            import httpx
+
+            requested_limit = max(limit, 1)
+            page_limit = min(max(requested_limit, 100), 500)
+            max_pages = 5
+
+            all_markets: List[Dict] = []
+            seen_ids = set()
+
+            for page in range(max_pages):
+                params = {
+                    "limit": str(page_limit),
+                    "offset": str(page * page_limit),
+                    "active": "true" if active else "false",
+                    "closed": "false" if active else "true",
+                    "archived": "false" if active else "true",
+                }
+
+                async def _call_gamma_page() -> Any:
+                    await self._throttle()
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        response = await client.get("https://gamma-api.polymarket.com/markets", params=params)
+                        if response.status_code != 200:
+                            logger.warning(
+                                "gamma_markets_unexpected_status",
+                                status=response.status_code,
+                                params=params,
+                            )
+                            return None
+                        return response.json()
+
+                payload = await self._execute_with_retries("gamma_get_markets", _call_gamma_page)
+                page_markets = self._parse_markets_response(payload, operation="gamma_get_markets")
+                if not page_markets:
+                    break
+
+                for market in page_markets:
+                    if not isinstance(market, dict):
+                        continue
+                    market_id = (
+                        market.get("id")
+                        or market.get("condition_id")
+                        or market.get("conditionId")
+                        or market.get("slug")
+                    )
+                    if market_id in seen_ids:
+                        continue
+                    seen_ids.add(market_id)
+                    all_markets.append(market)
+
+                if len(page_markets) < page_limit:
+                    break
+                if len(all_markets) >= requested_limit:
+                    break
+
+            if not all_markets:
+                return []
+
+            if active:
+                all_markets = self._filter_live_markets(all_markets)
+
+            return all_markets[:requested_limit]
+        except Exception as exc:
+            logger.warning("gamma_market_fetch_failed", error=str(exc))
+            return []
+
+    def _filter_live_markets(self, markets: List[Dict]) -> List[Dict]:
+        filtered: List[Dict] = []
+        rejected = 0
+        for market in markets:
+            if not isinstance(market, dict):
+                rejected += 1
+                continue
+
+            if market.get("closed") is True:
+                rejected += 1
+                continue
+
+            if market.get("archived") is True:
+                rejected += 1
+                continue
+
+            status = str(market.get("status") or "").upper()
+            if status in {"CLOSED", "RESOLVED", "SETTLED", "FINALIZED", "EXPIRED"}:
+                rejected += 1
+                continue
+
+            end_dt = self._extract_market_end_datetime(market)
+            if end_dt is not None and end_dt <= datetime.now(timezone.utc):
+                rejected += 1
+                continue
+
+            filtered.append(market)
+
+        logger.info("live_market_filter_summary", total=len(markets), accepted=len(filtered), rejected=rejected)
+        return filtered
+
+    def _extract_market_end_datetime(self, market: Dict) -> Optional[datetime]:
+        end_fields = [
+            "end_date_iso",
+            "endDateIso",
+            "endDateISO",
+            "endDate",
+            "end_date",
+            "endTime",
+            "end_time",
+            "closeTime",
+            "close_time",
+            "resolve_time",
+            "resolution_time",
+            "resolutionTime",
+            "expires_at",
+            "expiresAt",
+        ]
+
+        raw_value = None
+        for field in end_fields:
+            if field in market and market.get(field) not in (None, ""):
+                raw_value = market.get(field)
+                break
+
+        if raw_value is None:
+            return None
+
+        try:
+            if isinstance(raw_value, datetime):
+                if raw_value.tzinfo is None:
+                    return raw_value.replace(tzinfo=timezone.utc)
+                return raw_value.astimezone(timezone.utc)
+
+            if isinstance(raw_value, str):
+                text = raw_value.strip()
+                if not text:
+                    return None
+                if "T" in text or "Z" in text or "+" in text:
+                    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        return parsed.replace(tzinfo=timezone.utc)
+                    return parsed.astimezone(timezone.utc)
+                numeric = Decimal(text)
+                return datetime.fromtimestamp(float(numeric), tz=timezone.utc)
+
+            if isinstance(raw_value, (int, float, Decimal)):
+                return datetime.fromtimestamp(float(raw_value), tz=timezone.utc)
+        except Exception:
+            return None
+
+        return None
+
+    def _parse_markets_response(self, response: Any, operation: str) -> List[Dict]:
+        if response is None:
+            return []
+
+        logger.debug("markets_raw_response_type", operation=operation, type=type(response).__name__)
+
+        if isinstance(response, dict):
+            logger.debug("markets_response_is_dict", operation=operation, keys=list(response.keys()))
+            markets_list = response.get("data") or response.get("markets") or []
+        elif isinstance(response, list):
+            markets_list = response
+        else:
+            logger.warning("markets_unexpected_type", operation=operation, type=type(response).__name__)
+            return []
+
+        if not isinstance(markets_list, list):
+            logger.warning("markets_list_not_list_after_extraction", operation=operation, type=type(markets_list).__name__)
+            return []
+
+        logger.debug("markets_parsed", operation=operation, total_count=len(markets_list))
+        return markets_list
+
+    async def get_crypto_15min_markets(self) -> List[Dict]:
+        """
+        Fetch 15-minute crypto markets using slug-based discovery.
+
+        15-minute markets follow a predictable naming pattern:
+        {asset}-updown-15m-{unix_timestamp}
+        """
+        try:
+            import httpx
+            from datetime import datetime, timedelta
+
+            markets: List[Dict] = []
+            gamma_base = "https://gamma-api.polymarket.com/events/slug"
+
+            assets = ["btc", "eth", "sol", "xrp"]
+
+            now_utc = datetime.utcnow()
+            et_offset = timedelta(hours=-5)
+            now_et = now_utc + et_offset
+
+            minutes_et = (now_et.minute // 15) * 15
+            current_interval_et = now_et.replace(minute=minutes_et, second=0, microsecond=0)
+            current_interval_utc = current_interval_et - et_offset
+
+            intervals_to_check = [
+                current_interval_utc - timedelta(minutes=30),
+                current_interval_utc - timedelta(minutes=15),
+                current_interval_utc,
+                current_interval_utc + timedelta(minutes=15),
+                current_interval_utc + timedelta(minutes=30),
+                current_interval_utc + timedelta(minutes=45),
+            ]
+
+            logger.debug(
+                "checking_15min_intervals_ET",
+                current_utc=now_utc.isoformat(),
+                current_et=now_et.isoformat(),
+                intervals_et=[
+                    (interval + et_offset).strftime("%H:%M ET")
+                    for interval in intervals_to_check
+                ],
+            )
+
+            diagnostic_logged = False
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                ts_offsets = [0, 3600, 7200, -3600, -7200]
+                seen_slugs = set()
+                for asset in assets:
+                    for interval in intervals_to_check:
+                        for ts_offset in ts_offsets:
+                            unix_ts = int(interval.timestamp()) + ts_offset
+                            slug = f"{asset}-updown-15m-{unix_ts}"
+                            if slug in seen_slugs:
+                                continue
+                            seen_slugs.add(slug)
+
+                            try:
+                                url = f"{gamma_base}/{slug}"
+                                response = await client.get(url)
+
+                                if response.status_code == 200:
+                                    event = response.json()
+
+                                    if not diagnostic_logged and asset == "btc":
+                                        diagnostic_logged = True
+                                        logger.info(
+                                            "DIAGNOSTIC_event_structure",
+                                            slug=slug,
+                                            top_level_keys=list(event.keys()),
+                                            closed=event.get("closed"),
+                                            has_markets_array=("markets" in event),
+                                            markets_count=(len(event.get("markets", [])) if "markets" in event else "N/A"),
+                                            sample_event=str(event)[:500],
+                                        )
+
+                                    if event.get("closed", False):
+                                        logger.debug("event_closed", slug=slug)
+                                        continue
+
+                                    event_markets = event.get("markets", [])
+
+                                    if not event_markets:
+                                        if "conditionId" in event or "condition_id" in event:
+                                            event_markets = [event]
+                                        else:
+                                            logger.debug(
+                                                "no_markets_in_event",
+                                                slug=slug,
+                                                event_keys=list(event.keys())[:10],
+                                            )
+                                            continue
+
+                                    active_markets = [m for m in event_markets if not m.get("closed", False)]
+
+                                    if active_markets:
+                                        normalized_markets: List[Dict] = []
+                                        for market_item in active_markets:
+                                            if not isinstance(market_item, dict):
+                                                continue
+                                            normalized_markets.append(
+                                                {
+                                                    **market_item,
+                                                    "question": market_item.get("question") or event.get("title") or event.get("question"),
+                                                    "title": market_item.get("title") or event.get("title") or event.get("question"),
+                                                    "slug": market_item.get("slug") or event.get("slug") or event.get("ticker"),
+                                                    "startDate": market_item.get("startDate") or event.get("startDate") or event.get("startTime"),
+                                                    "endDate": market_item.get("endDate") or event.get("endDate") or event.get("closedTime"),
+                                                    "end_date_iso": market_item.get("end_date_iso") or event.get("endDate"),
+                                                    "event_id": market_item.get("event_id") or event.get("id"),
+                                                }
+                                            )
+
+                                        markets.extend(normalized_markets)
+                                        logger.info(
+                                            "15min_market_found",
+                                            asset=asset.upper(),
+                                            slug=slug,
+                                            markets_count=len(normalized_markets),
+                                            end_date=event.get("endDate") or event.get("end_date"),
+                                            market_ids=[
+                                                (m.get("conditionId") or m.get("condition_id") or m.get("id") or "unknown")[:8]
+                                                for m in normalized_markets
+                                            ],
+                                        )
+                                    else:
+                                        logger.debug("all_markets_closed", slug=slug)
+                                elif response.status_code == 404:
+                                    logger.debug("market_not_found", slug=slug)
+                                else:
+                                    logger.warning("unexpected_status", slug=slug, status=response.status_code)
+                            except Exception as exc:
+                                logger.error("slug_fetch_failed", slug=slug, error=str(exc))
+                                continue
+
+            logger.info(
+                "crypto_15min_markets_discovered",
+                total_found=len(markets),
+                assets_checked=len(assets),
+                intervals_checked=len(intervals_to_check),
+            )
+
+            return markets
+        except Exception as exc:
+            logger.error(
+                "get_crypto_15min_markets_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return []
+
+    async def _fallback_clob_recent_markets(self) -> List[Dict]:
+        """
+        Fallback: use CLOB API with pagination to reach recent markets.
+        """
+        if not self.client:
+            return []
+
+        try:
+            logger.debug("using_clob_fallback")
+            all_markets: List[Dict] = []
+            next_cursor = "MA=="
+            max_pages = 5
+
+            for page in range(max_pages):
+                async def _fetch_page() -> Any:
+                    await self._throttle()
+                    loop = asyncio.get_running_loop()
+                    return await loop.run_in_executor(
+                        None,
+                        self.client.get_markets,
+                        next_cursor,
+                    )
+
+                response = await self._execute_with_retries("get_markets_fallback", _fetch_page)
+                markets_list = self._parse_markets_response(response, operation="get_markets_fallback")
+                if not markets_list:
+                    break
+
+                if isinstance(response, dict):
+                    next_cursor = response.get("next_cursor") or response.get("nextCursor")
+
+                all_markets.extend(markets_list)
+                logger.debug(
+                    "clob_page_fetched",
+                    page=page + 1,
+                    markets=len(markets_list),
+                    total=len(all_markets),
+                )
+
+                if not next_cursor:
+                    break
+
+            crypto_15min_markets: List[Dict] = []
+            for market in all_markets:
+                if not isinstance(market, dict):
+                    continue
+                if market.get("closed", False):
+                    continue
+
+                question = (market.get("question") or "").lower()
+
+                has_crypto = any(asset in question for asset in [
+                    "bitcoin", "btc",
+                    "ethereum", "eth",
+                    "solana", "sol",
+                    "xrp", "ripple",
+                ])
+
+                is_15min = any(pattern in question for pattern in [
+                    "15 minute",
+                    "15-minute",
+                    "15min",
+                ])
+
+                is_directional = any(term in question for term in [
+                    "up or down",
+                    "rise or fall",
+                    "higher or lower",
+                ])
+
+                if has_crypto and is_15min and is_directional:
+                    crypto_15min_markets.append(market)
+
+            logger.info(
+                "clob_fallback_filtered",
+                total_scanned=len(all_markets),
+                found=len(crypto_15min_markets),
+            )
+
+            return crypto_15min_markets
+        except Exception as exc:
+            logger.error("clob_fallback_failed", error=str(exc))
+            return []
+
     async def get_active_markets(self, limit: int = 100) -> List[Dict]:
         """Compatibility helper for strategy modules."""
-        return await self.get_markets(active=True, limit=limit)
+        primary_markets = await self.get_markets(active=True, limit=max(limit, 200))
+        event_markets = await self._discover_crypto_event_markets(limit=max(limit, 300))
+
+        slug_discovered: List[Dict] = []
+        try:
+            slug_discovered.extend(await self.get_crypto_15min_markets())
+            slug_discovered.extend(await self._discover_updown_markets_by_timeframe("1h"))
+            slug_discovered.extend(await self._discover_updown_markets_by_timeframe("4h"))
+            slug_discovered.extend(await self._discover_updown_markets_by_timeframe("daily"))
+        except Exception as exc:
+            logger.warning("slug_discovery_failed", error=str(exc))
+
+        merged: List[Dict] = []
+        seen_ids = set()
+        for market in [*slug_discovered, *event_markets, *primary_markets]:
+            if not isinstance(market, dict):
+                continue
+            market_id = (
+                market.get("id")
+                or market.get("condition_id")
+                or market.get("conditionId")
+                or market.get("slug")
+            )
+            if market_id in seen_ids:
+                continue
+            seen_ids.add(market_id)
+            merged.append(market)
+
+        if not merged:
+            logger.warning("active_markets_discovery_empty")
+            return []
+
+        filtered = self._filter_live_markets(merged)
+        logger.info(
+            "active_markets_discovery_summary",
+            primary=len(primary_markets),
+            event_discovered=len(event_markets),
+            slug_discovered=len(slug_discovered),
+            merged=len(merged),
+            filtered=len(filtered),
+        )
+        return filtered[:limit]
+
+    async def get_events(
+        self,
+        *,
+        active: bool = True,
+        limit: int = 100,
+        offset: int = 0,
+        tag: Optional[str] = None,
+    ) -> List[Dict]:
+        """Fetch Gamma events with optional tag filter."""
+        try:
+            import httpx
+
+            params = {
+                "limit": str(max(limit, 1)),
+                "offset": str(max(offset, 0)),
+                "active": "true" if active else "false",
+            }
+            if tag:
+                params["tag"] = tag
+
+            async def _call_events() -> Any:
+                await self._throttle()
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.get("https://gamma-api.polymarket.com/events", params=params)
+                    if response.status_code != 200:
+                        logger.warning("gamma_events_unexpected_status", status=response.status_code, params=params)
+                        return None
+                    return response.json()
+
+            payload = await self._execute_with_retries("gamma_get_events", _call_events)
+            if isinstance(payload, list):
+                return [event for event in payload if isinstance(event, dict)]
+            if isinstance(payload, dict):
+                events_list = payload.get("data") or payload.get("events") or []
+                if isinstance(events_list, list):
+                    return [event for event in events_list if isinstance(event, dict)]
+            return []
+        except Exception as exc:
+            logger.warning("gamma_events_fetch_failed", error=str(exc))
+            return []
+
+    async def get_event_by_slug(self, slug: str) -> Optional[Dict]:
+        """Fetch a single Gamma event by slug."""
+        if not slug:
+            return None
+        try:
+            import httpx
+
+            async def _call_event() -> Any:
+                await self._throttle()
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.get(f"https://gamma-api.polymarket.com/events/slug/{slug}")
+                    if response.status_code == 404:
+                        return None
+                    if response.status_code != 200:
+                        logger.warning("gamma_event_unexpected_status", status=response.status_code, slug=slug)
+                        return None
+                    return response.json()
+
+            payload = await self._execute_with_retries("gamma_get_event_by_slug", _call_event)
+            if isinstance(payload, dict):
+                return payload
+            return None
+        except Exception as exc:
+            logger.warning("gamma_event_fetch_failed", slug=slug, error=str(exc))
+            return None
+
+    async def _discover_crypto_event_markets(self, limit: int) -> List[Dict]:
+        """Discover short-horizon crypto event markets from Gamma events inventory."""
+        page_size = min(max(limit, 100), 500)
+        max_pages = 3
+
+        discovered: List[Dict] = []
+        seen_market_ids = set()
+
+        for page in range(max_pages):
+            events = await self.get_events(
+                active=True,
+                tag="crypto",
+                limit=page_size,
+                offset=page * page_size,
+            )
+            if not events:
+                break
+
+            for event in events:
+                event_text = " ".join(
+                    [
+                        str(event.get("title") or ""),
+                        str(event.get("slug") or ""),
+                        str(event.get("ticker") or ""),
+                        str(event.get("description") or ""),
+                    ]
+                ).lower()
+
+                if not any(token in event_text for token in ("btc", "bitcoin", "eth", "ethereum", "sol", "xrp")):
+                    continue
+
+                event_markets = event.get("markets") if isinstance(event.get("markets"), list) else []
+                for market in event_markets:
+                    if not isinstance(market, dict):
+                        continue
+                    normalized = {
+                        **market,
+                        "question": market.get("question") or event.get("title") or event.get("question"),
+                        "title": market.get("title") or event.get("title") or event.get("question"),
+                        "slug": market.get("slug") or event.get("slug") or event.get("ticker"),
+                        "startDate": market.get("startDate") or event.get("startDate") or event.get("startTime"),
+                        "endDate": market.get("endDate") or event.get("endDate") or event.get("closedTime"),
+                        "end_date_iso": market.get("end_date_iso") or event.get("endDate"),
+                        "event_id": event.get("id"),
+                        "event_slug": event.get("slug"),
+                    }
+
+                    market_id = (
+                        normalized.get("id")
+                        or normalized.get("conditionId")
+                        or normalized.get("condition_id")
+                        or normalized.get("slug")
+                    )
+                    if market_id in seen_market_ids:
+                        continue
+                    seen_market_ids.add(market_id)
+                    discovered.append(normalized)
+
+            if len(events) < page_size:
+                break
+
+        logger.info("crypto_event_markets_discovered", count=len(discovered))
+        return discovered[:limit]
+
+    async def _discover_updown_markets_by_timeframe(self, timeframe_slug: str) -> List[Dict]:
+        """Discover crypto up/down markets by known slug patterns for 1h/4h/daily."""
+        try:
+            import httpx
+            from datetime import timedelta
+
+            assets = ["btc", "eth", "sol", "xrp"]
+            gamma_base = "https://gamma-api.polymarket.com/events/slug"
+            now_utc = datetime.now(timezone.utc)
+            discovered: List[Dict] = []
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                ts_offsets = [0, 3600, 7200, -3600, -7200]
+                seen_slugs = set()
+
+                if timeframe_slug in {"1h", "4h"}:
+                    step_seconds = 3600 if timeframe_slug == "1h" else 4 * 3600
+                    offsets = range(-3, 5)
+                    for asset in assets:
+                        for offset in offsets:
+                            base_ts = int((now_utc + timedelta(seconds=offset * step_seconds)).timestamp())
+                            for ts_offset in ts_offsets:
+                                ts = base_ts + ts_offset
+                                slug = f"{asset}-updown-{timeframe_slug}-{ts}"
+                                if slug in seen_slugs:
+                                    continue
+                                seen_slugs.add(slug)
+                                await self._try_append_slug_event(client, gamma_base, slug, discovered)
+                elif timeframe_slug == "daily":
+                    offsets = range(-1, 4)
+                    for asset in assets:
+                        for offset in offsets:
+                            date_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
+                            slug = f"{asset}-updown-{date_str}"
+                            await self._try_append_slug_event(client, gamma_base, slug, discovered)
+
+            logger.info("slug_timeframe_discovered", timeframe=timeframe_slug, count=len(discovered))
+            return discovered
+        except Exception as exc:
+            logger.warning("slug_timeframe_discovery_failed", timeframe=timeframe_slug, error=str(exc))
+            return []
+
+    async def _try_append_slug_event(
+        self,
+        client: Any,
+        gamma_base: str,
+        slug: str,
+        discovered: List[Dict],
+    ) -> None:
+        try:
+            await self._throttle()
+            response = await client.get(f"{gamma_base}/{slug}")
+            if response.status_code != 200:
+                return
+
+            event = response.json()
+            if not isinstance(event, dict):
+                return
+            if event.get("closed", False):
+                return
+
+            event_markets = event.get("markets") if isinstance(event.get("markets"), list) else []
+            if event_markets:
+                for market_item in event_markets:
+                    if not isinstance(market_item, dict) or market_item.get("closed", False):
+                        continue
+                    discovered.append(
+                        {
+                            **market_item,
+                            "question": market_item.get("question") or event.get("title") or event.get("question"),
+                            "title": market_item.get("title") or event.get("title") or event.get("question"),
+                            "slug": market_item.get("slug") or event.get("slug") or event.get("ticker"),
+                            "startDate": market_item.get("startDate") or event.get("startDate") or event.get("startTime"),
+                            "endDate": market_item.get("endDate") or event.get("endDate") or event.get("closedTime"),
+                            "end_date_iso": market_item.get("end_date_iso") or event.get("endDate"),
+                            "event_id": market_item.get("event_id") or event.get("id"),
+                        }
+                    )
+            elif event.get("conditionId") or event.get("condition_id"):
+                discovered.append(event)
+        except Exception:
+            return
 
     async def get_positions(self) -> List[Dict]:
         """Get open positions if available."""
@@ -1069,8 +1828,14 @@ class PolymarketClientV2:
 
         for entry in entries or []:
             try:
-                price_val = entry.get("price") if isinstance(entry, dict) else None
-                size_val = entry.get("size") if isinstance(entry, dict) else None
+                price_val = None
+                size_val = None
+                if isinstance(entry, dict):
+                    price_val = entry.get("price")
+                    size_val = entry.get("size")
+                else:
+                    price_val = getattr(entry, "price", None)
+                    size_val = getattr(entry, "size", None)
                 if price_val is None:
                     continue
                 price_dec = Decimal(str(price_val)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
@@ -1090,6 +1855,58 @@ class PolymarketClientV2:
         if best_price is None:
             best_price = Decimal("0")
         return best_price, total_size
+
+    def _normalize_orderbook(self, orderbook: Any) -> Optional[Dict]:
+        if orderbook is None:
+            return None
+
+        if isinstance(orderbook, dict):
+            bids = orderbook.get("bids") or []
+            asks = orderbook.get("asks") or []
+            return {
+                "bids": bids,
+                "asks": asks,
+                "market": orderbook.get("market"),
+                "asset_id": orderbook.get("asset_id") or orderbook.get("assetId") or orderbook.get("token_id"),
+                "timestamp": orderbook.get("timestamp"),
+                "raw": orderbook,
+            }
+
+        bids_obj = getattr(orderbook, "bids", None)
+        asks_obj = getattr(orderbook, "asks", None)
+        if bids_obj is None and asks_obj is None:
+            return None
+
+        def _normalize_side(side_entries: Any) -> List[Dict]:
+            normalized: List[Dict] = []
+            if not side_entries:
+                return normalized
+            for level in side_entries:
+                if isinstance(level, dict):
+                    price_val = level.get("price")
+                    size_val = level.get("size")
+                else:
+                    price_val = getattr(level, "price", None)
+                    size_val = getattr(level, "size", None)
+
+                if price_val is None:
+                    continue
+                normalized.append(
+                    {
+                        "price": str(price_val),
+                        "size": str(size_val) if size_val is not None else "0",
+                    }
+                )
+            return normalized
+
+        return {
+            "bids": _normalize_side(bids_obj),
+            "asks": _normalize_side(asks_obj),
+            "market": getattr(orderbook, "market", None),
+            "asset_id": getattr(orderbook, "asset_id", None),
+            "timestamp": getattr(orderbook, "timestamp", None),
+            "raw": orderbook,
+        }
 
     async def get_market_orderbook_summary(self, market_id: str) -> Optional[Dict]:
         """Return best bid/ask summary for a market (YES token)."""
@@ -1148,10 +1965,31 @@ class PolymarketClientV2:
                 token_id
             )
 
-        orderbook = await self._execute_with_retries("get_orderbook", _fetch_orderbook)
-        if orderbook is None:
+        orderbook_raw = await self._execute_with_retries("get_orderbook", _fetch_orderbook)
+        if orderbook_raw is None:
             logger.warning("orderbook_fetch_failed", token_id=token_id)
-        return orderbook
+
+        normalized = self._normalize_orderbook(orderbook_raw)
+        if not normalized:
+            logger.warning(
+                "orderbook_unparseable",
+                token_id=token_id,
+                orderbook_type=type(orderbook_raw).__name__,
+            )
+            return None
+
+        logger.info(
+            "orderbook_normalized",
+            token_id=token_id,
+            orderbook_type=type(orderbook_raw).__name__,
+            bids_count=len(normalized.get("bids") or []),
+            asks_count=len(normalized.get("asks") or []),
+        )
+        return normalized
+
+    async def get_market_orderbook(self, token_id: str) -> Optional[Dict]:
+        """Compatibility alias: always fetches live orderbook data from CLOB."""
+        return await self.get_orderbook(token_id)
     
     async def cancel_order(self, order_id: str) -> bool:
         """

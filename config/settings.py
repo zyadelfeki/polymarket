@@ -20,8 +20,27 @@ class Settings:
     INITIAL_CAPITAL: Decimal = Decimal(os.getenv("INITIAL_CAPITAL", "15.00"))
     MAX_POSITION_SIZE_PCT: float = float(os.getenv("MAX_POSITION_SIZE_PCT", "20"))
     MAX_DRAWDOWN_PCT: float = float(os.getenv("MAX_DRAWDOWN_PCT", "15"))
-    MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.15"))
+    MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.03"))
     MIN_CONFIDENCE: float = float(os.getenv("MIN_CONFIDENCE", "0.70"))
+    MIN_VOLATILITY_PCT: float = float(os.getenv("MIN_VOLATILITY_PCT", "0.5"))
+
+    LATENCY_ARB_ENFORCE_ORDERBOOK_VALIDATION: bool = (
+        os.getenv("LATENCY_ARB_ENFORCE_ORDERBOOK_VALIDATION", "true").lower() == "true"
+    )
+    LATENCY_ARB_PEAK_HOURS_ONLY: bool = (
+        os.getenv("LATENCY_ARB_PEAK_HOURS_ONLY", "true").lower() == "true"
+    )
+    LATENCY_ARB_USE_DYNAMIC_EDGE_THRESHOLDS: bool = (
+        os.getenv("LATENCY_ARB_USE_DYNAMIC_EDGE_THRESHOLDS", "true").lower() == "true"
+    )
+    LATENCY_ARB_MIN_ORDERBOOK_SIZE: Decimal = Decimal(
+        os.getenv("LATENCY_ARB_MIN_ORDERBOOK_SIZE", "10")
+    )
+
+    LATENCY_ARB_EDGE_15MIN: float = float(os.getenv("LATENCY_ARB_EDGE_15MIN", "0.03"))
+    LATENCY_ARB_EDGE_HOURLY: float = float(os.getenv("LATENCY_ARB_EDGE_HOURLY", "0.025"))
+    LATENCY_ARB_EDGE_4HOUR: float = float(os.getenv("LATENCY_ARB_EDGE_4HOUR", "0.02"))
+    LATENCY_ARB_EDGE_DAILY: float = float(os.getenv("LATENCY_ARB_EDGE_DAILY", "0.015"))
     
     MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
     MIN_BET_SIZE: Decimal = Decimal("0.10")
@@ -29,7 +48,7 @@ class Settings:
     
     CIRCUIT_BREAKER_ENABLED: bool = os.getenv("CIRCUIT_BREAKER_ENABLED", "true").lower() == "true"
     MAX_CONSECUTIVE_LOSSES: int = 3
-    DAILY_LOSS_LIMIT_PCT: float = 10.0
+    DAILY_LOSS_LIMIT_PCT: float = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "15"))
     MAX_DAILY_TRADES: int = int(os.getenv("MAX_DAILY_TRADES", "50"))
     
     PAPER_TRADING: bool = os.getenv("PAPER_TRADING", "true").lower() == "true"
@@ -89,6 +108,30 @@ class Settings:
         logger.info(f"Max Position: {cls.MAX_POSITION_SIZE_PCT}%")
         logger.info(f"Max Drawdown: {cls.MAX_DRAWDOWN_PCT}%")
         logger.info(f"Strategy Weights: VOL={cls.VOLATILITY_STRATEGY_WEIGHT} WHALE={cls.WHALE_COPY_WEIGHT} NEWS={cls.NEWS_ARBITRAGE_WEIGHT} BOND={cls.BOND_STRATEGY_WEIGHT}")
+        logger.info(
+            "LatencyArb Config: "
+            f"strict_ob={cls.LATENCY_ARB_ENFORCE_ORDERBOOK_VALIDATION} "
+            f"peak_hours={cls.LATENCY_ARB_PEAK_HOURS_ONLY} "
+            f"dynamic_edge={cls.LATENCY_ARB_USE_DYNAMIC_EDGE_THRESHOLDS}"
+        )
         logger.info("="*60)
+
+    @classmethod
+    def get_latency_arb_config(cls) -> dict:
+        """Normalized config payload for `LatencyArbitrageEngine`."""
+        return {
+            "min_edge": str(cls.MIN_EDGE_THRESHOLD),
+            "min_volatility_pct": str(cls.MIN_VOLATILITY_PCT),
+            "enforce_orderbook_validation": cls.LATENCY_ARB_ENFORCE_ORDERBOOK_VALIDATION,
+            "peak_hours_only": cls.LATENCY_ARB_PEAK_HOURS_ONLY,
+            "use_dynamic_edge_thresholds": cls.LATENCY_ARB_USE_DYNAMIC_EDGE_THRESHOLDS,
+            "min_orderbook_size": str(cls.LATENCY_ARB_MIN_ORDERBOOK_SIZE),
+            "edge_thresholds": {
+                "15min": str(cls.LATENCY_ARB_EDGE_15MIN),
+                "hourly": str(cls.LATENCY_ARB_EDGE_HOURLY),
+                "4hour": str(cls.LATENCY_ARB_EDGE_4HOUR),
+                "daily": str(cls.LATENCY_ARB_EDGE_DAILY),
+            },
+        }
 
 settings = Settings()

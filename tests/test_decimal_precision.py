@@ -78,6 +78,24 @@ def test_precision_stability_over_many_trades():
     assert abs(equity - Decimal("10.00")) <= Decimal("0.01")
 
 
+def test_no_precision_loss():
+    balance = Decimal("100.00")
+    for _ in range(1000):
+        bet = (balance * Decimal("0.01")).quantize(Decimal("0.01"))
+        balance -= bet
+        balance += bet
+    assert balance == Decimal("100.00")
+
+
+def test_no_precision_loss_over_1000_trades():
+    balance = Decimal("100.00")
+    for _ in range(1000):
+        bet = (balance * Decimal("0.01")).quantize(Decimal("0.01"))
+        balance -= bet
+        balance += bet
+    assert balance == Decimal("100.00"), f"Leaked {Decimal('100.00') - balance}"
+
+
 def test_decimal_json_round_trip_stable():
     payload = {"value": Decimal("0.01")}
     for _ in range(5):

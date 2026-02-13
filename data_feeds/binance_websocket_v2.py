@@ -107,7 +107,10 @@ class BinanceWebSocketV2:
         on_connection_change: Optional[Callable] = None,
         heartbeat_interval: float = 30.0,
         max_reconnect_delay: float = 60.0,
-        message_queue_size: int = 1000
+        message_queue_size: int = 1000,
+        connect_retries: int = 3,
+        connect_retry_delay: float = 2.0,
+        startup_health_grace_seconds: float = 90.0,
     ):
         """
         Initialize WebSocket feed.
@@ -128,6 +131,9 @@ class BinanceWebSocketV2:
         self.ws_url = "wss://stream.binance.com:9443/ws"
         self.heartbeat_interval = heartbeat_interval
         self.max_reconnect_delay = max_reconnect_delay
+        self.connect_retries = max(1, int(connect_retries))
+        self.connect_retry_delay = max(0.0, float(connect_retry_delay))
+        self.startup_health_grace_seconds = max(0.0, float(startup_health_grace_seconds))
         
         # Connection state
         self.state = ConnectionState.DISCONNECTED
@@ -165,7 +171,9 @@ class BinanceWebSocketV2:
         logger.info(
             "binance_websocket_initialized",
             symbols=symbols,
-            heartbeat_interval=heartbeat_interval
+            heartbeat_interval=heartbeat_interval,
+            connect_retries=self.connect_retries,
+            startup_health_grace_seconds=self.startup_health_grace_seconds,
         )
     
     async def start(self) -> bool:
@@ -182,8 +190,21 @@ class BinanceWebSocketV2:
             )
             return False
         
-        # Connect
-        connected = await self._connect()
+        connected = False
+        for attempt in range(1, self.connect_retries + 1):
+            connected = await self._connect()
+            if connected:
+                break
+
+            logger.warning(
+                "websocket_start_connect_attempt_failed",
+                attempt=attempt,
+                max_attempts=self.connect_retries,
+                retry_delay_seconds=self.connect_retry_delay,
+            )
+            if attempt < self.connect_retries:
+                await asyncio.sleep(self.connect_retry_delay)
+
         if not connected:
             return False
         
@@ -620,6 +641,11 @@ class BinanceWebSocketV2:
         # Check connection state
         if self.state != ConnectionState.CONNECTED:
             return False
+
+        if self.last_connect_time is not None:
+            connected_for = time.time() - self.last_connect_time
+            if connected_for < self.startup_health_grace_seconds:
+                return True
         
         # Check if receiving messages
         if self.last_message_time:

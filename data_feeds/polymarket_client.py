@@ -21,8 +21,179 @@ from config.markets import CRYPTO_SYMBOLS, PRICE_KEYWORDS
 
 logger = logging.getLogger(__name__)
 
+
+class MockPolymarketClient:
+    """
+    Mock Polymarket client for integration testing without blockchain access.
+
+    Provides:
+    - Fake BTC price threshold markets
+    - Deterministic orderbooks for mid-price calculations
+    - Simulated order placement/fills
+    - Charlie signal seeding + usage logging
+    """
+
+    def __init__(self):
+        self._markets = self._build_mock_markets()
+        self._orderbooks = self._build_orderbooks(self._markets)
+        self._orders: Dict[str, Dict[str, float]] = {}
+        self._logged_charlie_signal = False
+
+    async def get_markets(self, active: bool = True, limit: int = 100) -> List[Dict]:
+        await self._log_charlie_signal_usage()
+        markets = [m for m in self._markets if isinstance(m, dict)]
+        if active:
+            markets = [m for m in markets if not m.get("closed", False) and m.get("active", True)]
+        return markets[:limit]
+
+    async def get_market(self, market_id: str) -> Optional[Dict]:
+        await self._log_charlie_signal_usage()
+        for market in self._markets:
+            if market.get("condition_id") == market_id or market.get("id") == market_id:
+                return market
+        return None
+
+    async def get_market_orderbook(self, token_id: str) -> Dict:
+        await self._log_charlie_signal_usage()
+        return self._orderbooks.get(token_id, {"bids": [], "asks": []})
+
+    async def get_open_positions(self) -> List[Dict[str, Any]]:
+        return []
+
+    async def place_order(
+        self,
+        token_id: str,
+        side: str,
+        amount: float,
+        price: float,
+        order_type: str = "GTC"
+    ) -> Optional[Dict]:
+        order_id = f"mock_{int(datetime.utcnow().timestamp() * 1000)}"
+        self._orders[order_id] = {"price": price, "amount": amount}
+        logger.info(
+            f"[MOCK] Order accepted: {side} {amount:.2f} @ {price:.3f} ({order_type})"
+        )
+        return {"success": True, "order_id": order_id, "mock": True}
+
+    async def cancel_order(self, order_id: str) -> bool:
+        return self._orders.pop(order_id, None) is not None
+
+    async def get_order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
+        order = self._orders.get(order_id)
+        if not order:
+            return {"status": "CANCELLED"}
+        return {
+            "status": "MATCHED",
+            "filled_price": order.get("price"),
+            "filled_quantity": order.get("amount"),
+            "fees": 0,
+        }
+
+    async def get_market_prices_parallel(self, markets: List[Dict]) -> Dict[str, Dict]:
+        price_map = {}
+        for market in markets:
+            condition_id = market.get("condition_id", market.get("id"))
+            tokens = market.get("tokens", [])
+            if len(tokens) >= 2:
+                yes_token = tokens[0].get("token_id")
+                no_token = tokens[1].get("token_id")
+                price_map[condition_id] = {
+                    "condition_id": condition_id,
+                    "market_title": market.get("question", ""),
+                    "yes_price": 0.60,
+                    "no_price": 0.40,
+                    "yes_token": yes_token,
+                    "no_token": no_token,
+                    "total_liquidity": 1000,
+                    "yes_liquidity": 600,
+                    "no_liquidity": 400,
+                    "end_date": market.get("end_date_iso"),
+                    "market_data": market,
+                }
+        return price_map
+
+    def _build_mock_markets(self) -> List[Dict[str, Any]]:
+        now = datetime.utcnow().date().isoformat()
+        return [
+            {
+                "condition_id": "mock_btc_above_95000",
+                "question": f"Will Bitcoin close above $95,000 on {now}?",
+                "description": "Mock BTC price threshold market",
+                "active": True,
+                "closed": False,
+                "end_date_iso": f"{now}T23:59:59Z",
+                "tokens": [
+                    {"token_id": "mock_btc_95000_yes"},
+                    {"token_id": "mock_btc_95000_no"},
+                ],
+            },
+            {
+                "condition_id": "mock_btc_below_90000",
+                "question": f"Will BTC fall below $90,000 on {now}?",
+                "description": "Mock BTC downside market",
+                "active": True,
+                "closed": False,
+                "end_date_iso": f"{now}T23:59:59Z",
+                "tokens": [
+                    {"token_id": "mock_btc_90000_yes"},
+                    {"token_id": "mock_btc_90000_no"},
+                ],
+            },
+        ]
+
+    def _build_orderbooks(self, markets: List[Dict[str, Any]]) -> Dict[str, Dict[str, List[Dict[str, float]]]]:
+        orderbooks: Dict[str, Dict[str, List[Dict[str, float]]]] = {}
+        for market in markets:
+            tokens = market.get("tokens", [])
+            if len(tokens) < 2:
+                continue
+            yes_token = tokens[0].get("token_id")
+            no_token = tokens[1].get("token_id")
+            if yes_token:
+                orderbooks[yes_token] = {
+                    "bids": [{"price": 0.58, "size": 200}],
+                    "asks": [{"price": 0.62, "size": 200}],
+                }
+            if no_token:
+                orderbooks[no_token] = {
+                    "bids": [{"price": 0.38, "size": 200}],
+                    "asks": [{"price": 0.42, "size": 200}],
+                }
+        return orderbooks
+
+    async def _log_charlie_signal_usage(self) -> None:
+        if self._logged_charlie_signal:
+            return
+        try:
+            from integrations.charlie_intelligence import CharlieIntelligence
+
+            signal = await CharlieIntelligence().get_signal()
+            if signal:
+                logger.info("🧠 Mock Polymarket client using Charlie intelligence signal")
+                self._logged_charlie_signal = True
+        except Exception as exc:
+            logger.warning(f"Mock Charlie signal check failed: {exc}")
+
 class PolymarketClient:
     def __init__(self):
+        self.mock_mode = os.getenv("POLYMARKET_MOCK", "false").lower() == "true"
+        if self.mock_mode:
+            self._mock_client = MockPolymarketClient()
+            self.client = None
+            self.address = None
+            self.can_trade = True
+            self.market_cache = {}
+            self.last_market_refresh = None
+            self._paper_orders: Dict[str, Dict[str, float]] = {}
+            self.auth_retry_count = 0
+            self.max_auth_retries = 0
+            self.api_key_rotation_enabled = False
+            self.backup_api_keys = []
+            self._active_backup_key_index = 0
+            self.emergency_shutdown_reason = None
+            logger.warning("POLYMARKET_MOCK enabled - using mock client")
+            return
+
         self.host = "https://clob.polymarket.com"
         self.gamma_url = "https://gamma-api.polymarket.com"
         self.chain_id = 137
@@ -151,6 +322,11 @@ class PolymarketClient:
         logger.critical(f"Emergency shutdown: {reason}")
     
     async def get_markets(self, active: bool = True, limit: int = 100) -> List[Dict]:
+        if getattr(self, "mock_mode", False):
+            return await self._mock_client.get_markets(active=active, limit=limit)
+        if not self.client:
+            logger.error("Polymarket client unavailable: returning empty markets")
+            return []
         try:
             markets = self.client.get_markets()
 
@@ -178,6 +354,8 @@ class PolymarketClient:
 
     async def get_market(self, market_id: str) -> Optional[Dict]:
         """Fetch a single market by condition_id, with Gamma fallback."""
+        if getattr(self, "mock_mode", False):
+            return await self._mock_client.get_market(market_id)
         try:
             if hasattr(self.client, "get_market"):
                 market = await asyncio.to_thread(self.client.get_market, market_id)
@@ -216,6 +394,8 @@ class PolymarketClient:
             return None
     
     async def scan_crypto_markets_parallel(self, symbols: List[str] = None) -> List[Dict]:
+        if getattr(self, "mock_mode", False):
+            return await self._mock_client.get_markets(active=True, limit=100)
         if symbols is None:
             symbols = list(CRYPTO_SYMBOLS.keys())
         
@@ -237,6 +417,11 @@ class PolymarketClient:
         return crypto_markets
     
     async def get_market_orderbook(self, token_id: str) -> Dict:
+        if getattr(self, "mock_mode", False):
+            return await self._mock_client.get_market_orderbook(token_id)
+        if not self.client:
+            logger.error(f"Orderbook unavailable for {token_id}: client not initialized")
+            return {"bids": [], "asks": []}
         try:
             orderbook = self.client.get_order_book(token_id)
             return orderbook
@@ -246,6 +431,8 @@ class PolymarketClient:
 
     async def get_open_positions(self) -> List[Dict[str, Any]]:
         """Get open positions from the exchange if supported."""
+        if getattr(self, "mock_mode", False):
+            return await self._mock_client.get_open_positions()
         if settings.PAPER_TRADING:
             return []
         if not self.can_trade:
@@ -270,6 +457,8 @@ class PolymarketClient:
             return []
     
     async def get_market_prices_parallel(self, markets: List[Dict]) -> Dict[str, Dict]:
+        if getattr(self, "mock_mode", False):
+            return await self._mock_client.get_market_prices_parallel(markets)
         tasks = []
         for market in markets:
             condition_id = market.get("condition_id", market.get("id"))
@@ -331,7 +520,22 @@ class PolymarketClient:
                 total += float(order.get("size", 0)) * float(order.get("price", 0))
         return total
     
-    async def place_order(self, token_id: str, side: str, amount: float, price: float) -> Optional[Dict]:
+    async def place_order(
+        self,
+        token_id: str,
+        side: str,
+        amount: float,
+        price: float,
+        order_type: str = "GTC"
+    ) -> Optional[Dict]:
+        if getattr(self, "mock_mode", False):
+            return await self._mock_client.place_order(
+                token_id=token_id,
+                side=side,
+                amount=amount,
+                price=price,
+                order_type=order_type,
+            )
         if settings.PAPER_TRADING:
             logger.info(f"[PAPER] Order: {side} {amount:.2f} shares @ ${price:.3f}")
             import time
@@ -374,6 +578,8 @@ class PolymarketClient:
 
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel an order by ID."""
+        if getattr(self, "mock_mode", False):
+            return await self._mock_client.cancel_order(order_id)
         if settings.PAPER_TRADING:
             self._paper_orders.pop(order_id, None)
             return True
@@ -399,6 +605,8 @@ class PolymarketClient:
 
     async def get_order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
         """Get order status for an order ID."""
+        if getattr(self, "mock_mode", False):
+            return await self._mock_client.get_order_status(order_id)
         if settings.PAPER_TRADING:
             order = self._paper_orders.get(order_id)
             if not order:

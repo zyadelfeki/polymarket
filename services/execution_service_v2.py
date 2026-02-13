@@ -47,12 +47,14 @@ from services.error_codes import (
     RETRYABLE_CODES,
 )
 from services.idempotency import IdempotencyCache, IdempotencyKeyBuilder
+from execution.idempotency_manager import IdempotencyManager
 from services.validators import BoundaryValidator
 from services.correlation_context import CorrelationContext, inject_correlation
 from logs.precision_monitor import PrecisionMonitor, PrecisionError
 from services.retry import RetryableOperation
 from utils.correlation_id import generate_correlation_id
 from services.network_health import NetworkHealthMonitor, NetworkPartitionError
+from utils.decimal_helpers import to_decimal, to_timeout_float
 
 if _structlog_available:
     logger = structlog.get_logger(__name__)
@@ -286,15 +288,19 @@ class ExecutionServiceV2:
         polymarket_client: PolymarketClientV2,
         ledger: AsyncLedger,
         config: Optional[Dict] = None,
-        idempotency_cache: Optional[IdempotencyCache] = None
+        idempotency_cache: Optional[IdempotencyCache] = None,
+        idempotency_manager: Optional[IdempotencyManager] = None,
+        risk_aggregator: Optional[Any] = None,
     ):
         self.client = polymarket_client
         self.ledger = ledger
+
+        self.circuit_breaker_active = False
         
         self.config = config or {}
         self.max_retries = self.config.get('max_retries', 3)
-        self.timeout_seconds = self.config.get('timeout_seconds', 30)
-        self.fill_check_interval = self.config.get('fill_check_interval', 2.0)
+        self.timeout_seconds = to_decimal(self.config.get('timeout_seconds', '30'))
+        self.fill_check_interval = to_decimal(self.config.get('fill_check_interval', '2.0'))
         self.max_order_age_seconds = self.config.get('max_order_age_seconds', 300)
         
         self.orders: Dict[str, OrderState] = {}
@@ -310,6 +316,8 @@ class ExecutionServiceV2:
         self.execution_times_ms: List[float] = []
 
         self._idempotency_cache = idempotency_cache or IdempotencyCache()
+        self._idempotency_manager = idempotency_manager
+        self._risk_aggregator = risk_aggregator
         self.precision_monitor = PrecisionMonitor()
 
         partition_threshold = int(self.config.get("partition_threshold_seconds", 15))
@@ -323,6 +331,131 @@ class ExecutionServiceV2:
             max_retries=self.max_retries,
             timeout_seconds=self.timeout_seconds,
             paper_trading=getattr(self.client, "paper_trading", False)
+        )
+
+    async def get_real_balance(self) -> Decimal:
+        """Fetch actual wallet balance from Polymarket API."""
+        try:
+            balance_response = await self.client.get_wallet_balance()
+            if not balance_response or "balance" not in balance_response:
+                raise ValueError("Invalid balance response from API")
+
+            balance = Decimal(str(balance_response["balance"]))
+
+            if balance <= Decimal("0"):
+                logger.critical("zero_balance_detected_halting_trading")
+                self.circuit_breaker_active = True
+                raise ValueError("Cannot trade with zero balance")
+
+            logger.info("real_balance_fetched", balance=str(balance))
+            return balance
+        except Exception as exc:
+            logger.critical("failed_to_fetch_balance", error=str(exc))
+            self.circuit_breaker_active = True
+            raise
+
+    async def place_order_with_idempotency(
+        self,
+        strategy: str,
+        market_id: str,
+        token_id: str,
+        side: str,
+        quantity: Decimal,
+        price: Decimal,
+        order_type: str = "GTC",
+        metadata: Optional[Dict] = None,
+        correlation_id: Optional[str] = None,
+    ) -> OrderResult:
+        """Place order with file-backed idempotency protection."""
+        if not self._idempotency_manager:
+            return await self.place_order(
+                strategy=strategy,
+                market_id=market_id,
+                token_id=token_id,
+                side=side,
+                quantity=quantity,
+                price=price,
+                order_type=order_type,
+                metadata=metadata,
+                correlation_id=correlation_id,
+            )
+
+        idem_key = self._idempotency_manager.generate_key(
+            market_id=market_id,
+            side=side,
+            size=quantity,
+            price=price,
+            strategy=strategy,
+        )
+
+        cached = self._idempotency_manager.check_duplicate(idem_key)
+        if cached is not None:
+            if isinstance(cached, OrderResult):
+                return cached
+            if isinstance(cached, dict):
+                return OrderResult(**cached)
+            return OrderResult(
+                success=False,
+                status=OrderStatus.REJECTED,
+                error="invalid_idempotency_cache",
+                error_code=ErrorCode.INVALID_STATE.value,
+                correlation_id=correlation_id,
+                idempotency_key=idem_key,
+                is_duplicate=True,
+            )
+
+        result = await self.place_order(
+            strategy=strategy,
+            market_id=market_id,
+            token_id=token_id,
+            side=side,
+            quantity=quantity,
+            price=price,
+            order_type=order_type,
+            metadata=metadata,
+            correlation_id=correlation_id,
+            idempotency_key=idem_key,
+        )
+
+        if result.success:
+            self._idempotency_manager.record_order(idem_key, dict(result))
+
+        return result
+
+    async def place_order_with_risk_check(
+        self,
+        trade_delta: Decimal,
+        strategy: str,
+        market_id: str,
+        token_id: str,
+        side: str,
+        quantity: Decimal,
+        price: Decimal,
+        order_type: str = "GTC",
+        metadata: Optional[Dict] = None,
+        correlation_id: Optional[str] = None,
+    ) -> OrderResult:
+        """Place order only if within unified risk limits."""
+        if self._risk_aggregator and not self._risk_aggregator.can_place_trade(trade_delta):
+            return OrderResult(
+                success=False,
+                status=OrderStatus.REJECTED,
+                error="risk_limit_exceeded",
+                error_code=ErrorCode.INSUFFICIENT_CAPITAL.value,
+                correlation_id=correlation_id,
+                is_duplicate=False,
+            )
+
+        return await self.place_order_with_idempotency(
+            strategy=strategy,
+            market_id=market_id,
+            token_id=token_id,
+            side=side,
+            quantity=quantity,
+            price=price,
+            order_type=order_type,
+            metadata=metadata,
+            correlation_id=correlation_id,
         )
 
     async def start(self):
@@ -732,7 +865,7 @@ class ExecutionServiceV2:
             else:
                 fill_success = await self._wait_for_fills(
                     order_state,
-                    timeout=self.timeout_seconds,
+                    timeout=to_timeout_float(self.timeout_seconds),
                     target_price=price,
                     max_slippage_bps=max_slippage_bps,
                     correlation_id=correlation_id,
@@ -934,7 +1067,7 @@ class ExecutionServiceV2:
                 if order_state.status == OrderStatus.FILLED:
                     return True
             
-            await asyncio.sleep(self.fill_check_interval)
+            await asyncio.sleep(to_timeout_float(self.fill_check_interval))
         
         if order_state.status not in [OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED]:
             previous_status = order_state.status
@@ -1069,7 +1202,7 @@ class ExecutionServiceV2:
         
         while True:
             try:
-                await asyncio.sleep(self.fill_check_interval)
+                await asyncio.sleep(to_timeout_float(self.fill_check_interval))
                 
                 async with self.order_lock:
                     pending_orders = [
@@ -1083,7 +1216,7 @@ class ExecutionServiceV2:
                 for order in pending_orders:
                     await self._wait_for_fills(
                         order,
-                        timeout=0.1,
+                        timeout=to_timeout_float(Decimal("0.1")),
                         target_price=order.request.price,
                         max_slippage_bps=50,
                         correlation_id=order.request.metadata.get("correlation_id") if order.request.metadata else None,
@@ -1101,7 +1234,7 @@ class ExecutionServiceV2:
         
         while True:
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(to_timeout_float(60))
                 
                 async with self.order_lock:
                     to_remove = []

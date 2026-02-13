@@ -1,5 +1,5 @@
 import asyncio
-from decimal import Decimal
+from decimal import Decimal, getcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional, Dict
@@ -7,6 +7,8 @@ import logging
 import uuid
 
 logger = logging.getLogger(__name__)
+
+getcontext().prec = 18
 
 
 @dataclass
@@ -53,7 +55,8 @@ class ArbitrageEngine:
         # State
         self.executed_opportunities: Dict[str, ArbOpportunity] = {}
         self.active_positions: Dict[str, Dict] = {}
-        self.equity = Decimal("13.98")
+        initial_equity = self.config.get("initial_equity")
+        self.equity = Decimal(str(initial_equity)) if initial_equity is not None else Decimal("0")
         self.stats = {
             "opportunities_found": 0,
             "opportunities_executed": 0,

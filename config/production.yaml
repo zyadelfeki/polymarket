@@ -164,6 +164,20 @@ strategies:
     min_price_movement: 0.02  # 2%
     max_latency_ms: 100
     confidence_threshold: 0.7
+    timeframe_priority:
+      - hourly
+      - daily
+      - 4hour
+      - 15min
+    enforce_orderbook_validation: true
+    min_orderbook_size: 10.0
+    peak_hours_only: true
+    use_dynamic_edge_thresholds: true
+    edge_thresholds:
+      15min: 0.03
+      hourly: 0.025
+      4hour: 0.02
+      daily: 0.015
   
   # Mean Reversion
   mean_reversion:

@@ -25,7 +25,7 @@ import asyncio
 import logging
 import io
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, getcontext
 from typing import List, Dict, Optional
 import signal
 import sys
@@ -42,10 +42,12 @@ from services.health_monitor import HealthMonitor
 from data_feeds.binance_websocket import BinanceWebSocketFeed, BinanceWebSocketV2
 from data_feeds.polymarket_client import PolymarketClient
 from strategy.latency_arbitrage_engine import LatencyArbitrageEngine
+from strategies.latency_arbitrage_btc import LatencyArbitrageEngine as MultiTimeframeLatencyArbitrageEngine
 from risk.kelly_sizer import AdaptiveKellySizer
 from risk.circuit_breaker import CircuitBreaker
 from services.network_health import NetworkHealthMonitor
 from services.strategy_health import StrategyHealthMonitor
+from utils.decimal_helpers import to_decimal, quantize_price, quantize_quantity
 
 _stream = sys.stdout
 if hasattr(sys.stdout, "buffer"):
@@ -60,6 +62,8 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+getcontext().prec = 18
 
 class MarketDataService:
     """
@@ -190,7 +194,7 @@ class ProductionTradingBot:
     def __init__(self):
         # Core services
         self.ledger = Ledger(db_path="data/trading.db")
-        self.polymarket_client = PolymarketClient()
+        self.polymarket_client = self._initialize_polymarket_client()
         self.binance_ws = BinanceWebSocketV2()
         self.binance_ws.on_price_update = self._on_binance_price_update
         
@@ -212,19 +216,29 @@ class ProductionTradingBot:
         
         # Strategies
         self.latency_arb = LatencyArbitrageEngine(config={
-            'min_edge': 0.05,
+            'min_edge': to_decimal("0.05"),
             'max_hold_seconds': 30,
-            'target_profit': 0.40,
-            'stop_loss': 0.05
+            'target_profit': to_decimal("0.40"),
+            'stop_loss': to_decimal("0.05")
         })
         
         # Risk management
         self.kelly_sizer = AdaptiveKellySizer(config={
-            'kelly_fraction': 0.25,  # 1/4 Kelly
-            'max_bet_pct': 5.0,      # Max 5% per trade
-            'min_edge': 0.02,        # 2% minimum edge
-            'max_aggregate_exposure': 20.0  # Max 20% total
+            'kelly_fraction': to_decimal("0.25"),  # 1/4 Kelly
+            'max_bet_pct': to_decimal("5.0"),      # Max 5% per trade
+            'min_edge': to_decimal("0.02"),        # 2% minimum edge
+            'max_aggregate_exposure': to_decimal("20.0")  # Max 20% total
         })
+
+        self.multi_tf_latency_arb = MultiTimeframeLatencyArbitrageEngine(
+            binance_ws=self.binance_ws,
+            polymarket_client=self.polymarket_client,
+            charlie_predictor=None,
+            config=settings.get_latency_arb_config(),
+            execution_service=self.execution,
+            kelly_sizer=self.kelly_sizer,
+            redis_subscriber=None,
+        )
         
         self.circuit_breaker = CircuitBreaker(
             initial_capital=Decimal(str(settings.INITIAL_CAPITAL))
@@ -244,6 +258,18 @@ class ProductionTradingBot:
         self.opportunities_found = 0
         self.trades_executed = 0
         self.last_binance_update: Optional[datetime] = None
+
+    def _initialize_polymarket_client(self) -> PolymarketClient:
+        client = PolymarketClient()
+        if client is None:
+            raise RuntimeError("Polymarket client failed to initialize")
+
+        required_methods = ["get_markets", "get_market", "get_market_orderbook"]
+        for method in required_methods:
+            if not hasattr(client, method):
+                raise RuntimeError(f"Polymarket client missing required method: {method}")
+
+        return client
     
     async def start(self):
         """Start the bot"""
@@ -348,6 +374,34 @@ class ProductionTradingBot:
                     logger.warning("[Latency Arb] Circuit breaker engaged")
                     await asyncio.sleep(60)
                     continue
+
+                # Run multi-timeframe BTC latency scan first (hourly/daily priority)
+                try:
+                    multi_tf_opportunity = await self.multi_tf_latency_arb.scan_opportunities()
+                    if multi_tf_opportunity:
+                        self.opportunities_found += 1
+                        market_id = multi_tf_opportunity.get("market_id")
+                        direction = multi_tf_opportunity.get("direction")
+                        timeframe = multi_tf_opportunity.get("timeframe")
+                        logger.info(
+                            f"[Latency Arb][MultiTF] Opportunity found: market={market_id} "
+                            f"timeframe={timeframe} direction={direction} edge={multi_tf_opportunity.get('edge')}"
+                        )
+
+                        market_data = await self.polymarket_client.get_market(market_id)
+                        if market_data:
+                            signal = "BULLISH" if direction == "UP" else "BEARISH"
+                            confidence = to_decimal(multi_tf_opportunity.get("charlie_confidence") or "0.6")
+                            exec_result = await self.multi_tf_latency_arb.execute_signal(
+                                market=market_data,
+                                signal=signal,
+                                confidence=confidence,
+                            )
+                            if exec_result:
+                                self.trades_executed += 1
+                                logger.info("[Latency Arb][MultiTF] Trade executed")
+                except Exception as e:
+                    logger.error(f"[Latency Arb][MultiTF] Error: {e}", exc_info=True)
                 
                 # Get markets
                 markets = await self.market_data.get_markets()
@@ -394,13 +448,13 @@ class ProductionTradingBot:
                     if opp.action == 'BUY_YES':
                         token_id = opp.token_id_yes
                         side = 'YES'
-                        price = opp.market_price_yes
-                        expected_price = opp.expected_prob
+                        price = quantize_price(to_decimal(opp.market_price_yes))
+                        expected_price = quantize_price(to_decimal(opp.expected_prob))
                     else:
                         token_id = opp.token_id_no
                         side = 'NO'
-                        price = opp.market_price_no
-                        expected_price = Decimal("1") - opp.expected_prob
+                        price = quantize_price(to_decimal(opp.market_price_no))
+                        expected_price = quantize_price(Decimal("1") - to_decimal(opp.expected_prob))
 
                     # Compute real edge using spread + latency decay
                     orderbook = await self.market_data.get_orderbook(token_id)
@@ -412,9 +466,11 @@ class ProductionTradingBot:
                             bid = Decimal(str(bids[0]['price']))
                             ask = Decimal(str(asks[0]['price']))
                             spread = max(Decimal("0"), ask - bid)
-                    latency_advantage = 0.0
+                    latency_advantage = Decimal("0")
                     if self.last_binance_update:
-                        latency_advantage = (datetime.utcnow() - self.last_binance_update).total_seconds()
+                        latency_advantage = to_decimal(
+                            (datetime.utcnow() - self.last_binance_update).total_seconds()
+                        )
                     real_edge = self.kelly_sizer.calculate_real_edge(
                         market_price=price,
                         true_probability=expected_price,
@@ -430,9 +486,13 @@ class ProductionTradingBot:
                     # Calculate bet size (using REAL equity from ledger)
                     bet_size_result = self.kelly_sizer.calculate_bet_size(
                         bankroll=current_equity,  # NOT settings.INITIAL_CAPITAL
-                        win_probability=float(opp.confidence),
-                        payout_odds=1.0 / float(opp.market_price_yes) if opp.action == 'BUY_YES' else 1.0 / float(opp.market_price_no),
-                        edge=float(real_edge),
+                        win_probability=to_decimal(opp.confidence),
+                        payout_odds=(
+                            Decimal("1") / to_decimal(opp.market_price_yes)
+                            if opp.action == 'BUY_YES'
+                            else Decimal("1") / to_decimal(opp.market_price_no)
+                        ),
+                        edge=real_edge,
                         sample_size=30,
                         current_aggregate_exposure=aggregate_exposure
                     )
@@ -444,7 +504,7 @@ class ProductionTradingBot:
                         )
                         continue
                     
-                    quantity = bet_size_result.size / price
+                    quantity = quantize_quantity(bet_size_result.size / price)
 
                     # Transaction cost breakeven check
                     breakeven = self.ledger.calculate_breakeven_price(price, quantity)
@@ -473,9 +533,9 @@ class ProductionTradingBot:
                         metadata={
                             'question': opp.question,
                             'symbol': opp.symbol,
-                            'threshold': float(opp.threshold),
-                            'exchange_price': float(opp.exchange_price),
-                            'edge': float(opp.edge)
+                            'threshold': str(to_decimal(opp.threshold)),
+                            'exchange_price': str(to_decimal(opp.exchange_price)),
+                            'edge': str(to_decimal(opp.edge))
                         },
                         expected_price=expected_price
                     )
@@ -487,8 +547,8 @@ class ProductionTradingBot:
                         # Record in Kelly sizer for streak tracking
                         self.kelly_sizer.record_trade_result(
                             win=False,  # Unknown yet
-                            roi=0.0,
-                            bet_size=float(bet_size_result.size),
+                            roi=Decimal("0"),
+                            bet_size=bet_size_result.size,
                             strategy='latency_arb'
                         )
                         
@@ -596,8 +656,10 @@ class ProductionTradingBot:
                             # Update Kelly sizer
                             self.kelly_sizer.record_trade_result(
                                 win=(roi > 0),
-                                roi=float(roi),
-                                bet_size=float(position['quantity']) * float(entry_price),
+                                roi=roi,
+                                bet_size=quantize_quantity(
+                                    to_decimal(position['quantity']) * entry_price
+                                ),
                                 strategy=strategy
                             )
                             if strategy == "latency_arb":
@@ -638,7 +700,7 @@ class ProductionTradingBot:
                 logger.info(f"Strategy PnL (24h): ${strategy_pnl.get('net_pnl', 0)}")
                 logger.info(f"Execution Success Rate: {exec_stats.get('success_rate', 0):.1%}")
                 logger.info(f"Avg Order Latency: {exec_stats.get('avg_latency_ms', 0)}ms")
-                logger.info(f"Kelly Sizing: {kelly_stats['kelly_fraction']*100:.0%} | Wins: {kelly_stats['consecutive_wins']} | Losses: {kelly_stats['consecutive_losses']}")
+                logger.info(f"Kelly Sizing: {kelly_stats['kelly_fraction']:.0%} | Wins: {kelly_stats['consecutive_wins']} | Losses: {kelly_stats['consecutive_losses']}")
                 logger.info(f"Health: {self.health_monitor.is_healthy()}")
                 logger.info("="*60 + "\n")
             

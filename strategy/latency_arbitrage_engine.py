@@ -30,6 +30,9 @@ from decimal import Decimal
 import logging
 from dataclasses import dataclass
 
+from integrations.charlie_price_feed import CharliePriceFeed
+from integrations.charlie_intelligence import CharlieIntelligence
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -71,6 +74,14 @@ class LatencyArbitrageEngine:
         # Cache for recent opportunities (prevent duplicates)
         self.recent_opportunities = []  # Last 100 opportunities
         self.max_cache = 100
+
+        # Shared BTC price feed from project-charlie
+        shared_file = config.get('charlie_price_file')
+        self.charlie_price_feed = CharliePriceFeed(shared_file=shared_file)
+
+        # Shared intelligence feed from project-charlie
+        intel_file = config.get('charlie_intelligence_file')
+        self.charlie_intelligence = CharlieIntelligence(shared_file=intel_file)
         
         logger.info(
             f"LatencyArbitrageEngine initialized: min_edge={self.min_edge*100}%, "
@@ -95,6 +106,11 @@ class LatencyArbitrageEngine:
             List of opportunities sorted by edge (highest first)
         """
         opportunities = []
+
+        if exchange_prices is None:
+            exchange_prices = {}
+
+        exchange_prices = await self._ensure_exchange_prices(exchange_prices)
         
         for market in markets:
             question = market.get('question', '').lower()
@@ -157,6 +173,22 @@ class LatencyArbitrageEngine:
             
             # Calculate confidence (higher edge = higher confidence)
             confidence = min(edge / Decimal('0.30'), Decimal('1.0'))  # 30% edge = 100% confidence
+
+            # Apply Charlie intelligence boost if available
+            base_confidence = float(confidence)
+            signal = await self.charlie_intelligence.get_signal()
+            if signal:
+                position_direction = 'UP' if action == 'BUY_YES' else 'DOWN'
+                boosted_confidence = self.charlie_intelligence.boost_confidence(
+                    base_confidence,
+                    position_direction
+                )
+                if boosted_confidence != base_confidence:
+                    logger.info(
+                        "🧠 Charlie intelligence boosted confidence "
+                        f"{base_confidence:.1%} → {boosted_confidence:.1%}"
+                    )
+                base_confidence = boosted_confidence
             
             # Create opportunity
             opp = LatencyOpportunity(
@@ -172,7 +204,7 @@ class LatencyArbitrageEngine:
                 expected_prob=expected_yes_prob,
                 edge=edge,
                 action=action,
-                confidence=float(confidence),
+                confidence=base_confidence,
                 detected_at=datetime.utcnow()
             )
             
@@ -190,6 +222,18 @@ class LatencyArbitrageEngine:
         
         # Sort by edge (highest first)
         return sorted(opportunities, key=lambda x: x.edge, reverse=True)
+
+    async def _ensure_exchange_prices(self, exchange_prices: Dict[str, Decimal]) -> Dict[str, Decimal]:
+        """
+        Ensure BTC price exists by reading from Charlie price feed when missing.
+        """
+        if exchange_prices.get('BTC') is None:
+            try:
+                exchange_prices['BTC'] = await self.charlie_price_feed.get_btc_price()
+            except Exception as exc:
+                logger.error(f"Failed to load BTC price from Charlie feed: {exc}")
+
+        return exchange_prices
     
     def _extract_symbol_and_threshold(self, question: str) -> Tuple[Optional[str], Optional[Decimal]]:
         """
