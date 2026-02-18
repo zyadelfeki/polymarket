@@ -20,7 +20,7 @@ import sys
 import argparse
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 from decimal import Decimal
 import yaml
 import structlog
@@ -35,6 +35,7 @@ from risk.circuit_breaker_v2 import CircuitBreakerV2
 from security.secrets_manager import SecretsManager, get_secrets_manager
 from validation.models import TradingConfig
 from strategies.latency_arbitrage_btc import LatencyArbitrageEngine as MultiTimeframeLatencyArbitrageEngine
+from utils.decimal_helpers import quantize_quantity, to_decimal
 
 logger = structlog.get_logger(__name__)
 
@@ -267,6 +268,279 @@ class TradingSystem:
                     edge=str(opportunity.get("edge")),
                     trigger=trigger,
                 )
+
+            await self._execute_opportunity(opportunity=opportunity, trigger=trigger)
+
+    def _resolve_opportunity_confidence(self, confidence_value: Any) -> Decimal:
+        if confidence_value is None:
+            return Decimal("0.6")
+        if isinstance(confidence_value, Decimal):
+            return max(Decimal("0.01"), min(Decimal("0.99"), confidence_value))
+        if isinstance(confidence_value, str):
+            normalized = confidence_value.strip().upper()
+            if normalized == "HIGH":
+                return Decimal("0.8")
+            if normalized == "MEDIUM":
+                return Decimal("0.65")
+            if normalized == "LOW":
+                return Decimal("0.55")
+        try:
+            parsed = to_decimal(confidence_value)
+            return max(Decimal("0.01"), min(Decimal("0.99"), parsed))
+        except Exception:
+            return Decimal("0.6")
+
+    async def _execute_opportunity(self, opportunity: Dict[str, Any], trigger: str) -> None:
+        if not self.execution or not self.ledger:
+            logger.warning(
+                "opportunity_skipped",
+                reason="execution_or_ledger_unavailable",
+                trigger=trigger,
+            )
+            return
+
+        market_id = str(opportunity.get("market_id") or "").strip()
+        token_id = str(opportunity.get("token_id") or "").strip()
+        side = str(opportunity.get("side") or "").upper()
+        if not market_id or not token_id:
+            logger.warning(
+                "opportunity_skipped",
+                reason="missing_market_or_token_id",
+                market_id=market_id or None,
+                token_id=token_id or None,
+                trigger=trigger,
+            )
+            return
+        if side not in {"YES", "NO"}:
+            logger.warning(
+                "opportunity_skipped",
+                reason="invalid_opportunity_side",
+                side=side,
+                market_id=market_id,
+                trigger=trigger,
+            )
+            return
+
+        try:
+            edge = to_decimal(opportunity.get("edge"))
+        except Exception:
+            logger.warning(
+                "opportunity_skipped",
+                reason="invalid_edge",
+                market_id=market_id,
+                trigger=trigger,
+            )
+            return
+
+        price_raw = opportunity.get("market_price")
+        if price_raw is None:
+            price_raw = opportunity.get("price")
+        if price_raw is None:
+            logger.warning(
+                "opportunity_skipped",
+                reason="missing_market_price",
+                market_id=market_id,
+                token_id=token_id,
+                trigger=trigger,
+            )
+            return
+
+        try:
+            price = to_decimal(price_raw)
+        except Exception:
+            logger.warning(
+                "opportunity_skipped",
+                reason="invalid_market_price",
+                market_id=market_id,
+                token_id=token_id,
+                trigger=trigger,
+            )
+            return
+
+        trading_cfg = self.config.get("trading", {})
+        strategy_cfg = self.config.get("strategies", {}).get("latency_arb", {})
+
+        min_price = to_decimal(trading_cfg.get("min_price", "0.01"))
+        max_price = to_decimal(trading_cfg.get("max_price", "0.99"))
+        if not (min_price <= price <= max_price):
+            logger.warning(
+                "opportunity_skipped",
+                reason="price_out_of_bounds",
+                market_id=market_id,
+                token_id=token_id,
+                price=str(price),
+                min_price=str(min_price),
+                max_price=str(max_price),
+                trigger=trigger,
+            )
+            return
+
+        equity = await self._safe_await(
+            "ledger.get_equity.execute_opportunity",
+            self.ledger.get_equity(),
+            default=Decimal("0"),
+        )
+        if not isinstance(equity, Decimal):
+            equity = to_decimal(equity)
+        if equity <= Decimal("0"):
+            logger.warning(
+                "opportunity_skipped",
+                reason="non_positive_equity",
+                market_id=market_id,
+                trigger=trigger,
+            )
+            return
+
+        max_position_pct = to_decimal(
+            strategy_cfg.get(
+                "max_position_size_pct",
+                trading_cfg.get("max_position_size_pct", "5.0"),
+            )
+        )
+        min_position_size = to_decimal(trading_cfg.get("min_position_size", "1.00"))
+        max_order_size = to_decimal(trading_cfg.get("max_order_size", "1000.00"))
+
+        raw_position_value = equity * (max_position_pct / Decimal("100"))
+        position_value = max(raw_position_value, min_position_size)
+        position_value = min(position_value, max_order_size, equity)
+        if position_value < min_position_size:
+            logger.warning(
+                "opportunity_skipped",
+                reason="position_value_below_minimum",
+                market_id=market_id,
+                position_value=str(position_value),
+                min_position_size=str(min_position_size),
+                trigger=trigger,
+            )
+            return
+
+        quantity = quantize_quantity(position_value / price)
+        if quantity <= Decimal("0"):
+            logger.warning(
+                "opportunity_skipped",
+                reason="quantity_too_small",
+                market_id=market_id,
+                position_value=str(position_value),
+                price=str(price),
+                trigger=trigger,
+            )
+            return
+
+        order_value = quantize_quantity(quantity * price)
+        if order_value < min_position_size:
+            logger.warning(
+                "opportunity_skipped",
+                reason="order_value_below_minimum",
+                market_id=market_id,
+                token_id=token_id,
+                order_value=str(order_value),
+                min_position_size=str(min_position_size),
+                trigger=trigger,
+            )
+            return
+
+        position_size_pct = float((order_value / equity) * Decimal("100"))
+        if self.circuit_breaker:
+            can_trade = await self._safe_await(
+                "circuit_breaker.can_trade.execute_opportunity",
+                self.circuit_breaker.can_trade(equity, position_size_pct=position_size_pct),
+                default=False,
+            )
+            if not can_trade:
+                logger.warning(
+                    "risk_rejected",
+                    reason="circuit_breaker_blocked",
+                    market_id=market_id,
+                    token_id=token_id,
+                    position_size_pct=position_size_pct,
+                    trigger=trigger,
+                )
+                return
+
+        confidence = self._resolve_opportunity_confidence(opportunity.get("confidence"))
+        metadata = {
+            "trigger": trigger,
+            "outcome": side,
+            "direction": str(opportunity.get("direction") or ("UP" if side == "YES" else "DOWN")),
+            "edge": str(edge),
+            "confidence": str(confidence),
+            "question": str(opportunity.get("question") or ""),
+            "btc_price": str(opportunity.get("btc_price")) if opportunity.get("btc_price") is not None else None,
+        }
+
+        logger.info(
+            "order_submission_attempt",
+            market_id=market_id,
+            token_id=token_id,
+            side="BUY",
+            outcome=side,
+            quantity=str(quantity),
+            price=str(price),
+            order_value=str(order_value),
+            edge=str(edge),
+            trigger=trigger,
+        )
+
+        result = await self.execution.place_order_with_risk_check(
+            trade_delta=order_value,
+            strategy="latency_arbitrage_btc",
+            market_id=market_id,
+            token_id=token_id,
+            side="BUY",
+            quantity=quantity,
+            price=price,
+            metadata=metadata,
+        )
+
+        if not result.success:
+            logger.error(
+                "execution_failed",
+                market_id=market_id,
+                token_id=token_id,
+                error=result.error,
+                error_code=result.error_code,
+                status=result.status.value if hasattr(result.status, "value") else str(result.status),
+                trigger=trigger,
+            )
+            return
+
+        logger.info(
+            "order_submitted",
+            order_id=result.order_id,
+            market_id=market_id,
+            token_id=token_id,
+            trigger=trigger,
+        )
+
+        if result.filled_quantity and result.filled_quantity > Decimal("0"):
+            logger.info(
+                "order_filled",
+                order_id=result.order_id,
+                market_id=market_id,
+                token_id=token_id,
+                filled_quantity=str(result.filled_quantity),
+                filled_price=str(result.filled_price),
+                fees=str(result.fees),
+                trigger=trigger,
+            )
+            logger.info(
+                "paper_trade_executed" if self.config.get("trading", {}).get("paper_trading", True) else "trade_executed",
+                order_id=result.order_id,
+                market_id=market_id,
+                token_id=token_id,
+                outcome=side,
+                edge=str(edge),
+                trigger=trigger,
+            )
+            logger.info(
+                "position_opened",
+                order_id=result.order_id,
+                market_id=market_id,
+                token_id=token_id,
+                quantity=str(result.filled_quantity),
+                avg_price=str(result.filled_price),
+                trigger=trigger,
+            )
     
     async def initialize_components(self):
         """Initialize all system components."""

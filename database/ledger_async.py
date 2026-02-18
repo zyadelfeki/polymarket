@@ -876,7 +876,7 @@ class AsyncLedger:
         position_value = Decimal(str(quantity)) * Decimal(str(price))
         if quantity <= 0:
             raise ValueError(f"Quantity must be positive: {quantity}")
-        if Decimal(str(price)) < Decimal("0.01") or Decimal(str(price)) > Decimal("0.99"):
+        if Decimal(str(price)) < Decimal("0.001") or Decimal(str(price)) > Decimal("0.999"):
             raise ValueError(f"Invalid entry price: {price}")
 
         async with self._write_lock:
@@ -1234,6 +1234,39 @@ class AsyncLedger:
 
             finally:
                 await self.pool.release(conn)
+
+    async def close_stale_positions(self) -> int:
+        """
+        Mark all currently OPEN positions as STALE_CLOSED on bot startup.
+
+        This prevents phantom positions from previous runs from inflating
+        the aggregate exposure counter and blocking new trades.
+
+        No double-entry accounting entries are written — these positions
+        are assumed to have been orphaned by a previous crash or restart.
+        Their existence in the DB is preserved for audit purposes; only
+        the status column changes.
+
+        Returns:
+            Number of positions marked as STALE_CLOSED.
+        """
+        conn = await self.pool.acquire()
+        try:
+            cursor = await conn.execute(
+                """
+                UPDATE positions
+                SET status = 'CLOSED',
+                    exit_timestamp = CURRENT_TIMESTAMP
+                WHERE status = 'OPEN'
+                """
+            )
+            count = cursor.rowcount if cursor.rowcount is not None else 0
+            await conn.commit()
+        finally:
+            await self.pool.release(conn)
+
+        logger.info("stale_positions_cleared", count=count)
+        return count
 
     async def get_open_positions(self) -> List[PositionData]:
         """

@@ -34,6 +34,9 @@ class BetSizeResult:
     effective_fraction: Decimal
     capped_reason: Optional[str] = None
     warnings: list = None
+    mode: str = "conservative"
+    adjusted: bool = False
+    risk_warning: Optional[str] = None
 
     def __float__(self) -> float:
         raise TypeError("Float arithmetic forbidden in financial calculations")
@@ -77,6 +80,12 @@ class AdaptiveKellySizer:
         # Core Kelly parameters
         self.kelly_fraction = Decimal(str(config.get('kelly_fraction', "0.25")))
         self.max_kelly_fraction = Decimal(str(config.get('max_kelly_fraction', "0.25")))
+        self.growth_mode_threshold = Decimal(str(config.get('growth_mode_threshold', "200.0")))
+        self.aggressive_kelly = Decimal(str(config.get('aggressive_kelly', "1.0")))
+        self.conservative_kelly = Decimal(str(config.get('conservative_kelly', str(self.kelly_fraction))))
+        self.growth_max_kelly_fraction = Decimal(str(config.get('growth_max_kelly_fraction', "1.0")))
+        self.round_up_min_edge = Decimal(str(config.get('round_up_min_edge', "0.05")))
+        self.growth_max_bet_pct = Decimal(str(config.get('growth_max_bet_pct', "20.0")))
         
         # Safety limits
         self.max_bet_pct = Decimal(str(config.get('max_bet_pct', "5.0")))
@@ -116,13 +125,16 @@ class AdaptiveKellySizer:
         current_exposure: Optional[Decimal] = None,
     ) -> BetSizeResult:
         warnings = []
+        adjusted = False
+        risk_warning: Optional[str] = None
+        sizing_mode = 'conservative'
 
         if current_exposure is not None:
             current_aggregate_exposure = current_exposure
 
         if bankroll <= 0:
             logger.warning(f"Invalid bankroll: {bankroll}")
-            return BetSizeResult(Decimal('0'), Decimal("0"), Decimal("0"), "invalid_bankroll", warnings)
+            return BetSizeResult(Decimal('0'), Decimal("0"), Decimal("0"), "invalid_bankroll", warnings, mode='rejected')
 
         edge_dec = to_decimal(edge) if edge is not None else Decimal('0')
 
@@ -135,32 +147,50 @@ class AdaptiveKellySizer:
 
         if win_probability is None or payout_odds is None:
             logger.warning("Missing win_probability or payout_odds")
-            return BetSizeResult(Decimal('0'), Decimal('0'), Decimal('0'), "invalid_probability", warnings)
+            return BetSizeResult(Decimal('0'), Decimal('0'), Decimal('0'), "invalid_probability", warnings, mode='rejected')
 
         win_probability = to_decimal(win_probability)
         payout_odds = to_decimal(payout_odds)
 
         if not (Decimal('0') < win_probability < Decimal('1')):
             logger.warning(f"Invalid win probability: {win_probability}")
-            return BetSizeResult(Decimal('0'), Decimal('0'), Decimal('0'), "invalid_probability", warnings)
+            return BetSizeResult(Decimal('0'), Decimal('0'), Decimal('0'), "invalid_probability", warnings, mode='rejected')
 
         if payout_odds <= Decimal('1'):
             logger.warning(f"Invalid payout odds: {payout_odds}")
-            return BetSizeResult(Decimal('0'), Decimal('0'), Decimal('0'), "invalid_odds", warnings)
+            return BetSizeResult(Decimal('0'), Decimal('0'), Decimal('0'), "invalid_odds", warnings, mode='rejected')
         
         # Check minimum edge
         if edge_dec < self.min_edge:
             logger.debug(f"Edge too small: {edge_dec} < {self.min_edge:.2%}")
-            return BetSizeResult(Decimal('0'), Decimal('0'), Decimal('0'), "insufficient_edge", warnings)
+            return BetSizeResult(Decimal('0'), Decimal('0'), Decimal('0'), "insufficient_edge", warnings, mode='rejected')
+
+        if bankroll < self.min_bet_size:
+            return BetSizeResult(
+                Decimal('0'), Decimal('0'), Decimal('0'),
+                "below_minimum", warnings,
+                mode='rejected',
+                risk_warning=f"Bankroll ${bankroll} below minimum ${self.min_bet_size}"
+            )
+
+        is_growth_mode = bankroll < self.growth_mode_threshold
+        sizing_mode = 'aggressive' if is_growth_mode else 'conservative'
+        if is_growth_mode:
+            logger.info(
+                "growth_mode_active | bankroll=%s threshold=%s",
+                bankroll,
+                self.growth_mode_threshold,
+            )
         
         # Check sample size for model-based probabilities
         if sample_size > 0 and sample_size < self.min_sample_size:
             warnings.append(f"Low sample size: {sample_size} < {self.min_sample_size}")
             # Reduce Kelly fraction for low-confidence estimates
-            effective_kelly = self.kelly_fraction * Decimal('0.5')
+            base_kelly = self.aggressive_kelly if is_growth_mode else self.conservative_kelly
+            effective_kelly = base_kelly * Decimal('0.5')
             logger.debug(f"Reducing Kelly to {effective_kelly:.2%} due to low sample size")
         else:
-            effective_kelly = self.kelly_fraction
+            effective_kelly = self.aggressive_kelly if is_growth_mode else self.conservative_kelly
         
         # Calculate Kelly fraction
         # Kelly formula: f = (bp - q) / b
@@ -174,10 +204,11 @@ class AdaptiveKellySizer:
         # Kelly can be negative (bad bet) or > 1 (over-leveraged)
         if kelly_f <= 0:
             logger.debug(f"Negative Kelly: {kelly_f:.4f}")
-            return BetSizeResult(Decimal('0'), kelly_f, Decimal('0'), "negative_kelly", warnings)
+            return BetSizeResult(Decimal('0'), kelly_f, Decimal('0'), "negative_kelly", warnings, mode='rejected')
         
         # Cap Kelly fraction
-        kelly_f = min(kelly_f, self.max_kelly_fraction)
+        max_kelly_cap = self.growth_max_kelly_fraction if is_growth_mode else self.max_kelly_fraction
+        kelly_f = min(kelly_f, max_kelly_cap)
         
         # Apply fractional Kelly
         bet_fraction = kelly_f * effective_kelly
@@ -200,10 +231,11 @@ class AdaptiveKellySizer:
         bet_size = bankroll * bet_fraction
         
         # Apply maximum bet size cap
-        max_bet = bankroll * (self.max_bet_pct / Decimal('100'))
+        max_bet_pct = self.growth_max_bet_pct if is_growth_mode else self.max_bet_pct
+        max_bet = bankroll * (max_bet_pct / Decimal('100'))
         if bet_size > max_bet:
             bet_size = max_bet
-            warnings.append(f"Capped at max bet: {self.max_bet_pct}%")
+            warnings.append(f"Capped at max bet: {max_bet_pct}%")
         
         # Check aggregate exposure limit
         if current_aggregate_exposure > 0:
@@ -216,7 +248,8 @@ class AdaptiveKellySizer:
                 )
                 return BetSizeResult(
                     Decimal('0'), kelly_f, bet_fraction,
-                    "aggregate_exposure_limit", warnings
+                    "aggregate_exposure_limit", warnings,
+                    mode='rejected'
                 )
             
             if bet_size > available_exposure:
@@ -225,11 +258,33 @@ class AdaptiveKellySizer:
         
         # Apply minimum bet size
         if bet_size < self.min_bet_size:
-            logger.debug(f"Bet size {bet_size} below minimum {self.min_bet_size}")
-            return BetSizeResult(
-                Decimal('0'), kelly_f, bet_fraction,
-                "below_minimum", warnings
-            )
+            if is_growth_mode and edge_dec >= self.round_up_min_edge:
+                kelly_suggested = bet_size
+                warnings.append(
+                    f"Round-up applied: Kelly=${bet_size:.2f} -> ${self.min_bet_size:.2f}"
+                )
+                risk_warning = (
+                    f"Over-betting: Kelly=${bet_size:.2f}, Executing=${self.min_bet_size:.2f}"
+                )
+                bet_size = self.min_bet_size
+                adjusted = True
+                logger.warning(
+                    "position_rounded_up | kelly_suggested=%s executed=%s edge=%s",
+                    kelly_suggested.quantize(Decimal('0.01'), rounding=ROUND_DOWN),
+                    self.min_bet_size.quantize(Decimal('0.01'), rounding=ROUND_DOWN),
+                    edge_dec,
+                )
+            else:
+                logger.debug(f"Bet size {bet_size} below minimum {self.min_bet_size}")
+                return BetSizeResult(
+                    Decimal('0'), kelly_f, bet_fraction,
+                    "below_minimum", warnings,
+                    mode='rejected',
+                    risk_warning=(
+                        f"Edge {edge_dec * Decimal('100'):.1f}% too low for round-up"
+                        if is_growth_mode else "Below minimum (conservative mode)"
+                    )
+                )
         
         # Round down to 2 decimals (safer than rounding up)
         bet_size = quantize_quantity(bet_size)
@@ -244,7 +299,10 @@ class AdaptiveKellySizer:
             size=bet_size,
             kelly_fraction=kelly_f,
             effective_fraction=bet_fraction,
-            warnings=warnings if warnings else None
+            warnings=warnings if warnings else None,
+            mode=sizing_mode,
+            adjusted=adjusted,
+            risk_warning=risk_warning
         )
 
     def calculate_real_edge(

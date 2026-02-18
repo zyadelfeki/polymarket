@@ -1,0 +1,141 @@
+    async def initialize(self) -> None:
+        self.logger.info("🔵 STARTING initialize() method")
+        self.logger.info("INIT STEP 1/7: creating AsyncLedger")
+
+        self.ledger = AsyncLedger(db_path=self.db_path)
+        await self.ledger.initialize()
+        self.logger.info("✅ INIT STEP 1/7 complete: AsyncLedger initialized")
+
+        self.logger.info("INIT STEP 2/7: loading equity from ledger")
+        equity = await self.ledger.get_equity()
+        if equity <= 0:
+            await self.ledger.record_deposit(STARTING_CAPITAL, "Phase 6 starting capital")
+            equity = await self.ledger.get_equity()
+        self.logger.info("✅ INIT STEP 2/7 complete: equity loaded | equity=%s", equity)
+        self.last_known_balance = equity
+
+        self.logger.info("INIT STEP 3/7: creating CircuitBreakerV2")
+        self.circuit_breaker = CircuitBreakerV2(
+            initial_equity=equity,
+            max_drawdown_pct=float(CIRCUIT_BREAKER_CONFIG["max_drawdown_pct"]),
+            max_loss_streak=int(CIRCUIT_BREAKER_CONFIG["max_consecutive_losses"]),
+            daily_loss_limit_pct=float((CIRCUIT_BREAKER_CONFIG["max_daily_loss"] / STARTING_CAPITAL) * Decimal("100")),
+            adaptive_risk_profile=bool(CIRCUIT_BREAKER_CONFIG.get("adaptive_risk_profile", True)),
+        )
+        self.logger.info("✅ INIT STEP 3/7 complete: CircuitBreakerV2 created")
+
+        self.logger.info("INIT STEP 4/7: creating BinanceWebSocketV2")
+        self.binance = BinanceWebSocketV2(symbols=["BTC"])
+        self.logger.info("INIT STEP 4/7: starting BinanceWebSocketV2")
+        started = await self.binance.start()
+        if not started:
+            raise RuntimeError("Failed to start Binance WebSocket")
+        self.logger.info("✅ INIT STEP 4/7 complete: BinanceWebSocketV2 started")
+
+        self.logger.info("INIT STEP 5/7: creating PolymarketClientV2")
+        try:
+            self.client = PolymarketClientV2(
+                paper_trading=(self.mode == "paper"),
+                max_retries=API_CONFIG["max_retries"],
+                timeout=API_CONFIG["request_timeout_seconds"],
+            )
+            self.logger.info("✅ INIT STEP 5/7 complete: PolymarketClientV2 created")
+        except Exception as exc:
+            self.logger.error("❌ PolymarketClientV2 creation failed: %s", exc, exc_info=True)
+            raise
+
+        self.logger.info("⏳ Waiting 5 seconds for client to fully initialize...")
+        await asyncio.sleep(5)
+        self.logger.info("⏳ Client should be ready now, creating ExecutionService...")
+
+        self.logger.info("INIT STEP 6/7: creating ExecutionService")
+        try:
+            self.execution_service = ExecutionService(
+                polymarket_client=self.client,
+                ledger=self.ledger,
+                config={
+                    "max_retries": API_CONFIG["max_retries"],
+                    "timeout_seconds": API_CONFIG["request_timeout_seconds"],
+                    # Temporary testing override for paper mode only.
+                    # Production/live mode keeps the stricter default threshold.
+                    "partition_threshold_seconds": (
+                        PAPER_MODE_NETWORK_PARTITION_THRESHOLD_SECONDS if self.mode == "paper" else 15
+                    ),
+                },
+            )
+            self.logger.info("✅ ExecutionService created successfully")
+            self.logger.info("✅ INIT STEP 6/7 complete: ExecutionService created")
+        except Exception as exc:
+            self.logger.error("❌ ExecutionService creation failed: %s", exc, exc_info=True)
+            raise
+
+        self.logger.info("INIT STEP 7/7: creating AdaptiveKellySizer")
+        try:
+            self.kelly_sizer = AdaptiveKellySizer(
+                config={
+                    "kelly_fraction": str(KELLY_CONFIG["fractional_kelly"]),
+                    "conservative_kelly": str(KELLY_CONFIG.get("conservative_kelly", KELLY_CONFIG["fractional_kelly"])),
+                    "aggressive_kelly": str(KELLY_CONFIG.get("aggressive_kelly", Decimal("1.0"))),
+                    "growth_mode_threshold": str(KELLY_CONFIG.get("growth_mode_threshold", Decimal("200.0"))),
+                    "growth_max_bet_pct": str(KELLY_CONFIG.get("growth_max_bet_pct", Decimal("20.0"))),
+                    "round_up_min_edge": str(KELLY_CONFIG.get("round_up_min_edge", Decimal("0.05"))),
+                    "growth_max_kelly_fraction": "1.0",
+                    "max_bet_pct": str(KELLY_CONFIG["max_bet_pct"]),
+                    "min_edge": str(KELLY_CONFIG["min_edge_required"]),
+                    "max_aggregate_exposure": "20.0",
+                    "min_bet_size": "1.0",
+                }
+            )
+            self.logger.info("✅ AdaptiveKellySizer created successfully")
+            self.logger.info("✅ INIT STEP 7/7 complete: AdaptiveKellySizer created")
+        except Exception as exc:
+            self.logger.error("❌ AdaptiveKellySizer creation failed: %s", exc, exc_info=True)
+            raise
+
+        self.logger.info("INIT POST-STEP: creating LatencyArbitrageEngine")
+        try:
+            self.strategy = LatencyArbitrageEngine(
+                binance_ws=self.binance,
+                polymarket_client=self.client,
+                charlie_predictor=None,
+                execution_service=self.execution_service,
+                kelly_sizer=self.kelly_sizer,
+                config={
+                    "min_edge": str(STRATEGY_CONFIG["min_edge"]),
+                    "min_time_left_seconds": STRATEGY_CONFIG["min_time_to_expiry_seconds"],
+                    "max_time_left_seconds": STRATEGY_CONFIG["time_window_minutes"] * 60,
+                },
+            )
+            self.logger.info("✅ LatencyArbitrageEngine created successfully")
+            self.logger.info("✅ INIT POST-STEP complete: LatencyArbitrageEngine created")
+        except Exception as exc:
+            self.logger.error("❌ LatencyArbitrageEngine creation failed: %s", exc, exc_info=True)
+            raise
+
+        self.logger.info(f"DEBUG: About to check mode. self.mode={self.mode}, type={type(self.mode)}")
+        if self.mode == "paper":
+            previous_balance = self.last_known_balance
+            self.last_known_balance = PAPER_MODE_STATIC_BALANCE
+            self.logger.info(
+                "paper_balance_fixed | previous=%s current=%s change=%s",
+                previous_balance,
+                self.last_known_balance,
+                self.last_known_balance - previous_balance,
+            )
+        else:
+            live_balance = await self.client.get_live_balance() if self.client else None
+            if live_balance is not None and live_balance > Decimal("0"):
+                previous_balance = self.last_known_balance
+                self.last_known_balance = live_balance
+                self.logger.info(
+                    "balance_synced | previous=%s current=%s change=%s",
+                    previous_balance,
+                    live_balance,
+                    live_balance - previous_balance,
+                )
+                self.logger.info("Live balance initialized | balance=%s", live_balance)
+            else:
+                self.logger.warning("Live balance unavailable at init; using ledger equity=%s", equity)
+
+        self.logger.info("Initialization complete | mode=%s | equity=%s", self.mode, equity)
+        self.logger.info("🟢 FINISHED initialize() method")

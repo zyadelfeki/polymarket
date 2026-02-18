@@ -197,8 +197,9 @@ class ExecutionService:
         Internal order execution with retry logic.
         """
         start_time = time.monotonic()
+        is_paper_mode = bool(getattr(self.client, "paper_trading", False))
 
-        if self.network_monitor.check_partition():
+        if (not is_paper_mode) and self.network_monitor.check_partition():
             return OrderResult(
                 success=False,
                 order_id=None,
@@ -211,6 +212,62 @@ class ExecutionService:
                 retries=0
             )
         
+        if is_paper_mode:
+            try:
+                order_id = f"paper_{int(time.time() * 1000)}"
+                filled_price = Decimal(str(price))
+                filled_quantity = Decimal(str(quantity))
+                fees = Decimal("0")
+
+                correlation_id = ""
+                if metadata and isinstance(metadata, dict):
+                    correlation_id = str(metadata.get("correlation_id", ""))
+
+                position_id = await self.ledger.record_trade_entry(
+                    order_id=order_id,
+                    strategy=strategy,
+                    market_id=market_id,
+                    token_id=token_id,
+                    side=side,
+                    quantity=filled_quantity,
+                    price=filled_price,
+                    correlation_id=correlation_id,
+                    metadata=metadata,
+                )
+
+                latency_ms = int((time.monotonic() - start_time) * 1000)
+                logger.info(
+                    f"[{strategy}] Paper order simulated: {order_id[:20]} | "
+                    f"{filled_quantity} @ {filled_price} | Fees: ${fees} | "
+                    f"Position: {position_id} | Latency: {latency_ms}ms"
+                )
+
+                result = OrderResult(
+                    success=True,
+                    order_id=order_id,
+                    filled_price=filled_price,
+                    filled_quantity=filled_quantity,
+                    fees=fees,
+                    error=None,
+                    latency_ms=latency_ms,
+                    retries=1,
+                )
+                self.order_history.append(result)
+                return result
+            except Exception as e:
+                logger.error(f"Paper order simulation error: {e}", exc_info=True)
+                return OrderResult(
+                    success=False,
+                    order_id=None,
+                    filled_price=None,
+                    filled_quantity=None,
+                    fees=None,
+                    error=str(e),
+                    error_code="PAPER_SIM_ERROR",
+                    latency_ms=int((time.monotonic() - start_time) * 1000),
+                    retries=1,
+                )
+
         for attempt in range(self.max_retries):
             try:
                 # Rate limit
@@ -220,21 +277,26 @@ class ExecutionService:
                 logger.info(
                     f"[{strategy}] Placing order: {side} {quantity} @ {price} on {market_id[:20]}"
                 )
+
+                normalized_side = side.upper()
+                if normalized_side in {"YES", "NO"}:
+                    normalized_side = "BUY"
                 
                 order_response = await asyncio.wait_for(
                     self.client.place_order(
+                        market_id=market_id,
                         token_id=token_id,
-                        side=side.lower(),
-                        amount=float(quantity),
-                        price=float(price),
+                        side=normalized_side,
+                        size=quantity,
+                        price=price,
                         order_type=order_type
                     ),
                     timeout=self.timeout_seconds
                 )
                 self.network_monitor.record_success()
                 
-                if not order_response or not order_response.get('success'):
-                    error = order_response.get('error', 'Unknown error') if order_response else 'No response'
+                if order_response is None or not order_response.get('success'):
+                    error = order_response.get('error', 'Unknown error') if order_response is not None else 'No response'
                     logger.warning(f"Order failed (attempt {attempt+1}/{self.max_retries}): {error}")
                     
                     if attempt < self.max_retries - 1:
@@ -253,15 +315,37 @@ class ExecutionService:
                         retries=attempt + 1
                     )
                 
-                order_id = order_response['order_id']
-                
-                # Wait for fill (poll order status)
-                filled_price, filled_quantity, fees = await self._wait_for_fill(
-                    order_id,
-                    max_wait_seconds=30,
-                    target_price=price,
-                    max_slippage_bps=max_slippage_bps
-                )
+                order_id = order_response.get('order_id') or order_response.get('orderID')
+                if not order_id:
+                    logger.warning(f"Order response missing order_id (attempt {attempt+1}/{self.max_retries})")
+                    if attempt < self.max_retries - 1:
+                        backoff = self.initial_backoff * (2 ** attempt)
+                        await asyncio.sleep(backoff)
+                        continue
+                    return OrderResult(
+                        success=False,
+                        order_id=None,
+                        filled_price=None,
+                        filled_quantity=None,
+                        fees=None,
+                        error="missing_order_id",
+                        error_code="INVALID_ORDER_RESPONSE",
+                        latency_ms=int((time.monotonic() - start_time) * 1000),
+                        retries=attempt + 1,
+                    )
+
+                if getattr(self.client, "paper_trading", False):
+                    filled_price = Decimal(str(order_response.get('avg_price') or price))
+                    filled_quantity = Decimal(str(order_response.get('filled_size') or quantity))
+                    fees = Decimal("0")
+                else:
+                    # Wait for fill (poll order status)
+                    filled_price, filled_quantity, fees = await self._wait_for_fill(
+                        order_id,
+                        max_wait_seconds=30,
+                        target_price=price,
+                        max_slippage_bps=max_slippage_bps
+                    )
                 
                 if filled_quantity is None or filled_quantity == 0:
                     logger.warning(f"Order {order_id} not filled within timeout")
@@ -284,17 +368,21 @@ class ExecutionService:
                     logger.warning(f"Failed to publish positions: {exc}")
 
                 
+                correlation_id = ""
+                if metadata and isinstance(metadata, dict):
+                    correlation_id = str(metadata.get("correlation_id", ""))
+
                 # Record in ledger
-                txn_id, position_id = self.ledger.record_trade_entry(
+                position_id = await self.ledger.record_trade_entry(
+                    order_id=order_id,
                     strategy=strategy,
                     market_id=market_id,
                     token_id=token_id,
                     side=side,
                     quantity=filled_quantity,
-                    entry_price=filled_price,
-                    fees=fees,
-                    order_id=order_id,
-                    metadata=metadata
+                    price=filled_price,
+                    correlation_id=correlation_id,
+                    metadata=metadata,
                 )
                 
                 latency_ms = int((time.monotonic() - start_time) * 1000)

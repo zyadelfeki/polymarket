@@ -136,6 +136,32 @@ class IdempotencyManager:
                 return entry.get("result")
         return None
 
+    def record(self, key: str, status: str = "pending") -> None:
+        existing = self._cache.get(key, {})
+        attempts = existing.get("attempts", 0) + 1
+        self._cache[key] = {
+            "timestamp": time.time(),
+            "status": status,
+            "attempts": attempts,
+            "result": existing.get("result"),
+            "success": existing.get("success"),
+            "order_id": existing.get("order_id"),
+        }
+        self._save_cache()
+
+    def update_result(self, key: str, result: Dict[str, Any]) -> None:
+        serialized = self._serialize_value(result)
+        existing = self._cache.get(key, {})
+        self._cache[key] = {
+            "timestamp": existing.get("timestamp", time.time()),
+            "status": "success" if serialized.get("success") else "failed",
+            "attempts": existing.get("attempts", 1),
+            "result": serialized,
+            "success": serialized.get("success") if isinstance(serialized, dict) else False,
+            "order_id": serialized.get("order_id") if isinstance(serialized, dict) else None,
+        }
+        self._save_cache()
+
     def check_duplicate(self, key: str) -> Optional[Dict]:
         if self.is_duplicate(key):
             return self.get_cached_result(key)
@@ -158,20 +184,14 @@ class IdempotencyManager:
 
     def record_attempt(self, key: str, result: Dict) -> None:
         existing = self._cache.get(key, {})
-        attempts = existing.get("attempts", 0) + 1
-        serialized = self._serialize_value(result)
-        self._cache[key] = {
-            "timestamp": time.time(),
-            "result": serialized,
-            "attempts": attempts,
-            "success": serialized.get("success") if isinstance(serialized, dict) else False,
-            "order_id": serialized.get("order_id") if isinstance(serialized, dict) else None,
-        }
+        if not existing:
+            self.record(key, status="pending")
+        self.update_result(key, result)
+        attempts = self._cache.get(key, {}).get("attempts", 1)
         if _structlog_available:
             logger.info("order_attempt_recorded", key=key, attempts=attempts)
         else:
             logger.info("order_attempt_recorded | key=%s attempts=%s", key, attempts)
-        self._save_cache()
 
     def record_order(self, key: str, result: Dict) -> None:
         self.record_attempt(key, result)

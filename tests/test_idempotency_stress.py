@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from execution.ultra_fast_executor import UltraFastExecutor
+from execution.idempotency_manager import IdempotencyManager
 
 
 @pytest.mark.asyncio
@@ -200,3 +201,66 @@ async def test_cache_expiration():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+
+@pytest.mark.asyncio
+async def test_idempotency_manager_prevents_duplicate_orders():
+    manager = IdempotencyManager(db_path=":memory:", ttl=300)
+    key = manager.generate_key(
+        market_id="1369998",
+        outcome="YES",
+        side="BUY",
+        price=Decimal("0.52"),
+        size=Decimal("10.0"),
+    )
+
+    assert manager.is_duplicate(key) is False
+    manager.record(key, status="pending")
+
+    blocked = 0
+    for _ in range(9):
+        if manager.is_duplicate(key):
+            blocked += 1
+
+    assert blocked == 9
+
+
+@pytest.mark.asyncio
+async def test_idempotency_manager_concurrent_duplicate_prevention():
+    manager = IdempotencyManager(db_path=":memory:", ttl=300)
+    key = manager.generate_key(
+        market_id="1369998",
+        outcome="YES",
+        side="BUY",
+        price=Decimal("0.52"),
+        size=Decimal("10.0"),
+    )
+
+    async def attempt_trade():
+        if not manager.is_duplicate(key):
+            manager.record(key)
+            return "EXECUTED"
+        return "BLOCKED"
+
+    results = await asyncio.gather(*[attempt_trade() for _ in range(10)])
+    assert results.count("EXECUTED") == 1
+    assert results.count("BLOCKED") == 9
+
+
+@pytest.mark.asyncio
+async def test_idempotency_manager_cache_expiry():
+    manager = IdempotencyManager(db_path=":memory:", ttl=1)
+    key = manager.generate_key(
+        market_id="123",
+        outcome="YES",
+        side="BUY",
+        price=Decimal("0.52"),
+        size=Decimal("10"),
+    )
+
+    manager.record(key)
+    assert manager.is_duplicate(key) is True
+
+    await asyncio.sleep(1.5)
+    manager.clear_expired()
+    assert manager.is_duplicate(key) is False

@@ -16,6 +16,7 @@ from risk.kelly_sizer import AdaptiveKellySizer
 from integrations.charlie_booster import CharliePredictionBooster
 from utils.decimal_helpers import to_decimal, quantize_price, quantize_quantity, to_timeout_float
 from execution.idempotency_manager import IdempotencyManager
+from execution.order_types import OrderResult
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ class UltraFastExecutor:
         opportunity: Dict,
         capital: Decimal,
         bet_size: Optional[Decimal] = None,
-    ) -> Optional[Dict]:
+    ) -> Optional[OrderResult]:
         if bet_size is None:
             bet_size = await self.calculate_bet_size(opportunity, capital)
 
@@ -103,7 +104,7 @@ class UltraFastExecutor:
         token_id: Optional[str] = None,
         strategy: str = "ultra_fast_executor",
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> Dict:
+    ) -> OrderResult:
         """
         Execute order with idempotency protection.
         Returns cached result if duplicate detected.
@@ -143,23 +144,44 @@ class UltraFastExecutor:
             side,
         )
 
-        result = await self.execution.place_order(
-            strategy=strategy,
-            market_id=market_id,
-            token_id=token_id,
-            side=side,
-            quantity=size,
-            price=price,
-            metadata=metadata,
-            max_slippage_bps=100,
-        )
+        self.idempotency.record(idem_key, status="pending")
+
+        try:
+            result = await self.execution.place_order(
+                strategy=strategy,
+                market_id=market_id,
+                token_id=token_id,
+                side=side,
+                quantity=size,
+                price=price,
+                metadata=metadata,
+                max_slippage_bps=100,
+            )
+        except Exception as exc:
+            error_result: OrderResult = {
+                "success": False,
+                "order_id": None,
+                "error": str(exc),
+                "filled_size": None,
+                "avg_price": None,
+                "timestamp": time.time(),
+            }
+            self.idempotency.update_result(idem_key, error_result)
+            return error_result
 
         if isinstance(result, dict):
-            self.idempotency.record_attempt(idem_key, result)
+            self.idempotency.update_result(idem_key, result)
         else:
-            self.idempotency.record_attempt(idem_key, {"success": False, "error": "invalid_result"})
+            self.idempotency.update_result(idem_key, {"success": False, "error": "invalid_result"})
 
-        return result if isinstance(result, dict) else {"success": False, "error": "invalid_result", "timestamp": time.time()}
+        return result if isinstance(result, dict) else {
+            "success": False,
+            "order_id": None,
+            "error": "invalid_result",
+            "filled_size": None,
+            "avg_price": None,
+            "timestamp": time.time(),
+        }
 
     async def calculate_bet_size(self, opportunity: Dict, capital: Decimal) -> Decimal:
         edge = to_decimal(opportunity.get("edge", "0"))

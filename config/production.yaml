@@ -171,7 +171,7 @@ strategies:
       - 15min
     enforce_orderbook_validation: true
     min_orderbook_size: 10.0
-    peak_hours_only: true
+    peak_hours_only: false
     use_dynamic_edge_thresholds: true
     edge_thresholds:
       15min: 0.03

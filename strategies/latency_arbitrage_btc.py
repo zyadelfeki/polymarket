@@ -13,7 +13,7 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, getcontext
+from decimal import Decimal, InvalidOperation, getcontext
 from typing import Dict, Optional, Tuple, List
 
 try:
@@ -119,8 +119,10 @@ class LatencyArbitrageEngine:
         self.min_time_left_seconds = int(cfg.get("min_time_left_seconds", 15))
         self.max_time_left_seconds = int(cfg.get("max_time_left_seconds", 15 * 60))
         self.min_volatility_pct = to_decimal(cfg.get("min_volatility_pct", "0.2"))
+        self.slippage_buffer = to_decimal(cfg.get("slippage_buffer", "0.01"))
         self.min_orderbook_size = to_decimal(cfg.get("min_orderbook_size", "10"))
         self.enforce_orderbook_validation = bool(cfg.get("enforce_orderbook_validation", False))
+        self.max_spread_bps = float(cfg.get("max_spread_bps", 500))  # skip markets wider than 5%
         self.peak_hours_only = bool(cfg.get("peak_hours_only", False))
         self.use_dynamic_edge_thresholds = bool(cfg.get("use_dynamic_edge_thresholds", False))
         edge_thresholds_cfg = cfg.get("edge_thresholds") or {
@@ -158,16 +160,61 @@ class LatencyArbitrageEngine:
             min_edge=str(self.min_edge),
             max_edge=str(self.max_edge),
             min_volatility_pct=str(self.min_volatility_pct),
+            slippage_buffer=str(self.slippage_buffer),
             peak_hours_only=self.peak_hours_only,
             enforce_orderbook_validation=self.enforce_orderbook_validation,
         )
 
+    def calculate_dynamic_fee(self, price: Decimal) -> Decimal:
+        """Estimate taker fee as function of outcome price (peak near midpoint)."""
+        clamped_price = max(Decimal("0.0"), min(Decimal("1.0"), to_decimal(price)))
+        base_fee_rate = Decimal("0.03")
+        distance_from_midpoint = abs(clamped_price - Decimal("0.5"))
+        fee_multiplier = Decimal("1.0") - (distance_from_midpoint * Decimal("2"))
+        estimated_fee = base_fee_rate * max(Decimal("0"), fee_multiplier)
+        return max(estimated_fee, Decimal("0.005"))
+
+    def calculate_net_edge(self, raw_edge: Decimal, yes_price: Decimal) -> Decimal:
+        """Adjust edge for taker fee and slippage."""
+        taker_fee = self.calculate_dynamic_fee(yes_price)
+        total_cost = taker_fee + self.slippage_buffer
+        net_edge = to_decimal(raw_edge) - total_cost
+        logger.debug(
+            "edge_adjusted_for_fees",
+            raw_edge=float(raw_edge),
+            estimated_fee=float(taker_fee),
+            net_edge=float(net_edge),
+        )
+        logger.debug(
+            "edge_adjustment",
+            raw_edge=float(raw_edge),
+            taker_fee=float(taker_fee),
+            slippage=float(self.slippage_buffer),
+            net_edge=float(net_edge),
+        )
+        return net_edge
+
+    def _min_required_net_edge(self, price: Decimal, timeframe: Optional[str]) -> Decimal:
+        base_min_edge = self._resolve_min_edge(timeframe)
+        price_dec = to_decimal(price)
+        midpoint_min = max(base_min_edge, Decimal("0.06"))
+        outer_min = max(base_min_edge, Decimal("0.03"))
+        if Decimal("0.40") < price_dec < Decimal("0.60"):
+            return midpoint_min
+        return outer_min
+
     def determine_trade_direction(
         self,
-        btc_price: Decimal,
-        strike_price: Decimal,
-        yes_odds: Decimal,
-        no_odds: Decimal,
+        btc_price: Optional[Decimal] = None,
+        strike_price: Optional[Decimal] = None,
+        yes_odds: Optional[Decimal] = None,
+        no_odds: Optional[Decimal] = None,
+        market_id: Optional[str] = None,
+        start_price: Optional[Decimal] = None,
+        current_price: Optional[Decimal] = None,
+        yes_price: Optional[Decimal] = None,
+        no_price: Optional[Decimal] = None,
+        min_edge: Optional[Decimal] = None,
     ) -> Optional[Dict]:
         """
         Generate trade signal based on price vs strike.
@@ -176,35 +223,52 @@ class LatencyArbitrageEngine:
         - Bullish: BUY YES token
         - Bearish: BUY NO token
         """
-        btc_price = to_decimal(btc_price)
-        strike_price = to_decimal(strike_price)
-        yes_odds = to_decimal(yes_odds)
-        no_odds = to_decimal(no_odds)
+        reference_start = start_price if start_price is not None else strike_price
+        observed_current = current_price if current_price is not None else btc_price
+        observed_yes = yes_price if yes_price is not None else yes_odds
+        observed_no = no_price if no_price is not None else no_odds
 
-        if strike_price <= 0:
+        if reference_start is None or observed_current is None or observed_yes is None or observed_no is None:
             return None
 
-        # Bullish scenario: BTC price ABOVE strike
-        if btc_price > strike_price:
-            if yes_odds < Decimal("0.85"):
-                return {
-                    "outcome": "YES",
-                    "side": "BUY",
-                    "direction": "BULLISH",
-                    "confidence": Decimal("1.0") - yes_odds,
-                    "edge": (btc_price - strike_price) / strike_price,
-                }
+        start_price_dec = to_decimal(reference_start)
+        current_price_dec = to_decimal(observed_current)
+        yes_odds_dec = to_decimal(observed_yes)
+        no_odds_dec = to_decimal(observed_no)
+        min_edge_dec = to_decimal(min_edge) if min_edge is not None else self.min_edge
 
-        # Bearish scenario: BTC price BELOW strike
-        if btc_price < strike_price:
-            if no_odds < Decimal("0.85"):
-                return {
-                    "outcome": "NO",
-                    "side": "BUY",
-                    "direction": "BEARISH",
-                    "confidence": Decimal("1.0") - no_odds,
-                    "edge": (strike_price - btc_price) / strike_price,
-                }
+        if start_price_dec <= 0:
+            return None
+
+        price_change_pct = (current_price_dec - start_price_dec) / start_price_dec
+        scaled_move = price_change_pct * Decimal("5")
+        true_prob_up = max(Decimal("0.01"), min(Decimal("0.99"), Decimal("0.5") + scaled_move))
+        true_prob_down = Decimal("1.0") - true_prob_up
+
+        edge_up = true_prob_up - yes_odds_dec
+        edge_down = true_prob_down - no_odds_dec
+
+        if current_price_dec > start_price_dec and edge_up > min_edge_dec:
+            return {
+                "market_id": market_id,
+                "outcome": "YES",
+                "side": "BUY",
+                "direction": "BULLISH",
+                "expected_outcome": "UP",
+                "confidence": true_prob_up,
+                "edge": edge_up,
+            }
+
+        if current_price_dec < start_price_dec and edge_down > min_edge_dec:
+            return {
+                "market_id": market_id,
+                "outcome": "NO",
+                "side": "BUY",
+                "direction": "BEARISH",
+                "expected_outcome": "DOWN",
+                "confidence": true_prob_down,
+                "edge": edge_down,
+            }
 
         return None
 
@@ -374,6 +438,15 @@ class LatencyArbitrageEngine:
                     spread_bps=spread_bps,
                     status="orderbook_valid",
                 )
+                if spread_bps is not None and spread_bps > self.max_spread_bps:
+                    logger.info(
+                        "market_skipped",
+                        reason="spread_too_wide",
+                        spread_bps=spread_bps,
+                        max_spread_bps=self.max_spread_bps,
+                        market_id=market.get("id") or market.get("condition_id"),
+                    )
+                    continue
             else:
                 logger.warning(
                     "dead_market_detected",
@@ -425,7 +498,14 @@ class LatencyArbitrageEngine:
 
             question = (market.get("question") or market.get("title") or "").lower()
             slug = str(market.get("slug") or market.get("ticker") or "").lower()
-            if asset_lower not in question and asset_lower not in slug:
+            if not self._market_matches_asset(asset_lower=asset_lower, question=question, slug=slug):
+                logger.debug(
+                    "btc_market_rejected",
+                    reason="asset_match_failed",
+                    asset=asset_lower,
+                    question=(market.get("question") or market.get("title") or "")[:140],
+                    slug=slug,
+                )
                 continue
 
             market_id = (
@@ -499,6 +579,15 @@ class LatencyArbitrageEngine:
             )
         )
         return selected_markets
+
+    def _market_matches_asset(self, asset_lower: str, question: str, slug: str) -> bool:
+        if asset_lower in question or asset_lower in slug:
+            return True
+
+        if asset_lower == "btc":
+            return bool(self._btc_re.search(question) or ("bitcoin" in slug))
+
+        return False
 
     async def get_markets_for_all_timeframes(self, asset: str, base_timestamp: int) -> List[Dict]:
         """Scan supported timeframes and return markets sorted by priority (1 = highest)."""
@@ -690,17 +779,31 @@ class LatencyArbitrageEngine:
                 text = raw_value.strip()
                 if not text:
                     return None
-                if "T" in text or "Z" in text or "+" in text:
-                    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-                    if parsed.tzinfo is None:
-                        return parsed.replace(tzinfo=timezone.utc)
-                    return parsed.astimezone(timezone.utc)
-                parsed_ts = to_decimal(text)
-                return datetime.fromtimestamp(parsed_ts, tz=timezone.utc)
+                if "T" in text or "Z" in text or "+" in text or ("-" in text and ":" in text):
+                    try:
+                        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            return parsed.replace(tzinfo=timezone.utc)
+                        return parsed.astimezone(timezone.utc)
+                    except ValueError:
+                        pass
+
+                if re.fullmatch(r"[+-]?\d+(\.\d+)?", text):
+                    parsed_ts = to_decimal(text)
+                    if parsed_ts > Decimal("1000000000000"):
+                        parsed_ts = parsed_ts / Decimal("1000")
+                    return datetime.fromtimestamp(float(parsed_ts), tz=timezone.utc)
+
+                logger.debug(
+                    "market_datetime_unparseable_string",
+                    fields=fields,
+                    raw_value=text[:60],
+                )
+                return None
 
             if isinstance(raw_value, (int, float, Decimal)):
                 return datetime.fromtimestamp(to_decimal(raw_value), tz=timezone.utc)
-        except (ValueError, TypeError) as exc:
+        except (ValueError, TypeError, InvalidOperation, OverflowError, OSError) as exc:
             logger.debug(
                 "market_datetime_parse_failed",
                 fields=fields,
@@ -842,6 +945,8 @@ class LatencyArbitrageEngine:
 
         edge_up = true_prob_up - prices["yes"]
         edge_down = true_prob_down - prices["no"]
+        net_edge_up = self.calculate_net_edge(edge_up, prices["yes"])
+        net_edge_down = self.calculate_net_edge(edge_down, prices["no"])
 
         expected_outcome = "UP" if btc_price >= start_price else "DOWN"
         expected_true_prob = true_prob_up if expected_outcome == "UP" else true_prob_down
@@ -870,14 +975,17 @@ class LatencyArbitrageEngine:
             no_price=str(prices["no"]),
             edge_up=str(edge_up),
             edge_down=str(edge_down),
+            net_edge_up=str(net_edge_up),
+            net_edge_down=str(net_edge_down),
             min_edge=str(self._resolve_min_edge(timeframe)),
         )
         if not market_id:
             return None
 
-        min_edge_threshold = self._resolve_min_edge(timeframe)
+        min_edge_threshold_up = self._min_required_net_edge(prices["yes"], timeframe)
+        min_edge_threshold_down = self._min_required_net_edge(prices["no"], timeframe)
 
-        if abs(edge_up) >= abs(edge_down) and edge_up > min_edge_threshold:
+        if net_edge_up > min_edge_threshold_up and net_edge_up >= net_edge_down:
             return {
                 "market_id": market_id,
                 "token_id": prices["yes_token_id"],
@@ -885,8 +993,9 @@ class LatencyArbitrageEngine:
                 "outcome": "UP",
                 "true_prob": true_prob_up,
                 "market_price": prices["yes"],
-                "edge": edge_up,
-                "confidence": "HIGH" if edge_up > Decimal("0.15") else "MEDIUM",
+                "edge": net_edge_up,
+                "raw_edge": edge_up,
+                "confidence": "HIGH" if net_edge_up > Decimal("0.15") else "MEDIUM",
                 "charlie_confidence": charlie_confidence,
                 "direction": "UP",
                 "btc_price": btc_price,
@@ -896,7 +1005,7 @@ class LatencyArbitrageEngine:
                 "timeframe": timeframe or self._detect_market_timeframe(market) or "unknown",
             }
 
-        if edge_down > min_edge_threshold:
+        if net_edge_down > min_edge_threshold_down and net_edge_down > net_edge_up:
             return {
                 "market_id": market_id,
                 "token_id": prices["no_token_id"],
@@ -904,8 +1013,9 @@ class LatencyArbitrageEngine:
                 "outcome": "DOWN",
                 "true_prob": true_prob_down,
                 "market_price": prices["no"],
-                "edge": edge_down,
-                "confidence": "HIGH" if edge_down > Decimal("0.15") else "MEDIUM",
+                "edge": net_edge_down,
+                "raw_edge": edge_down,
+                "confidence": "HIGH" if net_edge_down > Decimal("0.15") else "MEDIUM",
                 "charlie_confidence": charlie_confidence,
                 "direction": "DOWN",
                 "btc_price": btc_price,
@@ -917,9 +1027,10 @@ class LatencyArbitrageEngine:
 
         logger.debug(
             "edges_too_small",
-            edge_up=str(edge_up),
-            edge_down=str(edge_down),
-            min_edge=str(min_edge_threshold),
+            edge_up=str(net_edge_up),
+            edge_down=str(net_edge_down),
+            min_edge_up=str(min_edge_threshold_up),
+            min_edge_down=str(min_edge_threshold_down),
         )
 
         return None
@@ -1392,8 +1503,12 @@ class LatencyArbitrageEngine:
             now_et = datetime.now(timezone.utc)
             hour = now_et.hour
         else:
-            now_et = datetime.now(ZoneInfo("America/New_York"))
-            hour = now_et.hour
+            try:
+                now_et = datetime.now(ZoneInfo("America/New_York"))
+                hour = now_et.hour
+            except Exception:
+                now_et = datetime.now(timezone.utc)
+                hour = now_et.hour
 
         if 9 <= hour < 16:
             return True

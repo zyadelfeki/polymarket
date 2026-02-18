@@ -514,16 +514,16 @@ class Ledger:
                 "SELECT SUM(amount) as total FROM transaction_lines WHERE transaction_id = ?",
                 (txn_id,)
             )
-            total = cursor.fetchone()[0] or 0.0
-            if abs(total) > 0:
-                adjustment = -float(total)
+            total = Decimal(str(cursor.fetchone()[0] or "0"))
+            if abs(total) > Decimal("0"):
+                adjustment = -total
                 adjustment_account = revenue_id if adjustment < 0 else loss_id
                 conn.execute(
                     """
                     INSERT INTO transaction_lines (transaction_id, account_id, amount)
                     VALUES (?, ?, ?)
                     """,
-                    (txn_id, adjustment_account, str(adjustment))
+                    (txn_id, adjustment_account, _format_amount(adjustment))
                 )
 
             conn.execute(
@@ -571,7 +571,7 @@ class Ledger:
                     UPDATE positions
                     SET current_price = ?
                     WHERE token_id = ? AND status = 'OPEN'
-                """, (float(price), token_id))
+                """, (str(price), token_id))
             conn.commit()
     
     def get_open_positions(self, strategy: Optional[str] = None) -> List[Dict]:

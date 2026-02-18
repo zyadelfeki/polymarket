@@ -127,6 +127,7 @@ class CircuitBreakerV2:
         recovery_threshold_pct: float = 5.0,
         cooldown_minutes: int = 30,
         half_open_max_position_pct: float = 2.0,
+        adaptive_risk_profile: bool = True,
         audit_logger: Optional[Any] = None,
         alert_service: Optional[AlertService] = None
     ):
@@ -141,11 +142,20 @@ class CircuitBreakerV2:
             recovery_threshold_pct: Drawdown reduction needed for recovery
             cooldown_minutes: Minutes before attempting recovery
             half_open_max_position_pct: Max position size in half-open state
+            adaptive_risk_profile: Apply micro-capital risk profile below $100
         """
         self.initial_equity = initial_equity
+        self.adaptive_risk_profile = adaptive_risk_profile
         self.max_drawdown_pct = max_drawdown_pct
         self.max_loss_streak = max_loss_streak
         self.daily_loss_limit_pct = daily_loss_limit_pct
+
+        # Micro-capital growth profile: allow wider variance to avoid over-triggering.
+        if self.adaptive_risk_profile and initial_equity < Decimal("100"):
+            self.max_drawdown_pct = max(self.max_drawdown_pct, 50.0)
+            self.daily_loss_limit_pct = max(self.daily_loss_limit_pct, 30.0)
+            self.max_loss_streak = max(self.max_loss_streak, 10)
+
         self.recovery_threshold_pct = recovery_threshold_pct
         self.cooldown_period = timedelta(minutes=cooldown_minutes)
         self.half_open_max_position_pct = half_open_max_position_pct
@@ -188,9 +198,10 @@ class CircuitBreakerV2:
         logger.info(
             "circuit_breaker_initialized",
             initial_equity=float(initial_equity),
-            max_drawdown_pct=max_drawdown_pct,
-            max_loss_streak=max_loss_streak,
-            daily_loss_limit_pct=daily_loss_limit_pct
+            max_drawdown_pct=self.max_drawdown_pct,
+            max_loss_streak=self.max_loss_streak,
+            daily_loss_limit_pct=self.daily_loss_limit_pct,
+            adaptive_risk_profile=self.adaptive_risk_profile,
         )
 
     async def _record_audit_event(

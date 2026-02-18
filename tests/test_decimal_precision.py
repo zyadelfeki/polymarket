@@ -14,6 +14,7 @@ from data_feeds.polymarket_client_v2 import OrderSide
 from logs.precision_monitor import PrecisionMonitor, PrecisionError
 from utils.decimal_json import dumps as decimal_dumps, loads as decimal_loads
 from database.ledger_async import AsyncLedger
+from utils.decimal_helpers import safe_decimal, quantize_price, quantize_usdc, quantize_size, validate_precision, format_for_api
 
 
 VALID_MARKET_ID = "0x" + "c" * 64
@@ -126,3 +127,29 @@ async def test_decimal_json_db_round_trip(tmp_path):
     assert decoded["value"] == Decimal("0.01")
 
     await ledger.close()
+
+
+def test_safe_decimal_from_string_exact():
+    result = safe_decimal("0.52")
+    assert isinstance(result, Decimal)
+    assert result == Decimal("0.52")
+
+
+def test_safe_decimal_warns_on_float():
+    with pytest.warns(UserWarning):
+        result = safe_decimal(0.52)
+    assert isinstance(result, Decimal)
+    assert result == Decimal("0.52")
+
+
+def test_decimal_quantization_helpers():
+    assert quantize_price(Decimal("0.526789")) == Decimal("0.5267")
+    assert quantize_usdc(Decimal("10.999")) == Decimal("10.99")
+    assert quantize_size(Decimal("0.009"), Decimal("0.01")) == Decimal("0")
+    assert quantize_size(Decimal("10.567"), Decimal("0.01")) == Decimal("10.56")
+
+
+def test_validate_precision_bounds_and_api_format():
+    assert validate_precision(Decimal("0.123456789012345678")) is True
+    assert validate_precision(Decimal("0.1234567890123456789")) is False
+    assert format_for_api(Decimal("10.500000000000000000")) == "10.5"

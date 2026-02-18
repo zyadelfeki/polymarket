@@ -48,6 +48,35 @@ class StubCharlie:
         return {"probability": 0.6, "confidence": 0.7}
 
 
+def test_market_filter_accepts_bitcoin_and_btc_variants():
+    engine = LatencyArbitrageEngine(
+        binance_ws=StubBinance(Decimal("95000"), volatility=3.0),
+        polymarket_client=StubPolymarket({}, yes_price=Decimal("0.50"), no_price=Decimal("0.50")),
+        charlie_predictor=StubCharlie(),
+        config={"min_edge": 0.03, "max_edge": 0.99, "min_volatility_pct": 0.0},
+    )
+
+    markets = [
+        {
+            "id": "m_bitcoin",
+            "question": "Bitcoin Up or Down - 15 minute",
+            "slug": "bitcoin-up-or-down-15m",
+            "closed": False,
+        },
+        {
+            "id": "m_btc",
+            "question": "BTC Up or Down - 15 minute",
+            "slug": "btc-up-or-down-15m",
+            "closed": False,
+        },
+    ]
+
+    selected = engine._select_markets_for_all_timeframes(asset="BTC", markets=markets)
+    selected_ids = {item["data"].get("id") for item in selected}
+    assert "m_bitcoin" in selected_ids
+    assert "m_btc" in selected_ids
+
+
 @pytest.mark.asyncio
 async def test_latency_arbitrage_yes_signal():
     market = {

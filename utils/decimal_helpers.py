@@ -5,6 +5,7 @@ Prevents capital leakage through floating-point errors.
 
 from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Any, Union
+import warnings
 
 getcontext().prec = 18
 
@@ -17,12 +18,17 @@ def safe_decimal(value: Any) -> Decimal:
         return Decimal(value)
     if isinstance(value, (int, float)):
         if isinstance(value, float):
+            warnings.warn(
+                "float_to_decimal_conversion_detected",
+                UserWarning,
+                stacklevel=2,
+            )
             try:
                 import structlog
 
                 logger = structlog.get_logger(__name__)
                 logger.warning(
-                    "float_to_decimal_conversion",
+                    "float_to_decimal_conversion_detected",
                     value=value,
                     precision_warning="Potential precision loss",
                 )
@@ -57,6 +63,8 @@ def quantize_size(value: Decimal, min_size: Decimal = Decimal("0.01")) -> Decima
     Token size standard: Market-dependent minimum.
     Rounds down to prevent attempting to trade fractional tokens.
     """
+    if value < min_size:
+        return Decimal("0")
     return value.quantize(min_size, rounding=ROUND_DOWN)
 
 
@@ -65,8 +73,10 @@ def validate_precision(value: Decimal, max_decimal_places: int = 18) -> bool:
     Validate that a Decimal doesn't exceed precision limits.
     Returns False if value would lose precision in EVM calculations.
     """
-    normalized = value.normalize()
-    return abs(normalized.as_tuple().exponent) <= max_decimal_places
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int):
+        return abs(exponent) <= max_decimal_places
+    return True
 
 
 def to_timeout_float(value: Union[Decimal, float, int]) -> float:
@@ -74,3 +84,9 @@ def to_timeout_float(value: Union[Decimal, float, int]) -> float:
     if isinstance(value, Decimal):
         return value.__float__()
     return float(value)
+
+
+def format_for_api(value: Decimal) -> str:
+    """Convert Decimal to plain string without scientific notation."""
+    rendered = f"{safe_decimal(value):.18f}"
+    return rendered.rstrip("0").rstrip(".")

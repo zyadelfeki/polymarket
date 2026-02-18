@@ -13,9 +13,9 @@ import asyncio
 import time
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP, getcontext
-from typing import Optional, Dict, List, Any, Callable, Awaitable, TypeVar, TypedDict
+from typing import Optional, Dict, List, Any, Callable, Awaitable, TypeVar
 from enum import Enum
 try:
     import structlog
@@ -76,6 +76,9 @@ else:
         def error(self, event: str, **kwargs):
             self._log(logging.ERROR, event, **kwargs)
 
+        def exception(self, event: str, **kwargs):
+            self._log(logging.ERROR, event, exc_info=True, **kwargs)
+
         def critical(self, event: str, **kwargs):
             self._log(logging.CRITICAL, event, **kwargs)
 
@@ -85,6 +88,7 @@ from services.error_codes import ErrorCode
 from services.correlation_context import CorrelationContext, inject_correlation
 from services.validators import BoundaryValidator
 from services.network_health import NetworkHealthMonitor
+from execution.order_types import OrderResult
 from utils.decimal_helpers import to_decimal, safe_decimal, quantize_price, quantize_quantity
 
 T = TypeVar("T")
@@ -94,16 +98,6 @@ class OrderSide(Enum):
     """Order side enum"""
     BUY = "BUY"
     SELL = "SELL"
-
-
-class OrderResult(TypedDict):
-    """Immutable execution contract - enforced on ALL code paths."""
-    success: bool
-    order_id: Optional[str]
-    error: Optional[str]
-    filled_size: Optional[Decimal]
-    avg_price: Optional[Decimal]
-    timestamp: float
 
 
 class OrderResultDict(dict):
@@ -231,6 +225,7 @@ class PolymarketClientV2:
             paper_trading: If True, simulate trades
         """
         self.host = "https://clob.polymarket.com"
+        self.clob_base_url = self.host
         self.chain_id = 137  # Polygon Mainnet
         
         self.private_key = private_key
@@ -242,6 +237,7 @@ class PolymarketClientV2:
         
         # Load proxy address from environment
         self.proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
+        self.wallet_address = self.proxy_address
         
         # Initialize Web3 for balance checks (optional)
         if Web3:
@@ -454,6 +450,8 @@ class PolymarketClientV2:
             # Step 2: Derive wallet address
             account = Account.from_key(self.private_key)
             self.address = account.address
+            if not self.wallet_address:
+                self.wallet_address = self.address
             logger.info("wallet_address_derived", address=self.address)
             
             # Step 3: For LIVE mode, derive API credentials NOW
@@ -846,7 +844,11 @@ class PolymarketClientV2:
 
         correlation_id = correlation_id or CorrelationContext.get()
         side_str = side.value if isinstance(side, OrderSide) else str(side)
-        if side_str.upper() not in {"BUY", "SELL"}:
+        normalized_side = side_str.strip().upper()
+        if normalized_side in {"YES", "NO"}:
+            normalized_side = "BUY"
+
+        if normalized_side not in {"BUY", "SELL"}:
             logger.error(
                 "invalid_order_input",
                 **inject_correlation({
@@ -916,7 +918,7 @@ class PolymarketClientV2:
                 order_id=order_id,
                 market=market_id,
                 token=token_id,
-                side=side,
+                side=normalized_side,
                 price=str(price_dec),
                 size=str(size_dec),
                 correlation_id=correlation_id
@@ -953,7 +955,7 @@ class PolymarketClientV2:
                 "placing_live_order",
                 market=market_id,
                 token=token_id,
-                side=side,
+                side=normalized_side,
                 price=str(price_dec),
                 size=str(size_dec),
                 correlation_id=correlation_id
@@ -968,11 +970,11 @@ class PolymarketClientV2:
                 except Exception:
                     logger.debug("idempotency_header_set_failed", correlation_id=correlation_id)
 
-            order_side = SELL if side_str.upper() == "SELL" else BUY
+            order_side = SELL if normalized_side == "SELL" else BUY
             order = OrderArgs(
                 token_id=token_id,
-                price=price_dec.__float__(),
-                size=size_dec.__float__(),
+                price=price_dec,
+                size=size_dec,
                 side=order_side
             )
 
@@ -1066,6 +1068,43 @@ class PolymarketClientV2:
 
         logger.error("wallet_balance_unavailable", reason="unsupported_client")
         return None
+
+    async def get_live_balance(self) -> Optional[Decimal]:
+        """Fetch available collateral balance from CLOB balances endpoint."""
+        if self.paper_trading:
+            balance_raw = os.getenv("PAPER_TRADING_BALANCE") or os.getenv("INITIAL_CAPITAL") or "0"
+            try:
+                return Decimal(str(balance_raw))
+            except Exception:
+                return Decimal("0")
+
+        balance_address = self.wallet_address or self.proxy_address or self.address
+        if not balance_address:
+            logger.error("live_balance_address_missing")
+            return None
+
+        try:
+            import httpx
+
+            async def _fetch_live_balance() -> Optional[Decimal]:
+                await self._throttle()
+                url = f"{self.clob_base_url}/balances/{balance_address}"
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.get(url)
+                    if response.status_code != 200:
+                        logger.error("balance_fetch_failed", status=response.status_code)
+                        return None
+
+                    data = response.json()
+                    collateral_raw = data.get("collateral", "0") if isinstance(data, dict) else "0"
+                    balance = Decimal(str(collateral_raw)) / Decimal("1000000")
+                    logger.info("live_balance_fetched", balance=str(balance), address=balance_address)
+                    return balance
+
+            return await self._execute_with_retries("get_live_balance", _fetch_live_balance)
+        except Exception as e:
+            logger.error("balance_fetch_error", error=str(e))
+            return None
     
     async def get_markets(
         self,
@@ -1217,6 +1256,13 @@ class PolymarketClientV2:
         return filtered
 
     def _extract_market_end_datetime(self, market: Dict) -> Optional[datetime]:
+        def _from_unix_decimal(value: Any) -> datetime:
+            seconds_decimal = safe_decimal(value)
+            whole_seconds = int(seconds_decimal)
+            micros_decimal = (seconds_decimal - Decimal(whole_seconds)) * Decimal("1000000")
+            microseconds = int(micros_decimal)
+            return datetime.fromtimestamp(whole_seconds, tz=timezone.utc) + timedelta(microseconds=microseconds)
+
         end_fields = [
             "end_date_iso",
             "endDateIso",
@@ -1259,10 +1305,10 @@ class PolymarketClientV2:
                         return parsed.replace(tzinfo=timezone.utc)
                     return parsed.astimezone(timezone.utc)
                 numeric = Decimal(text)
-                return datetime.fromtimestamp(float(numeric), tz=timezone.utc)
+                return _from_unix_decimal(numeric)
 
             if isinstance(raw_value, (int, float, Decimal)):
-                return datetime.fromtimestamp(float(raw_value), tz=timezone.utc)
+                return _from_unix_decimal(raw_value)
         except Exception:
             return None
 

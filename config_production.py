@@ -4,6 +4,11 @@ STARTING_CAPITAL = Decimal("13.98")
 
 KELLY_CONFIG = {
     "fractional_kelly": Decimal("0.25"),
+    "aggressive_kelly": Decimal("1.0"),
+    "conservative_kelly": Decimal("0.25"),
+    "growth_mode_threshold": Decimal("200.0"),
+    "growth_max_bet_pct": Decimal("20.0"),
+    "round_up_min_edge": Decimal("0.03"),
     "max_bet_pct": Decimal("5.0"),
     "min_edge_required": Decimal("0.02"),
     "min_confidence": Decimal("0.65"),
@@ -13,6 +18,7 @@ CIRCUIT_BREAKER_CONFIG = {
     "max_daily_loss": Decimal("2.00"),
     "max_drawdown_pct": Decimal("25.0"),
     "max_consecutive_losses": 5,
+    "adaptive_risk_profile": True,
     "max_single_trade_loss": Decimal("0.70"),
     "cooldown_after_trip_seconds": 3600,
 }

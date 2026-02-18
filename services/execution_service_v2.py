@@ -262,6 +262,16 @@ class OrderState:
             retries=self.retries
         )
 
+    @property
+    def is_complete(self) -> bool:
+        return self.status in [
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+            OrderStatus.FAILED,
+            OrderStatus.EXPIRED,
+        ]
+
 
 class ExecutionServiceV2:
     """
@@ -1278,6 +1288,23 @@ class ExecutionServiceV2:
         
         logger.info("orders_cancelled", count=cancelled)
         return cancelled
+
+    async def cleanup_old_orders(self, max_age_seconds: int = 3600) -> int:
+        """Remove completed orders older than the provided age threshold."""
+        async with self.order_lock:
+            stale_order_ids = [
+                order_id
+                for order_id, order in self.orders.items()
+                if order.is_complete and order.age_seconds > max_age_seconds
+            ]
+
+            for order_id in stale_order_ids:
+                del self.orders[order_id]
+
+        if stale_order_ids:
+            logger.info("orders_cleaned_up", count=len(stale_order_ids), source="manual_cleanup")
+
+        return len(stale_order_ids)
     
     def get_metrics(self) -> Dict:
         avg_execution_time = (
