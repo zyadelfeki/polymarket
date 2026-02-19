@@ -37,6 +37,62 @@ from validation.models import TradingConfig
 from strategies.latency_arbitrage_btc import LatencyArbitrageEngine as MultiTimeframeLatencyArbitrageEngine
 from utils.decimal_helpers import quantize_quantity, to_decimal
 
+# Charlie integration — new modules
+from state.order_store import OrderStore, OrderState
+from risk.performance_tracker import PerformanceTracker
+from risk.kelly_sizing import KellySizer
+from integrations.charlie_booster import CharliePredictionGate, TradeRecommendation
+from config_production import (
+    CHARLIE_CONFIG,
+    KELLY_CONFIG,
+    ORDER_STORE_CONFIG,
+    PERFORMANCE_TRACKER_CONFIG,
+    REGIME_RISK_OVERRIDES,
+    GLOBAL_RISK_BUDGET,
+    STARTING_CAPITAL,
+)
+from services.portfolio_state import PortfolioState
+from services.do_not_trade import DoNotTradeRegistry
+
+
+def _build_model_feedback_callback():
+    """
+    Return a sync callable ``(was_correct: bool) -> None`` that propagates
+    settled-trade outcomes back into Charlie's ensemble engine accuracy weights.
+
+    The callback is intentionally lazy: it imports the ensemble engine on first
+    call so that it never blocks startup (engine is optional).
+
+    All 5 model names are updated with the same correctness flag because we
+    have a consensus signal, not per-model attribution.
+    """
+    _MODEL_NAMES = (
+        "random_forest", "xgboost", "neural_network", "svm", "lstm",
+    )
+
+    def _callback(was_correct: bool) -> None:
+        try:
+            # Reach into the module-level singleton that ``signals.py`` lazily
+            # initialises so we don't construct a second engine.
+            import sys, os
+            charlie_root = os.getenv("CHARLIE_PATH", "")
+            if charlie_root and charlie_root not in sys.path:
+                sys.path.insert(0, charlie_root)
+            from src.api import signals as _signals_mod  # type: ignore
+            engine = _signals_mod._ensemble_engine
+            if engine is None:
+                return
+            for model_name in _MODEL_NAMES:
+                engine.update_model_performance(model_name, was_correct)
+        except Exception as exc:
+            # Feedback is best-effort — never crash a settled-trade update
+            import logging
+            logging.getLogger(__name__).warning(
+                "model_feedback_callback_error", error=str(exc)
+            )
+
+    return _callback
+
 logger = structlog.get_logger(__name__)
 
 
@@ -69,6 +125,17 @@ class TradingSystem:
         self.strategy_engine: Optional[MultiTimeframeLatencyArbitrageEngine] = None
         self.strategy_scan_lock = asyncio.Lock()
         self.last_strategy_scan_at = 0.0
+
+        # Charlie integration components
+        self.order_store: Optional[OrderStore] = None
+        self.performance_tracker: Optional[PerformanceTracker] = None
+        self.kelly_sizer: Optional[KellySizer] = None
+        self.charlie_gate: Optional[CharliePredictionGate] = None
+        self.portfolio_state: Optional[PortfolioState] = None
+        self.do_not_trade: DoNotTradeRegistry = DoNotTradeRegistry(
+            path="data/do_not_trade.json",
+            auto_load=True,
+        )
         self.last_discovered_markets = []
         startup_config = config.get('startup', {})
         self.init_timeout_seconds = float(startup_config.get('component_timeout_seconds', 25.0))
@@ -321,6 +388,17 @@ class TradingSystem:
             )
             return
 
+        # --- DoNotTrade check — before any API calls or risk calculations ---
+        if self.do_not_trade.is_blocked(market_id):
+            logger.info(
+                "opportunity_skipped",
+                reason="do_not_trade_registry",
+                market_id=market_id,
+                entry=self.do_not_trade.all_blocked().get(market_id, {}),
+                trigger=trigger,
+            )
+            return
+
         try:
             edge = to_decimal(opportunity.get("edge"))
         except Exception:
@@ -458,6 +536,113 @@ class TradingSystem:
                 return
 
         confidence = self._resolve_opportunity_confidence(opportunity.get("confidence"))
+
+        # --- Charlie gate: mandatory signal check before any order -----------
+        charlie_rec: Optional[TradeRecommendation] = None
+        charlie_p_win: Optional[Decimal] = None
+        charlie_conf_dec: Optional[Decimal] = None
+        charlie_regime: Optional[str] = None
+
+        if self.charlie_gate is not None:
+            # Map opportunity symbol to Charlie vocab (default BTC)
+            opp_symbol = str(opportunity.get("symbol") or opportunity.get("btc_symbol") or "BTC")
+            charlie_rec = await self._safe_await(
+                "charlie_gate.evaluate_market",
+                self.charlie_gate.evaluate_market(
+                    market_id=market_id,
+                    market_price=price,
+                    symbol=opp_symbol,
+                    timeframe="15m",
+                    bankroll=equity,
+                    override_win_rate=(
+                        self.performance_tracker.get_rolling_win_rate(20)
+                        if self.performance_tracker is not None
+                        else None
+                    ),
+                ),
+                timeout_seconds=10.0,
+                default=None,
+            )
+
+            if charlie_rec is None:
+                logger.info(
+                    "order_blocked_no_charlie_signal",
+                    market_id=market_id,
+                    trigger=trigger,
+                )
+                return
+
+            # Adopt Charlie's recommended side and Kelly size
+            side = charlie_rec.side
+            quantity = quantize_quantity(charlie_rec.size / price) if price > Decimal("0") else quantity
+            order_value = quantize_quantity(quantity * price)
+            charlie_p_win  = Decimal(str(charlie_rec.p_win))
+            charlie_conf_dec = Decimal(str(charlie_rec.confidence))
+            charlie_regime = charlie_rec.regime
+
+            # --- Regime-based position-size multiplier ----------------------
+            # Scale down (or up) Kelly size according to the detected technical
+            # regime.  HIGH_VOL → 50% of Kelly; UNKNOWN → 60%; etc.  Never
+            # allows the multiplier to INCREASE size beyond the hard Kelly cap.
+            technical_regime = getattr(charlie_rec, "technical_regime", "UNKNOWN")
+            regime_mult = REGIME_RISK_OVERRIDES.get(technical_regime, Decimal("0.60"))
+            regime_mult = min(regime_mult, Decimal("1.0"))  # cap at 1× regardless of config
+            if regime_mult < Decimal("1.0"):
+                quantity = quantize_quantity(quantity * regime_mult)
+                order_value = quantize_quantity(quantity * price)
+                logger.info(
+                    "regime_size_adjustment",
+                    market_id=market_id,
+                    technical_regime=technical_regime,
+                    multiplier=str(regime_mult),
+                    adjusted_order_value=str(order_value),
+                )
+
+            # --- Global + per-market risk budget check ----------------------
+            # Refresh the portfolio snapshot so we have an up-to-date view
+            # of total exposure before committing this trade.
+            if self.portfolio_state is not None:
+                self.portfolio_state.update_equity(equity)
+                await self._safe_await(
+                    "portfolio_state.refresh.pre_trade",
+                    self.portfolio_state.refresh(),
+                )
+                if not self.portfolio_state.within_global_budget(order_value):
+                    logger.warning(
+                        "order_blocked_global_risk_budget_exceeded",
+                        market_id=market_id,
+                        proposed_size=str(order_value),
+                        total_exposure=str(self.portfolio_state.total_exposure),
+                        equity=str(equity),
+                        trigger=trigger,
+                    )
+                    return
+                if not self.portfolio_state.within_market_budget(market_id, order_value):
+                    logger.warning(
+                        "order_blocked_per_market_budget_exceeded",
+                        market_id=market_id,
+                        proposed_size=str(order_value),
+                        market_exposure=str(self.portfolio_state.exposure_for_market(market_id)),
+                        equity=str(equity),
+                        trigger=trigger,
+                    )
+                    return
+
+            if order_value < min_position_size:
+                logger.info(
+                    "order_blocked_kelly_size_too_small",
+                    market_id=market_id,
+                    order_value=str(order_value),
+                    min_position_size=str(min_position_size),
+                    trigger=trigger,
+                )
+                return
+        else:
+            logger.warning(
+                "charlie_gate_not_initialised — proceeding without Charlie (should not happen in production)",
+                market_id=market_id,
+            )
+
         metadata = {
             "trigger": trigger,
             "outcome": side,
@@ -466,7 +651,36 @@ class TradingSystem:
             "confidence": str(confidence),
             "question": str(opportunity.get("question") or ""),
             "btc_price": str(opportunity.get("btc_price")) if opportunity.get("btc_price") is not None else None,
+            "charlie_p_win": str(charlie_p_win) if charlie_p_win is not None else None,
+            "charlie_confidence": str(charlie_conf_dec) if charlie_conf_dec is not None else None,
+            "charlie_regime": charlie_regime,
+            "charlie_edge": str(charlie_rec.edge) if charlie_rec is not None else None,
+            "charlie_implied_prob": str(charlie_rec.implied_prob) if charlie_rec is not None else None,
         }
+
+        # Write CREATED row to persistent order ledger before sending to exchange
+        if self.order_store is not None:
+            pre_order_id = f"pre_{market_id}_{token_id}_{int(asyncio.get_event_loop().time()*1000)}"
+            await self._safe_await(
+                "order_store.upsert_pre_order",
+                self.order_store.upsert_order(
+                    order_id=pre_order_id,
+                    market_id=market_id,
+                    token_id=token_id,
+                    outcome=side,
+                    side="BUY",
+                    size=order_value,
+                    price=price,
+                    state=OrderState.CREATED,
+                    charlie_p_win=charlie_p_win,
+                    charlie_conf=charlie_conf_dec,
+                    charlie_regime=charlie_regime,
+                    strategy="latency_arbitrage_btc",
+                    notes=charlie_rec.reason if charlie_rec else None,
+                ),
+            )
+        else:
+            pre_order_id = None
 
         logger.info(
             "order_submission_attempt",
@@ -478,6 +692,9 @@ class TradingSystem:
             price=str(price),
             order_value=str(order_value),
             edge=str(edge),
+            charlie_p_win=str(charlie_p_win),
+            charlie_confidence=str(charlie_conf_dec),
+            charlie_regime=charlie_regime,
             trigger=trigger,
         )
 
@@ -491,6 +708,46 @@ class TradingSystem:
             price=price,
             metadata=metadata,
         )
+
+        # --- Update order ledger with exchange result ---------------------
+        if self.order_store is not None and result is not None:
+            exchange_order_id = getattr(result, "order_id", None) or pre_order_id or ""
+            if result.success and exchange_order_id:
+                filled_qty = getattr(result, "filled_quantity", None) or getattr(result, "filled_size", None)
+                new_state = OrderState.FILLED if (filled_qty and filled_qty > Decimal("0")) else OrderState.SUBMITTED
+                # If we have a real exchange ID, upsert with it; otherwise transition the pre-order
+                if exchange_order_id != pre_order_id:
+                    await self._safe_await(
+                        "order_store.upsert_submitted",
+                        self.order_store.upsert_order(
+                            order_id=exchange_order_id,
+                            market_id=market_id,
+                            token_id=token_id,
+                            outcome=side,
+                            side="BUY",
+                            size=order_value,
+                            price=price,
+                            state=new_state,
+                            charlie_p_win=charlie_p_win,
+                            charlie_conf=charlie_conf_dec,
+                            charlie_regime=charlie_regime,
+                            strategy="latency_arbitrage_btc",
+                            notes=charlie_rec.reason if charlie_rec else None,
+                        ),
+                    )
+                else:
+                    await self._safe_await(
+                        "order_store.transition_submitted",
+                        self.order_store.transition_state(exchange_order_id, new_state),
+                    )
+            elif not result.success and pre_order_id:
+                await self._safe_await(
+                    "order_store.transition_error",
+                    self.order_store.transition_state(
+                        pre_order_id, OrderState.ERROR,
+                        notes=str(getattr(result, "error", "unknown"))
+                    ),
+                )
 
         if not result.success:
             logger.error(
@@ -676,24 +933,6 @@ class TradingSystem:
             logger.info("component_construct_success", component="execution_service")
             await self._await_step("execution_service.start", self.execution.start())
 
-            # 6.5 Strategy Engine
-            strategy_cfg = self.config.get('strategies', {}).get('latency_arb', {})
-            strategy_enabled = bool(strategy_cfg.get('enabled', True))
-            if strategy_enabled:
-                logger.info("component_construct_begin", component="latency_arb_strategy")
-                self.strategy_engine = MultiTimeframeLatencyArbitrageEngine(
-                    binance_ws=self.websocket,
-                    polymarket_client=self.api_client,
-                    charlie_predictor=None,
-                    config=strategy_cfg,
-                    execution_service=None,
-                    kelly_sizer=None,
-                    redis_subscriber=None,
-                )
-                logger.info("component_construct_success", component="latency_arb_strategy")
-            else:
-                logger.warning("strategy_disabled", strategy="latency_arb")
-            
             # 7. Health Monitor
             monitor_config = self.config.get('monitoring', {})
             
@@ -724,7 +963,92 @@ class TradingSystem:
             logger.info("health_monitor_initialized")
 
             await self._market_discovery_probe()
-            
+
+            # --- Charlie integration components ---
+            # 8. Order Store
+            order_store_path = ORDER_STORE_CONFIG.get("db_path", "data/orders_ledger.db")
+            logger.info("component_construct_begin", component="order_store")
+            self.order_store = OrderStore(db_path=order_store_path)
+            await self._await_step("order_store.initialize", self.order_store.initialize())
+            logger.info("component_construct_success", component="order_store", path=order_store_path)
+
+            # 9. Kelly Sizer
+            logger.info("component_construct_begin", component="kelly_sizer")
+            self.kelly_sizer = KellySizer(config=KELLY_CONFIG)
+            logger.info("component_construct_success", component="kelly_sizer")
+
+            # 10. Charlie Prediction Gate
+            charlie_min_edge = CHARLIE_CONFIG.get("min_edge", Decimal("0.05"))
+            charlie_min_conf = CHARLIE_CONFIG.get("min_confidence", Decimal("0.60"))
+            charlie_regimes = CHARLIE_CONFIG.get("allowed_regimes", None)
+            charlie_timeout = float(CHARLIE_CONFIG.get("signal_timeout_seconds", 8.0))
+            logger.info("component_construct_begin", component="charlie_gate")
+            self.charlie_gate = CharliePredictionGate(
+                kelly_sizer=self.kelly_sizer,
+                min_edge=Decimal(str(charlie_min_edge)),
+                min_confidence=Decimal(str(charlie_min_conf)),
+                allowed_regimes=charlie_regimes,
+                signal_timeout=charlie_timeout,
+            )
+            logger.info(
+                "component_construct_success",
+                component="charlie_gate",
+                min_edge=str(charlie_min_edge),
+                min_confidence=str(charlie_min_conf),
+            )
+
+            # 11. Performance Tracker
+            logger.info("component_construct_begin", component="performance_tracker")
+            self.performance_tracker = PerformanceTracker(
+                order_store=self.order_store,
+                ledger=self.ledger,
+                initial_capital=STARTING_CAPITAL,
+                model_feedback_callback=_build_model_feedback_callback(),
+            )
+            await self._safe_await(
+                "performance_tracker.refresh",
+                self.performance_tracker.refresh(),
+            )
+            logger.info(
+                "component_construct_success",
+                component="performance_tracker",
+                **{k: str(v) for k, v in self.performance_tracker.get_summary().items()},
+            )
+
+            # 12. Strategy Engine — wired with live charlie_gate, execution, kelly_sizer
+            # Must be constructed AFTER steps 9–11 so all dependencies are real instances.
+            strategy_cfg = self.config.get('strategies', {}).get('latency_arb', {})
+            strategy_enabled = bool(strategy_cfg.get('enabled', True))
+            if strategy_enabled:
+                logger.info("component_construct_begin", component="latency_arb_strategy")
+                self.strategy_engine = MultiTimeframeLatencyArbitrageEngine(
+                    binance_ws=self.websocket,
+                    polymarket_client=self.api_client,
+                    charlie_predictor=self.charlie_gate,
+                    config=strategy_cfg,
+                    execution_service=self.execution,
+                    kelly_sizer=self.kelly_sizer,
+                    redis_subscriber=None,
+                )
+                logger.info("component_construct_success", component="latency_arb_strategy")
+            else:
+                logger.warning("strategy_disabled", strategy="latency_arb")
+
+            # 13. Portfolio State — cached position/exposure snapshot for risk budget checks
+            budget = GLOBAL_RISK_BUDGET
+            logger.info("component_construct_begin", component="portfolio_state")
+            self.portfolio_state = PortfolioState(
+                ledger=self.ledger,
+                equity=STARTING_CAPITAL,
+                global_max_exposure_pct=float(budget.get("max_exposure_pct", Decimal("0.50"))),
+                max_per_market_pct=float(budget.get("max_per_market_pct", Decimal("0.10"))),
+            )
+            await self._safe_await(
+                "portfolio_state.refresh",
+                self.portfolio_state.refresh(force=True),
+            )
+            logger.info("component_construct_success", component="portfolio_state")
+
             logger.info("all_components_initialized")
             
         except Exception as e:
@@ -754,14 +1078,46 @@ class TradingSystem:
         try:
             # Initialize all components
             await self._await_step("initialize_components", self.initialize_components(), timeout_seconds=120.0)
-            
+
+            # --- Startup reconciliation: recover any open orders from last run ---
+            if self.order_store is not None:
+                reconcile_summary = await self._safe_await(
+                    "order_store.reconcile_open_orders",
+                    self.order_store.reconcile_open_orders(self.api_client),
+                    timeout_seconds=60.0,
+                    default={},
+                )
+                open_count = reconcile_summary.get("still_open", 0)
+                resolved_count = reconcile_summary.get("resolved_while_offline", 0)
+                recovered_pnl = reconcile_summary.get("recovered_pnl", Decimal("0"))
+                print(
+                    f"\n=== STARTUP RECONCILIATION ===\n"
+                    f"  Recovered {open_count} open order(s) across markets.\n"
+                    f"  {resolved_count} order(s) resolved while offline.\n"
+                    f"  Recovered PnL: ${recovered_pnl:.2f} USDC\n"
+                    f"==============================\n"
+                )
+                logger.info(
+                    "startup_reconciliation_complete",
+                    open_orders=open_count,
+                    resolved_offline=resolved_count,
+                    recovered_pnl=str(recovered_pnl),
+                )
+
+                # Refresh performance tracker after reconcile
+                if self.performance_tracker is not None:
+                    await self._safe_await(
+                        "performance_tracker.refresh_post_reconcile",
+                        self.performance_tracker.refresh(),
+                    )
+
             self.running = True
-            
+
             logger.info(
                 "trading_system_started",
                 status="operational"
             )
-            
+
             # Main loop
             await self._main_loop()
             
@@ -888,6 +1244,51 @@ class TradingSystem:
                 circuit_breaker_state=self.circuit_breaker.state.value if self.circuit_breaker else 'unknown'
             )
             
+            # Refresh performance tracker and enforce dynamic thresholds
+            if self.performance_tracker is not None:
+                await self._safe_await(
+                    "performance_tracker.refresh",
+                    self.performance_tracker.refresh(),
+                    timeout_seconds=10.0,
+                )
+                summary = self.performance_tracker.get_summary()
+                logger.info("performance_tracker_update", **{k: str(v) for k, v in summary.items()})
+
+                max_dd_halt = PERFORMANCE_TRACKER_CONFIG.get("max_drawdown_halt", Decimal("0.15"))
+                min_wr = PERFORMANCE_TRACKER_CONFIG.get("min_rolling_win_rate", Decimal("0.35"))
+                win_rate_sample = int(PERFORMANCE_TRACKER_CONFIG.get("win_rate_min_sample", 20))
+
+                current_dd = self.performance_tracker.get_current_drawdown()
+                if current_dd >= Decimal(str(max_dd_halt)):
+                    logger.critical(
+                        "performance_halt_drawdown",
+                        current_drawdown_pct=str(current_dd * 100),
+                        threshold_pct=str(Decimal(str(max_dd_halt)) * 100),
+                    )
+                    if self.circuit_breaker:
+                        from risk.circuit_breaker_v2 import TripReason
+                        await self._safe_await(
+                            "circuit_breaker.trip_drawdown",
+                            self.circuit_breaker.trip(TripReason.MAX_DRAWDOWN),
+                            default=None,
+                        )
+
+                rolling_wr = self.performance_tracker.get_rolling_win_rate(win_rate_sample)
+                if rolling_wr is not None and Decimal(str(rolling_wr)) < Decimal(str(min_wr)):
+                    logger.critical(
+                        "performance_halt_win_rate",
+                        rolling_win_rate=f"{rolling_wr:.2%}",
+                        threshold=str(min_wr),
+                        sample_size=win_rate_sample,
+                    )
+                    if self.circuit_breaker:
+                        from risk.circuit_breaker_v2 import TripReason
+                        await self._safe_await(
+                            "circuit_breaker.trip_loss_streak",
+                            self.circuit_breaker.trip(TripReason.LOSS_STREAK),
+                            default=None,
+                        )
+
         except Exception as e:
             logger.error(
                 "periodic_check_failed",
@@ -937,6 +1338,30 @@ class TradingSystem:
         self.shutdown_event.set()
         
         try:
+            # --- Shutdown snapshot: log final state before closing ---
+            if self.order_store is not None:
+                price_feed = getattr(self, "api_client", None)
+                snapshot = await self._safe_await(
+                    "order_store.shutdown_snapshot",
+                    self.order_store.shutdown_snapshot(price_feed=price_feed),
+                    timeout_seconds=15.0,
+                    default={},
+                )
+                print(
+                    f"\n=== SHUTDOWN SNAPSHOT ===\n"
+                    f"  Open positions     : {snapshot.get('open_positions', 'N/A')}\n"
+                    f"  Total exposure     : ${snapshot.get('total_exposure_usdc', '?')} USDC\n"
+                    f"  Mark-to-market PnL : ${snapshot.get('mark_to_market_pnl', '?')} USDC\n"
+                    f"  Realized PnL (all) : ${snapshot.get('realized_pnl_all_time', '?')} USDC\n"
+                    f"  Hit rate           : {snapshot.get('hit_rate', 'N/A')}\n"
+                    f"  Markets            : {snapshot.get('markets', [])}\n"
+                    f"========================\n"
+                )
+                await self._safe_await(
+                    "order_store.close", self.order_store.close(), timeout_seconds=5.0
+                )
+                logger.info("order_store_closed")
+
             # Stop health monitor
             if self.health_monitor:
                 await self._safe_await("health_monitor.stop", self.health_monitor.stop(), timeout_seconds=15.0)
@@ -982,9 +1407,14 @@ async def main():
     )
     parser.add_argument(
         '--mode',
-        choices=['paper', 'live'],
+        choices=['paper', 'live', 'replay'],
         default='paper',
-        help='Trading mode'
+        help='Trading mode.  "replay" re-evaluates history against current thresholds.'
+    )
+    parser.add_argument(
+        '--replay-db',
+        default='data/orders_ledger.db',
+        help='Path to the order-ledger SQLite DB used by --mode replay.'
     )
     args = parser.parse_args()
 
@@ -1016,6 +1446,12 @@ async def main():
         config = yaml.safe_load(f)
     
     # Override paper trading mode from command line
+    if args.mode == 'replay':
+        # Replay mode: re-evaluate settled order history. Never touches exchange.
+        from replay.engine import run_replay
+        await run_replay(db_path=args.replay_db)
+        return
+
     if 'trading' not in config:
         config['trading'] = {}
     config['trading']['paper_trading'] = (args.mode == 'paper')

@@ -1384,6 +1384,54 @@ class AsyncLedger:
 
         return equity
 
+    async def get_positions_by_market(self) -> List[Dict]:
+        """
+        Return aggregate exposure for every market that has at least one OPEN
+        position.
+
+        Groups by ``market_id`` so callers get a single row per market rather
+        than one row per position.  Useful for portfolio-level risk checks.
+
+        Returns a list of dicts with keys:
+          market_id      – Polymarket condition_id / market slug
+          token_id       – token ID of the first open leg (most markets have
+                           one open leg at a time)
+          open_lots      – number of open sub-positions in this market
+          total_quantity – aggregate quantity across all open legs (Decimal)
+          avg_entry_price– quantity-weighted average entry price (Decimal)
+          strategy       – strategy tag from the first open position
+        """
+        rows = await self._execute_query(
+            """
+            SELECT
+                market_id,
+                MAX(token_id)                                          AS token_id,
+                COUNT(*)                                               AS open_lots,
+                SUM(CAST(quantity AS REAL))                            AS total_quantity,
+                SUM(CAST(quantity AS REAL) * CAST(entry_price AS REAL))
+                    / NULLIF(SUM(CAST(quantity AS REAL)), 0)           AS avg_entry_price,
+                MAX(strategy)                                          AS strategy
+            FROM positions
+            WHERE status = 'OPEN'
+            GROUP BY market_id
+            ORDER BY total_quantity DESC
+            """,
+            fetch_all=True,
+        )
+        result = []
+        for row in (rows or []):
+            result.append(
+                {
+                    "market_id":        row[0],
+                    "token_id":         row[1],
+                    "open_lots":        int(row[2]),
+                    "total_quantity":   Decimal(str(row[3])) if row[3] is not None else Decimal("0"),
+                    "avg_entry_price":  Decimal(str(row[4])) if row[4] is not None else Decimal("0"),
+                    "strategy":         row[5] or "",
+                }
+            )
+        return result
+
     async def get_metrics(self) -> Dict:
         """
         Get ledger metrics.
