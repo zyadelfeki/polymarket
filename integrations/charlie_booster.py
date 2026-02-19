@@ -106,6 +106,9 @@ class TradeRecommendation:
     regime:           str       # directional: BULLISH | BEARISH | NEUTRAL
     technical_regime: str       # structural: TRENDING | MEAN_REVERTING | HIGH_VOL | LOW_VOL | UNKNOWN
     reason:           str       # structured string for order log
+    # model_votes is optional: {"random_forest": "BUY", "svm": "HOLD", ...}
+    # Stored in order_tracking.model_votes for per-model feedback on settlement.
+    model_votes:      Optional[Dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +204,8 @@ class CharliePredictionGate:
         confidence: float = float(signal["confidence"])
         regime: str = signal["regime"]
         technical_regime: str = signal.get("technical_regime", "UNKNOWN")
+        # model_votes may be present if Charlie's ensemble exposes them in the signal dict
+        model_votes: Optional[Dict] = signal.get("model_votes", None)
 
         # --- 2. Compute edge (evaluate both YES and NO directions) ----------
         yes_implied = float(market_price)
@@ -318,6 +323,7 @@ class CharliePredictionGate:
             regime=regime,
             technical_regime=technical_regime,
             reason=reason,
+            model_votes=model_votes,
         )
 
         logger.info(

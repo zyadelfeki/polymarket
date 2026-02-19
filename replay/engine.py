@@ -206,7 +206,7 @@ class ReplayEngine:
         # Regime multiplier — if multiplier is 0.0 for this regime, treat as skipped
         if self._apply_regime_overrides:
             regime = order.get("charlie_regime") or "UNKNOWN"
-            mult = REGIME_RISK_OVERRIDES.get(regime, Decimal("0.60"))
+            mult = REGIME_RISK_OVERRIDES.get(regime, Decimal("1.0"))
             if mult <= Decimal("0"):
                 return False, f"regime_blocked:{regime}"
 

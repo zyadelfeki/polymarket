@@ -156,6 +156,15 @@ class PortfolioState:
         Always returns True when equity is zero (avoid false blocks at startup
         before ledger is populated).
         """
+        if self._last_refresh_ts == 0.0:
+            # Snapshot has never been loaded — allow the trade but warn so we
+            # can detect prolonged cold-start conditions in the logs.
+            logger.warning(
+                "portfolio_state_cold_start_allowing_order",
+                method="within_global_budget",
+                proposed_size=str(proposed_size),
+            )
+            return True
         if self.equity <= Decimal("0"):
             return True
         cap = self.equity * self._global_max_exposure_pct
@@ -166,6 +175,15 @@ class PortfolioState:
         Return True if adding ``proposed_size`` to this market would keep
         per-market exposure ≤ the per-market fraction of equity.
         """
+        if self._last_refresh_ts == 0.0:
+            # Snapshot has never been loaded — allow the trade but warn.
+            logger.warning(
+                "portfolio_state_cold_start_allowing_order",
+                method="within_market_budget",
+                market_id=market_id,
+                proposed_size=str(proposed_size),
+            )
+            return True
         if self.equity <= Decimal("0"):
             return True
         cap = self.equity * self._max_per_market_pct

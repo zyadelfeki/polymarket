@@ -301,6 +301,7 @@ class ExecutionServiceV2:
         idempotency_cache: Optional[IdempotencyCache] = None,
         idempotency_manager: Optional[IdempotencyManager] = None,
         risk_aggregator: Optional[Any] = None,
+        do_not_trade_registry: Optional[Any] = None,
     ):
         self.client = polymarket_client
         self.ledger = ledger
@@ -312,6 +313,15 @@ class ExecutionServiceV2:
         self.timeout_seconds = to_decimal(self.config.get('timeout_seconds', '30'))
         self.fill_check_interval = to_decimal(self.config.get('fill_check_interval', '2.0'))
         self.max_order_age_seconds = self.config.get('max_order_age_seconds', 300)
+
+        # Auto-block threshold: if realised slippage on a successful fill exceeds
+        # this many basis points, the market gets added to the do-not-trade list.
+        # Default 200 bps (2%) — configurable via execution.auto_block_slippage_bps.
+        self._auto_block_slippage_bps: Decimal = Decimal(
+            str(self.config.get("auto_block_slippage_bps", 200))
+        )
+        # Registry for auto-blocking markets with excessive slippage.
+        self._do_not_trade_registry = do_not_trade_registry
         
         self.orders: Dict[str, OrderState] = {}
         self.order_lock = asyncio.Lock()
@@ -905,6 +915,33 @@ class ExecutionServiceV2:
             if order_state.avg_fill_price > 0:
                 slippage_bps = (order_state.avg_fill_price - price) / price * Decimal("10000")
                 self.total_slippage_bps += abs(slippage_bps)
+
+                # --- Auto-block on excessive slippage -------------------------
+                # If realised slippage exceeds the configured threshold, add the
+                # market to the do-not-trade list.  This catches venues that
+                # consistently fill at unfavourable prices before the next manual
+                # review.  Threshold defaults to 200 bps (configurable via
+                # execution.auto_block_slippage_bps).
+                if (
+                    self._do_not_trade_registry is not None
+                    and abs(slippage_bps) > self._auto_block_slippage_bps
+                ):
+                    reason = (
+                        f"auto_slippage_{abs(slippage_bps):.0f}bps"
+                        f"_threshold_{self._auto_block_slippage_bps:.0f}bps"
+                    )
+                    logger.warning(
+                        "auto_block_excessive_slippage",
+                        market_id=market_id,
+                        slippage_bps=str(slippage_bps),
+                        threshold_bps=str(self._auto_block_slippage_bps),
+                        reason=reason,
+                    )
+                    self._do_not_trade_registry.block(
+                        market_id,
+                        reason=reason,
+                        auto=True,
+                    )
 
             self.total_fees += order_state.total_fees
 

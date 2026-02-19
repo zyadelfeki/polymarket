@@ -100,25 +100,57 @@ def _load_charlie_kelly():
 
 class _BuiltinKelly:
     """
-    Pure-Python Kelly identical in behaviour to Charlie's DynamicKelly.
-    Used when project-charlie is not on sys.path.
+    Pure-Python Kelly for a binary prediction-market bet.
+
+    The true Kelly fraction for a binary outcome is:
+
+        b = (1 - q) / q       # decimal odds (net profit per $1 risked on a win)
+        f = (p * (b + 1) - 1) / b
+          = (p - q) / (1 - q)  # simplified for binary market
+
+    Where:
+        p  = estimated win probability (Charlie's p_win)
+        q  = market-implied win probability (token price)
+
+    We then apply:
+        1. Fractional-Kelly multiplier (default 0.5 = half-Kelly)
+        2. Hard cap at max_fraction
+
+    Rationale for half-Kelly default
+    ---------------------------------
+    Full Kelly maximises long-run log-wealth but is extremely sensitive to
+    model error.  At half-Kelly, expected growth rate falls by only ~25% while
+    the variance of outcomes drops by 75%.  This is the standard institutional
+    choice when the edge estimate carries uncertainty.
     """
 
-    def __init__(self, fraction: float = 0.25, max_fraction: float = 0.75):
+    def __init__(self, fraction: float = 0.5, max_fraction: float = 0.05):
+        # fraction: fractional-Kelly multiplier applied to the raw Kelly fraction
         self.fraction = fraction
         self.max_fraction = max_fraction
 
-    def optimal_fraction(self, win_rate: float, avg_win: float, avg_loss: float,
-                         volatility: float = 0.0) -> float:
-        if avg_loss <= 0 or win_rate <= 0 or avg_win <= 0:
+    def optimal_fraction(self, p_win: float, implied_prob: float) -> float:
+        """
+        Return the fractional-Kelly position size as a fraction of bankroll
+        (already multiplied by self.fraction and capped at self.max_fraction).
+
+        Returns 0.0 when there is no edge (p_win <= implied_prob).
+        """
+        q = implied_prob
+        p = p_win
+
+        # Guard against degenerate inputs
+        if q <= 0.0 or q >= 1.0 or p <= 0.0:
             return 0.0
-        b = avg_win / avg_loss
-        p = win_rate
-        q = 1.0 - p
-        base = (b * p - q) / b
-        vol_factor = 1.0 / (1.0 + max(0.0, volatility) * 2.0)
-        frac = max(0.0, base) * vol_factor * self.fraction
-        return min(frac, self.max_fraction)
+
+        # True Kelly formula for binary outcome
+        raw_f = (p - q) / (1.0 - q)
+
+        if raw_f <= 0.0:
+            return 0.0
+
+        fractional_f = raw_f * self.fraction
+        return min(fractional_f, self.max_fraction)
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +191,8 @@ class KellySizer:
     def __init__(self, config: Optional[Dict] = None) -> None:
         cfg = config or {}
 
-        # Kelly fraction multiplier (default ¼ Kelly)
-        self._fractional_kelly = float(cfg.get("fractional_kelly", Decimal("0.25")))
+        # Fractional-Kelly multiplier — default ½ Kelly (see _BuiltinKelly docstring)
+        self._fractional_kelly = float(cfg.get("fractional_kelly", Decimal("0.5")))
         # Hard floor on required edge
         self._min_edge = Decimal(str(cfg.get("min_edge_required", Decimal("0.02"))))
         # Max bet as % of bankroll
@@ -168,17 +200,14 @@ class KellySizer:
         # Minimum confidence required (checked externally, stored here for reference)
         self._min_confidence = Decimal(str(cfg.get("min_confidence", Decimal("0.65"))))
 
-        _load_charlie_kelly()
-        if _DynamicKelly is not None:
-            self._kelly = _DynamicKelly(
-                fraction=self._fractional_kelly,
-                max_fraction=float(self._max_bet_pct / Decimal("100")),
-            )
-        else:
-            self._kelly = _BuiltinKelly(
-                fraction=self._fractional_kelly,
-                max_fraction=float(self._max_bet_pct / Decimal("100")),
-            )
+        # Always use the built-in true-Kelly implementation.
+        # DynamicKelly from project-charlie uses a different parameterisation
+        # (win_rate/avg_win/avg_loss) and doesn't guarantee the correct binary
+        # Kelly formula, so we bypass it here.
+        self._kelly = _BuiltinKelly(
+            fraction=self._fractional_kelly,
+            max_fraction=float(self._max_bet_pct / Decimal("100")),
+        )
 
     def compute_size(
         self,
@@ -233,28 +262,33 @@ class KellySizer:
                 edge=edge,
             )
 
-        # --- Kelly inputs ------------------------------------------------
-        # avg_win: if we win, we collect (1/implied_prob - 1) per dollar
-        # avg_loss: if we lose, we lose 1.0 (the entire bet)
-        b_ratio = max(1e-6, (1.0 - implied_prob) / implied_prob)  # odds b
-        effective_win_rate = override_win_rate if override_win_rate is not None else p_win
+        # --- True Kelly fraction (binary prediction market) ----------------
+        # f_raw = (p_win - implied_prob) / (1 - implied_prob)
+        # f_half = f_raw * fractional_kelly_multiplier  (built into _BuiltinKelly)
+        # Capped at max_bet_pct / 100  (also built into _BuiltinKelly)
+        #
+        # Why bypass the avg_win / avg_loss parameterisation:
+        #   In a binary prediction market a $1 bet on a YES token worth $q pays
+        #   $(1/q) on WIN and $0 on LOSS.  The odds b = (1-q)/q and the true
+        #   Kelly fraction f = (p*(b+1)-1)/b = (p-q)/(1-q).  Using
+        #   avg_win=b*100 and avg_loss=100 gives the same result algebraically
+        #   but introduces floating-point noise and a hidden coupling between
+        #   the volatility damping factor in the old formula and the edge
+        #   estimate.  We drop the volatility damping here because the Kelly
+        #   fraction already accounts for uncertainty through fractional sizing.
 
-        # Call either Charlie's DynamicKelly or the built-in fallback
-        if _KellyInput is not None and _DynamicKelly is not None:
-            ki = _KellyInput(
-                win_rate=effective_win_rate,
-                avg_win=b_ratio * 100.0,   # % return on win
-                avg_loss=100.0,            # % lost on a loss
-                volatility=volatility * 100.0,
-            )
-            raw_frac = float(self._kelly.optimal_fraction(ki))  # type: ignore[arg-type]
-        else:
-            raw_frac = self._kelly.optimal_fraction(  # type: ignore[call-arg]
-                win_rate=effective_win_rate,
-                avg_win=b_ratio * 100.0,
-                avg_loss=100.0,
-                volatility=volatility * 100.0,
-            )
+        # If the tracker has enough history, prefer its empirical win rate over
+        # the model's self-reported p_win — it anchors sizing on actual accuracy.
+        effective_win_rate: float = (
+            float(override_win_rate)
+            if override_win_rate is not None
+            else float(p_win)
+        )
+
+        raw_frac = self._kelly.optimal_fraction(
+            p_win=effective_win_rate,
+            implied_prob=implied_prob,
+        )
 
         kelly_fraction = Decimal(str(raw_frac))
 

@@ -239,6 +239,31 @@ CREATE TABLE IF NOT EXISTS idempotency_log (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency_key ON idempotency_log(idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_idempotency_order ON idempotency_log(order_id);
+
+CREATE TABLE IF NOT EXISTS order_tracking (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id       TEXT    NOT NULL UNIQUE,
+    market_id      TEXT    NOT NULL,
+    token_id       TEXT    NOT NULL DEFAULT '',
+    outcome        TEXT    NOT NULL,
+    side           TEXT    NOT NULL DEFAULT 'BUY',
+    size           TEXT    NOT NULL,
+    price          TEXT    NOT NULL,
+    order_state    TEXT    NOT NULL DEFAULT 'CREATED',
+    opened_at      TEXT    NOT NULL,
+    closed_at      TEXT,
+    pnl            TEXT,
+    charlie_p_win  TEXT,
+    charlie_conf   TEXT,
+    charlie_regime TEXT,
+    strategy       TEXT,
+    model_votes    TEXT,
+    notes          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_tracking_state  ON order_tracking(order_state);
+CREATE INDEX IF NOT EXISTS idx_order_tracking_market ON order_tracking(market_id);
+CREATE INDEX IF NOT EXISTS idx_order_tracking_opened ON order_tracking(opened_at);
 """
 
 
@@ -1383,6 +1408,317 @@ class AsyncLedger:
         logger.debug("equity_fetched", equity=str(equity))
 
         return equity
+
+    # ------------------------------------------------------------------ order tracking
+
+    # Lifecycle states that indicate an order is still active.
+    _OPEN_ORDER_STATES = frozenset({
+        "CREATED", "SUBMITTED", "PARTIALLY_FILLED", "FILLED",
+    })
+    _TERMINAL_ORDER_STATES = frozenset({
+        "CANCELLED", "EXPIRED", "SETTLED", "ERROR",
+    })
+
+    async def record_order_created(
+        self,
+        *,
+        order_id: str,
+        market_id: str,
+        token_id: str = "",
+        outcome: str,
+        side: str = "BUY",
+        size: Decimal,
+        price: Decimal,
+        charlie_p_win: Optional[Decimal] = None,
+        charlie_conf: Optional[Decimal] = None,
+        charlie_regime: Optional[str] = None,
+        strategy: Optional[str] = None,
+        model_votes: Optional[Dict] = None,
+        notes: Optional[str] = None,
+    ) -> None:
+        """
+        Insert a new order row in state CREATED (idempotent on order_id).
+
+        Called immediately before the API call so a crash after submission
+        still leaves a CREATED row that reconcile_open_orders() will pick up
+        and reconcile on the next startup.
+        """
+        import json as _json
+        now = datetime.now(timezone.utc).isoformat()
+        votes_json = _json.dumps(model_votes) if model_votes is not None else None
+        await self.execute(
+            """
+            INSERT INTO order_tracking
+                (order_id, market_id, token_id, outcome, side, size, price,
+                 order_state, opened_at, charlie_p_win, charlie_conf,
+                 charlie_regime, strategy, model_votes, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'CREATED', ?,
+                    ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(order_id) DO NOTHING
+            """,
+            (
+                order_id,
+                market_id,
+                token_id,
+                outcome.upper(),
+                side.upper(),
+                str(size),
+                str(price),
+                now,
+                str(charlie_p_win) if charlie_p_win is not None else None,
+                str(charlie_conf) if charlie_conf is not None else None,
+                charlie_regime,
+                strategy,
+                votes_json,
+                notes,
+            ),
+        )
+
+    async def transition_order_state(
+        self,
+        order_id: str,
+        new_state: str,
+        *,
+        pnl: Optional[Decimal] = None,
+        notes: Optional[str] = None,
+    ) -> None:
+        """
+        Fast-path state update — only changes order_state, pnl, closed_at,
+        and notes.  Does not touch any other column.
+        """
+        closed_at = (
+            datetime.now(timezone.utc).isoformat()
+            if new_state.upper() in self._TERMINAL_ORDER_STATES
+            else None
+        )
+        await self.execute(
+            """
+            UPDATE order_tracking
+            SET order_state = ?,
+                pnl         = COALESCE(?, pnl),
+                closed_at   = COALESCE(?, closed_at),
+                notes       = COALESCE(?, notes)
+            WHERE order_id = ?
+            """,
+            (
+                new_state.upper(),
+                str(pnl) if pnl is not None else None,
+                closed_at,
+                notes,
+                order_id,
+            ),
+        )
+
+    async def get_open_orders(self) -> List[Dict]:
+        """Return all order_tracking rows in OPEN_ORDER_STATES as plain dicts."""
+        placeholders = ",".join("?" * len(self._OPEN_ORDER_STATES))
+        states = list(self._OPEN_ORDER_STATES)
+        rows = await self._execute_query(
+            f"SELECT * FROM order_tracking WHERE order_state IN ({placeholders})"
+            " ORDER BY opened_at ASC",
+            params=tuple(states),
+            fetch_all=True,
+        )
+        return [dict(zip([d[0] for d in row.description], row)) if hasattr(row, 'description') else dict(row) for row in (rows or [])]
+
+    async def _order_rows_as_dicts(self, rows) -> List[Dict]:
+        """Convert aiosqlite Row objects to plain dicts."""
+        if not rows:
+            return []
+        result = []
+        for row in rows:
+            # aiosqlite Row supports keys() and index access
+            try:
+                result.append(dict(row))
+            except TypeError:
+                # Fallback: row is a plain tuple — fetch column names via description
+                result.append({f"col_{i}": v for i, v in enumerate(row)})
+        return result
+
+    async def get_all_tracked_orders(self, limit: int = 500) -> List[Dict]:
+        """Return the most recent `limit` order tracking rows."""
+        rows = await self._execute_query(
+            "SELECT * FROM order_tracking ORDER BY opened_at DESC LIMIT ?",
+            params=(limit,),
+            fetch_all=True,
+        )
+        return await self._order_rows_as_dicts(rows)
+
+    async def reconcile_open_orders(self, api_client) -> Dict:
+        """
+        On startup: compare order_tracking open rows against current exchange
+        state and close out any that resolved while the process was offline.
+
+        Returns a summary dict that ``main.py`` logs on startup:
+          open_orders              – total rows queried
+          resolved_while_offline   – rows transitioned to SETTLED/CANCELLED/EXPIRED
+          still_open               – rows still in an open state
+          recovered_pnl            – sum of PnL for settled rows
+        """
+        placeholders = ",".join("?" * len(self._OPEN_ORDER_STATES))
+        states = list(self._OPEN_ORDER_STATES)
+        rows = await self._execute_query(
+            f"SELECT * FROM order_tracking WHERE order_state IN ({placeholders})"
+            " ORDER BY opened_at ASC",
+            params=tuple(states),
+            fetch_all=True,
+        )
+        open_orders = await self._order_rows_as_dicts(rows)
+
+        if not open_orders:
+            logger.info("ledger_reconcile_no_open_orders")
+            return {
+                "open_orders": 0,
+                "resolved_while_offline": 0,
+                "still_open": 0,
+                "recovered_pnl": Decimal("0"),
+            }
+
+        logger.info("ledger_reconcile_start", open_order_count=len(open_orders))
+        resolved_count = 0
+        still_open_count = 0
+        recovered_pnl = Decimal("0")
+
+        for row in open_orders:
+            order_id = row.get("order_id", "")
+            market_id = row.get("market_id", "")
+            size_str = row.get("size", "0")
+            price_str = row.get("price", "0")
+            size = Decimal(str(size_str))
+            price = Decimal(str(price_str))
+
+            exchange_state: Optional[str] = None
+            market_resolved = False
+            winning_side: Optional[str] = None
+            payout_per_share: Optional[Decimal] = None
+
+            try:
+                if hasattr(api_client, "get_order_status"):
+                    status = await asyncio.wait_for(
+                        api_client.get_order_status(order_id), timeout=10.0
+                    )
+                    if status:
+                        exchange_state = (status.get("status") or "").upper()
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning("ledger_reconcile_order_status_error",
+                               order_id=order_id, error=str(exc))
+
+            try:
+                if hasattr(api_client, "get_market"):
+                    market = await asyncio.wait_for(
+                        api_client.get_market(market_id), timeout=10.0
+                    )
+                    if market:
+                        market_resolved = bool(
+                            market.get("closed") or market.get("resolved")
+                        )
+                        winning_side = market.get("winning_side") or market.get("outcome")
+                        raw_payout = market.get("payout_numerator") or market.get(
+                            "payout_per_share"
+                        )
+                        if raw_payout is not None:
+                            payout_per_share = Decimal(str(raw_payout))
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning("ledger_reconcile_market_status_error",
+                               market_id=market_id, error=str(exc))
+
+            if market_resolved and payout_per_share is not None:
+                quantity = size / price if price > Decimal("0") else Decimal("0")
+                pnl = quantity * payout_per_share - size
+                await self.transition_order_state(
+                    order_id, "SETTLED", pnl=pnl,
+                    notes=f"resolved_offline winning_side={winning_side} payout={payout_per_share}",
+                )
+                recovered_pnl += pnl
+                resolved_count += 1
+                logger.info("ledger_order_settled_offline",
+                            order_id=order_id, market_id=market_id,
+                            pnl=str(pnl), winning_side=winning_side)
+
+            elif exchange_state in {"CANCELLED", "EXPIRED"}:
+                new_state = "CANCELLED" if exchange_state == "CANCELLED" else "EXPIRED"
+                await self.transition_order_state(
+                    order_id, new_state, notes="resolved_offline"
+                )
+                resolved_count += 1
+                logger.info("ledger_order_closed_offline",
+                            order_id=order_id, exchange_state=exchange_state)
+            else:
+                still_open_count += 1
+
+        summary = {
+            "open_orders": len(open_orders),
+            "resolved_while_offline": resolved_count,
+            "still_open": still_open_count,
+            "recovered_pnl": recovered_pnl,
+        }
+        logger.info("ledger_reconcile_complete",
+                    **{k: str(v) for k, v in summary.items()})
+        return summary
+
+    async def shutdown_snapshot(self, price_feed=None) -> Dict:
+        """
+        Log a final human-readable snapshot of open order exposure on shutdown.
+        Called by ``main.py`` inside ``stop()`` before closing the ledger.
+        """
+        import json as _json
+        rows = await self._execute_query(
+            "SELECT * FROM order_tracking WHERE order_state IN "
+            "('CREATED','SUBMITTED','PARTIALLY_FILLED','FILLED')"
+            " ORDER BY opened_at ASC",
+            fetch_all=True,
+        )
+        open_orders = await self._order_rows_as_dicts(rows)
+
+        total_exposure = Decimal("0")
+        mark_pnl = Decimal("0")
+
+        for row in open_orders:
+            size = Decimal(str(row.get("size", "0")))
+            total_exposure += size
+            if price_feed is not None:
+                try:
+                    mid = await asyncio.wait_for(
+                        price_feed.get_price(row["market_id"]), timeout=3.0
+                    )
+                    if mid is not None:
+                        mark_price = Decimal(str(mid))
+                        entry_price = Decimal(str(row.get("price", "0")))
+                        quantity = size / entry_price if entry_price > Decimal("0") else Decimal("0")
+                        mark_pnl += (mark_price - entry_price) * quantity
+                except Exception:
+                    pass
+
+        # Realized PnL from settled orders
+        realized_pnl_row = await self.execute_scalar(
+            "SELECT SUM(CAST(pnl AS REAL)) FROM order_tracking"
+            " WHERE order_state = 'SETTLED' AND pnl IS NOT NULL"
+        )
+        realized_pnl = (
+            Decimal(str(realized_pnl_row)) if realized_pnl_row is not None else Decimal("0")
+        )
+
+        settled_count = await self.execute_scalar(
+            "SELECT COUNT(*) FROM order_tracking WHERE order_state = 'SETTLED'"
+        ) or 0
+        win_count = await self.execute_scalar(
+            "SELECT COUNT(*) FROM order_tracking"
+            " WHERE order_state = 'SETTLED' AND CAST(pnl AS REAL) > 0"
+        ) or 0
+        hit_rate = (win_count / settled_count) if settled_count > 0 else None
+
+        snapshot = {
+            "open_positions": len(open_orders),
+            "total_exposure_usdc": str(total_exposure),
+            "mark_to_market_pnl": str(mark_pnl),
+            "realized_pnl_all_time": str(realized_pnl),
+            "hit_rate": hit_rate,
+            "markets": list({row["market_id"] for row in open_orders}),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.info("ledger_shutdown_snapshot",
+                    **{k: str(v) for k, v in snapshot.items()})
+        return snapshot
 
     async def get_positions_by_market(self) -> List[Dict]:
         """

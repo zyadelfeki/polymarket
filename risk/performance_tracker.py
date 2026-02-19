@@ -77,14 +77,22 @@ class PerformanceTracker:
         Pull the latest settled orders and current equity from both stores.
         Must be awaited before reading any metric.
         """
-        stats = await self._store.get_stats()
-        all_orders = await self._store.get_all_orders(limit=1000)
-
-        # Only settled orders with a real PnL contribute to metrics
-        self._settled_orders = [
-            o for o in all_orders
-            if o.get("state") == "SETTLED" and o.get("pnl") is not None
-        ]
+        # Support both AsyncLedger (order_tracking table) and legacy OrderStore.
+        # AsyncLedger has get_all_tracked_orders(); OrderStore has get_all_orders().
+        if hasattr(self._store, "get_all_tracked_orders"):
+            # AsyncLedger path — order_tracking table uses 'order_state' column
+            all_orders = await self._store.get_all_tracked_orders(limit=1000)
+            self._settled_orders = [
+                o for o in all_orders
+                if o.get("order_state") == "SETTLED" and o.get("pnl") is not None
+            ]
+        else:
+            # Legacy OrderStore path — uses 'state' column
+            all_orders = await self._store.get_all_orders(limit=1000)
+            self._settled_orders = [
+                o for o in all_orders
+                if o.get("state") == "SETTLED" and o.get("pnl") is not None
+            ]
 
         # Dispatch model feedback for newly-settled orders.
         # Each new settlement triggers one call to the registered callback so
@@ -97,7 +105,14 @@ class PerformanceTracker:
                     try:
                         pnl = Decimal(str(order["pnl"]))
                         was_correct = pnl > Decimal("0")
-                        self._model_feedback_callback(was_correct)
+                        # Pass the full order dict so the callback can do
+                        # per-model attribution via the stored model_votes column.
+                        import inspect as _inspect
+                        sig = _inspect.signature(self._model_feedback_callback)
+                        if len(sig.parameters) >= 2:
+                            self._model_feedback_callback(was_correct, order)
+                        else:
+                            self._model_feedback_callback(was_correct)
                         logger.debug(
                             "model_feedback_dispatched",
                             order_id=oid,

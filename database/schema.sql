@@ -140,3 +140,34 @@ CREATE TABLE IF NOT EXISTS idempotency_log (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency_key ON idempotency_log(idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_idempotency_order ON idempotency_log(order_id);
+
+-- Order lifecycle tracking (replaces state/orders_ledger.db)
+-- This table tracks the lifecycle state of every order placed by the bot.
+-- It is separate from the `positions` table (which is an accounting record of
+-- fills) because an order may go through CREATED → SUBMITTED → FILLED before
+-- a position row is written.  Keeping lifecycle state here avoids mutating the
+-- double-entry `positions` ledger for non-accounting events.
+CREATE TABLE IF NOT EXISTS order_tracking (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id       TEXT    NOT NULL UNIQUE,
+    market_id      TEXT    NOT NULL,
+    token_id       TEXT    NOT NULL DEFAULT '',
+    outcome        TEXT    NOT NULL,
+    side           TEXT    NOT NULL DEFAULT 'BUY',
+    size           TEXT    NOT NULL,
+    price          TEXT    NOT NULL,
+    order_state    TEXT    NOT NULL DEFAULT 'CREATED',
+    opened_at      TEXT    NOT NULL,
+    closed_at      TEXT,
+    pnl            TEXT,
+    charlie_p_win  TEXT,
+    charlie_conf   TEXT,
+    charlie_regime TEXT,
+    strategy       TEXT,
+    model_votes    TEXT,
+    notes          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_tracking_state    ON order_tracking(order_state);
+CREATE INDEX IF NOT EXISTS idx_order_tracking_market   ON order_tracking(market_id);
+CREATE INDEX IF NOT EXISTS idx_order_tracking_opened   ON order_tracking(opened_at);

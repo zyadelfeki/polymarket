@@ -57,33 +57,80 @@ from services.do_not_trade import DoNotTradeRegistry
 
 def _build_model_feedback_callback():
     """
-    Return a sync callable ``(was_correct: bool) -> None`` that propagates
-    settled-trade outcomes back into Charlie's ensemble engine accuracy weights.
+    Return a callable ``(was_correct: bool, order: dict) -> None`` that
+    propagates settled-trade outcomes back into Charlie's ensemble accuracy
+    weights **per model**, using the ``model_votes`` JSON stored at order
+    creation time.
 
-    The callback is intentionally lazy: it imports the ensemble engine on first
-    call so that it never blocks startup (engine is optional).
+    Per-model attribution logic
+    ---------------------------
+    At order creation, ``record_order_created`` stores the full model_votes
+    dict (e.g. {"random_forest": "BUY", "svm": "HOLD", ...}) in the
+    ``model_votes`` column.  On settlement we know the actual direction
+    (profit = UP / YES, loss = DOWN / NO).  Each model that voted in the
+    correct direction gets ``was_correct=True``; others get ``False``.
+    This lets the EWMA accuracy tracker differentiate models that are
+    systematically better or worse, rather than giving all five the same
+    lesson.
 
-    All 5 model names are updated with the same correctness flag because we
-    have a consensus signal, not per-model attribution.
+    Falls back to uniform update if ``model_votes`` is absent (legacy rows).
     """
+    import json as _json
+    import logging as _logging
+
     _MODEL_NAMES = (
         "random_forest", "xgboost", "neural_network", "svm", "lstm",
     )
+    _log = _logging.getLogger(__name__)
 
-    def _callback(was_correct: bool) -> None:
+    def _get_engine():
+        import sys, os
+        charlie_root = os.getenv("CHARLIE_PATH", "")
+        if charlie_root and charlie_root not in sys.path:
+            sys.path.insert(0, charlie_root)
+        from src.api import signals as _signals_mod  # type: ignore
+        return _signals_mod._ensemble_engine
+
+    def _callback(was_correct: bool, order: dict = None) -> None:
         try:
-            # Reach into the module-level singleton that ``signals.py`` lazily
-            # initialises so we don't construct a second engine.
-            import sys, os
-            charlie_root = os.getenv("CHARLIE_PATH", "")
-            if charlie_root and charlie_root not in sys.path:
-                sys.path.insert(0, charlie_root)
-            from src.api import signals as _signals_mod  # type: ignore
-            engine = _signals_mod._ensemble_engine
+            engine = _get_engine()
             if engine is None:
                 return
-            for model_name in _MODEL_NAMES:
-                engine.update_model_performance(model_name, was_correct)
+
+            # Try per-model attribution via stored model_votes
+            model_votes = None
+            if order is not None:
+                raw_votes = order.get("model_votes")
+                if raw_votes:
+                    try:
+                        model_votes = _json.loads(raw_votes) if isinstance(raw_votes, str) else raw_votes
+                    except Exception:
+                        model_votes = None
+
+            if model_votes and isinstance(model_votes, dict):
+                # Determine winning direction: positive PnL = YES/BUY was correct.
+                correct_vote = "BUY" if was_correct else "SELL"
+                for model_name in _MODEL_NAMES:
+                    vote = model_votes.get(model_name)
+                    if vote is None:
+                        continue
+                    model_correct = (vote == correct_vote)
+                    engine.update_model_performance(model_name, model_correct)
+                _log.debug(
+                    "per_model_feedback_dispatched",
+                    correct_direction=correct_vote,
+                    votes=model_votes,
+                )
+            else:
+                # Legacy fallback: uniform update when no model_votes are stored.
+                for model_name in _MODEL_NAMES:
+                    engine.update_model_performance(model_name, was_correct)
+                _log.debug(
+                    "uniform_model_feedback_dispatched",
+                    was_correct=was_correct,
+                    reason="no_model_votes_in_order",
+                )
+
         except Exception as exc:
             # Feedback is best-effort — never crash a settled-trade update
             import logging
@@ -582,10 +629,12 @@ class TradingSystem:
 
             # --- Regime-based position-size multiplier ----------------------
             # Scale down (or up) Kelly size according to the detected technical
-            # regime.  HIGH_VOL → 50% of Kelly; UNKNOWN → 60%; etc.  Never
-            # allows the multiplier to INCREASE size beyond the hard Kelly cap.
+            # regime.  HIGH_VOL → 50% of Kelly; etc.  UNKNOWN means we didn't
+            # have enough features to classify — pass-through at 1.0× rather
+            # than penalising the trade.  Never allows the multiplier to INCREASE
+            # size beyond the hard Kelly cap.
             technical_regime = getattr(charlie_rec, "technical_regime", "UNKNOWN")
-            regime_mult = REGIME_RISK_OVERRIDES.get(technical_regime, Decimal("0.60"))
+            regime_mult = REGIME_RISK_OVERRIDES.get(technical_regime, Decimal("1.0"))
             regime_mult = min(regime_mult, Decimal("1.0"))  # cap at 1× regardless of config
             if regime_mult < Decimal("1.0"):
                 quantity = quantize_quantity(quantity * regime_mult)
@@ -658,9 +707,30 @@ class TradingSystem:
             "charlie_implied_prob": str(charlie_rec.implied_prob) if charlie_rec is not None else None,
         }
 
-        # Write CREATED row to persistent order ledger before sending to exchange
+        # Write CREATED row to unified order ledger before sending to exchange.
+        # Stores model_votes so per-model feedback works on settlement.
+        pre_order_id = f"pre_{market_id}_{token_id}_{int(asyncio.get_event_loop().time()*1000)}"
+        if self.ledger is not None:
+            await self._safe_await(
+                "ledger.record_order_created",
+                self.ledger.record_order_created(
+                    order_id=pre_order_id,
+                    market_id=market_id,
+                    token_id=token_id,
+                    outcome=side,
+                    side="BUY",
+                    size=order_value,
+                    price=price,
+                    charlie_p_win=charlie_p_win,
+                    charlie_conf=charlie_conf_dec,
+                    charlie_regime=charlie_regime,
+                    strategy="latency_arbitrage_btc",
+                    model_votes=charlie_rec.model_votes if charlie_rec is not None else None,
+                    notes=charlie_rec.reason if charlie_rec else None,
+                ),
+            )
+        # Legacy order_store write (transition period — kept until order_store is removed)
         if self.order_store is not None:
-            pre_order_id = f"pre_{market_id}_{token_id}_{int(asyncio.get_event_loop().time()*1000)}"
             await self._safe_await(
                 "order_store.upsert_pre_order",
                 self.order_store.upsert_order(
@@ -679,8 +749,6 @@ class TradingSystem:
                     notes=charlie_rec.reason if charlie_rec else None,
                 ),
             )
-        else:
-            pre_order_id = None
 
         logger.info(
             "order_submission_attempt",
@@ -709,17 +777,17 @@ class TradingSystem:
             metadata=metadata,
         )
 
-        # --- Update order ledger with exchange result ---------------------
-        if self.order_store is not None and result is not None:
+        # --- Update unified order ledger with exchange result -------------------
+        if result is not None:
             exchange_order_id = getattr(result, "order_id", None) or pre_order_id or ""
             if result.success and exchange_order_id:
                 filled_qty = getattr(result, "filled_quantity", None) or getattr(result, "filled_size", None)
-                new_state = OrderState.FILLED if (filled_qty and filled_qty > Decimal("0")) else OrderState.SUBMITTED
-                # If we have a real exchange ID, upsert with it; otherwise transition the pre-order
-                if exchange_order_id != pre_order_id:
+                new_state_str = "FILLED" if (filled_qty and filled_qty > Decimal("0")) else "SUBMITTED"
+                # If exchange returned a new ID, create a proper row for it
+                if exchange_order_id != pre_order_id and self.ledger is not None:
                     await self._safe_await(
-                        "order_store.upsert_submitted",
-                        self.order_store.upsert_order(
+                        "ledger.record_order_submitted",
+                        self.ledger.record_order_created(
                             order_id=exchange_order_id,
                             market_id=market_id,
                             token_id=token_id,
@@ -727,27 +795,66 @@ class TradingSystem:
                             side="BUY",
                             size=order_value,
                             price=price,
-                            state=new_state,
                             charlie_p_win=charlie_p_win,
                             charlie_conf=charlie_conf_dec,
                             charlie_regime=charlie_regime,
                             strategy="latency_arbitrage_btc",
+                            model_votes=charlie_rec.model_votes if charlie_rec is not None else None,
                             notes=charlie_rec.reason if charlie_rec else None,
                         ),
                     )
-                else:
+                if self.ledger is not None:
                     await self._safe_await(
-                        "order_store.transition_submitted",
-                        self.order_store.transition_state(exchange_order_id, new_state),
+                        "ledger.transition_order_state_submitted",
+                        self.ledger.transition_order_state(
+                            exchange_order_id, new_state_str
+                        ),
                     )
+                # Legacy order_store update (transition period)
+                if self.order_store is not None:
+                    from state.order_store import OrderState as _OS
+                    _new_os = _OS.FILLED if new_state_str == "FILLED" else _OS.SUBMITTED
+                    if exchange_order_id != pre_order_id:
+                        await self._safe_await(
+                            "order_store.upsert_submitted",
+                            self.order_store.upsert_order(
+                                order_id=exchange_order_id,
+                                market_id=market_id,
+                                token_id=token_id,
+                                outcome=side,
+                                side="BUY",
+                                size=order_value,
+                                price=price,
+                                state=_new_os,
+                                charlie_p_win=charlie_p_win,
+                                charlie_conf=charlie_conf_dec,
+                                charlie_regime=charlie_regime,
+                                strategy="latency_arbitrage_btc",
+                                notes=charlie_rec.reason if charlie_rec else None,
+                            ),
+                        )
+                    else:
+                        await self._safe_await(
+                            "order_store.transition_submitted",
+                            self.order_store.transition_state(exchange_order_id, _new_os),
+                        )
             elif not result.success and pre_order_id:
-                await self._safe_await(
-                    "order_store.transition_error",
-                    self.order_store.transition_state(
-                        pre_order_id, OrderState.ERROR,
-                        notes=str(getattr(result, "error", "unknown"))
-                    ),
-                )
+                if self.ledger is not None:
+                    await self._safe_await(
+                        "ledger.transition_order_state_error",
+                        self.ledger.transition_order_state(
+                            pre_order_id, "ERROR",
+                            notes=str(getattr(result, "error", "unknown")),
+                        ),
+                    )
+                if self.order_store is not None:
+                    await self._safe_await(
+                        "order_store.transition_error",
+                        self.order_store.transition_state(
+                            pre_order_id, OrderState.ERROR,
+                            notes=str(getattr(result, "error", "unknown"))
+                        ),
+                    )
 
         if not result.success:
             logger.error(
@@ -928,7 +1035,9 @@ class TradingSystem:
                     'fill_check_interval': exec_config.get('fill_check_interval_seconds', 2),
                     'max_order_age_seconds': exec_config.get('max_order_age_seconds', 3600),
                     'max_retries': self.config.get('api', {}).get('polymarket', {}).get('max_retries', 3),
-                }
+                    'auto_block_slippage_bps': exec_config.get('auto_block_slippage_bps', 200),
+                },
+                do_not_trade_registry=self.do_not_trade,
             )
             logger.info("component_construct_success", component="execution_service")
             await self._await_step("execution_service.start", self.execution.start())
@@ -998,9 +1107,11 @@ class TradingSystem:
             )
 
             # 11. Performance Tracker
+            # Pass ledger as the order store — it now has get_all_tracked_orders()
+            # which reads from the unified order_tracking table (no split-brain).
             logger.info("component_construct_begin", component="performance_tracker")
             self.performance_tracker = PerformanceTracker(
-                order_store=self.order_store,
+                order_store=self.ledger,
                 ledger=self.ledger,
                 initial_capital=STARTING_CAPITAL,
                 model_feedback_callback=_build_model_feedback_callback(),
@@ -1080,36 +1191,36 @@ class TradingSystem:
             await self._await_step("initialize_components", self.initialize_components(), timeout_seconds=120.0)
 
             # --- Startup reconciliation: recover any open orders from last run ---
-            if self.order_store is not None:
-                reconcile_summary = await self._safe_await(
-                    "order_store.reconcile_open_orders",
-                    self.order_store.reconcile_open_orders(self.api_client),
-                    timeout_seconds=60.0,
-                    default={},
-                )
-                open_count = reconcile_summary.get("still_open", 0)
-                resolved_count = reconcile_summary.get("resolved_while_offline", 0)
-                recovered_pnl = reconcile_summary.get("recovered_pnl", Decimal("0"))
-                print(
-                    f"\n=== STARTUP RECONCILIATION ===\n"
-                    f"  Recovered {open_count} open order(s) across markets.\n"
-                    f"  {resolved_count} order(s) resolved while offline.\n"
-                    f"  Recovered PnL: ${recovered_pnl:.2f} USDC\n"
-                    f"==============================\n"
-                )
-                logger.info(
-                    "startup_reconciliation_complete",
-                    open_orders=open_count,
-                    resolved_offline=resolved_count,
-                    recovered_pnl=str(recovered_pnl),
-                )
+            # Use the ledger's order_tracking table — single source of truth.
+            reconcile_summary = await self._safe_await(
+                "ledger.reconcile_open_orders",
+                self.ledger.reconcile_open_orders(self.api_client),
+                timeout_seconds=60.0,
+                default={},
+            )
+            open_count = reconcile_summary.get("still_open", 0)
+            resolved_count = reconcile_summary.get("resolved_while_offline", 0)
+            recovered_pnl = reconcile_summary.get("recovered_pnl", Decimal("0"))
+            print(
+                f"\n=== STARTUP RECONCILIATION ===\n"
+                f"  Recovered {open_count} open order(s) across markets.\n"
+                f"  {resolved_count} order(s) resolved while offline.\n"
+                f"  Recovered PnL: ${recovered_pnl:.2f} USDC\n"
+                f"==============================\n"
+            )
+            logger.info(
+                "startup_reconciliation_complete",
+                open_orders=open_count,
+                resolved_offline=resolved_count,
+                recovered_pnl=str(recovered_pnl),
+            )
 
-                # Refresh performance tracker after reconcile
-                if self.performance_tracker is not None:
-                    await self._safe_await(
-                        "performance_tracker.refresh_post_reconcile",
-                        self.performance_tracker.refresh(),
-                    )
+            # Refresh performance tracker after reconcile
+            if self.performance_tracker is not None:
+                await self._safe_await(
+                    "performance_tracker.refresh_post_reconcile",
+                    self.performance_tracker.refresh(),
+                )
 
             self.running = True
 
@@ -1339,11 +1450,12 @@ class TradingSystem:
         
         try:
             # --- Shutdown snapshot: log final state before closing ---
-            if self.order_store is not None:
+            # Use ledger.shutdown_snapshot (order_tracking table) — single source of truth.
+            if self.ledger is not None:
                 price_feed = getattr(self, "api_client", None)
                 snapshot = await self._safe_await(
-                    "order_store.shutdown_snapshot",
-                    self.order_store.shutdown_snapshot(price_feed=price_feed),
+                    "ledger.shutdown_snapshot",
+                    self.ledger.shutdown_snapshot(price_feed=price_feed),
                     timeout_seconds=15.0,
                     default={},
                 )
@@ -1357,6 +1469,9 @@ class TradingSystem:
                     f"  Markets            : {snapshot.get('markets', [])}\n"
                     f"========================\n"
                 )
+
+            # Close legacy order_store if still present (transition period)
+            if self.order_store is not None:
                 await self._safe_await(
                     "order_store.close", self.order_store.close(), timeout_seconds=5.0
                 )
