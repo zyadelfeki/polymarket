@@ -26,7 +26,7 @@ import os
 import json
 from typing import List, Dict, Optional, Tuple, Any
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from utils.decimal_json import dumps as decimal_dumps
@@ -371,6 +371,13 @@ class ConnectionPool:
                 db_path=self.db_path
             )
             
+            # For :memory: databases each new connection gets its own isolated
+            # database, so we MUST reuse the schema-initialising connection as
+            # the only pool connection.  For file-backed DBs the normal path
+            # applies: close the temp conn after schema init, then open fresh
+            # pool connections that inherit schema from the persisted file.
+            _is_memory_db = self.db_path in (":memory:", "")
+
             # CRITICAL FIX: Create temporary connection for schema initialization
             # This ensures schema is visible to all subsequent connections
             temp_conn = await aiosqlite.connect(
@@ -518,38 +525,60 @@ class ConnectionPool:
                 raise
             
             finally:
-                # Close temporary connection - don't add to pool
-                await temp_conn.close()
-            
+                # For file-backed DBs: close the temp connection — the schema
+                # is safely persisted and new connections will see it.
+                # For :memory: DBs: do NOT close temp_conn here; we add it to
+                # the pool below so the schema is preserved.
+                if not _is_memory_db:
+                    await temp_conn.close()
+
             # CRITICAL FIX: Small delay to ensure filesystem sync (especially on Windows)
             await asyncio.sleep(0.1)
             
             # NOW create pool connections - schema is guaranteed visible
             logger.info("creating_connection_pool", pool_size=self.pool_size)
-            
-            for i in range(self.pool_size):
-                conn = await aiosqlite.connect(
-                    self.db_path,
-                    isolation_level=None
-                )
-                await conn.execute("PRAGMA foreign_keys = ON")
-                await conn.execute("PRAGMA journal_mode = WAL")
-                
-                # Verify this connection can see tables
-                cursor = await conn.execute(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
-                )
-                table_count = (await cursor.fetchone())[0]
-                
-                if table_count == 0:
-                    await conn.close()
-                    raise RuntimeError(
-                        f"Connection {i} cannot see database tables! "
-                        "This indicates a critical race condition."
+
+            if _is_memory_db:
+                # Re-use the schema-holding connection as the pool connection.
+                # Opening new connections to ':memory:' would yield fresh empty
+                # databases, losing all schema created above.
+                await self.connections.put(temp_conn)
+                logger.debug("connection_0_added_memory_reuse",
+                             table_count="verified_during_schema_init")
+                # If pool_size > 1 was requested for an in-memory DB, warn and
+                # cap at 1 — shared :memory: requires URI file mode which is
+                # outside the scope of this pool.
+                if self.pool_size > 1:
+                    logger.warning(
+                        "memory_db_pool_size_capped",
+                        requested=self.pool_size,
+                        actual=1,
+                        reason="each :memory: connection is isolated; pool capped at 1",
                     )
-                
-                await self.connections.put(conn)
-                logger.debug(f"connection_{i}_added", table_count=table_count)
+            else:
+                for i in range(self.pool_size):
+                    conn = await aiosqlite.connect(
+                        self.db_path,
+                        isolation_level=None
+                    )
+                    await conn.execute("PRAGMA foreign_keys = ON")
+                    await conn.execute("PRAGMA journal_mode = WAL")
+                    
+                    # Verify this connection can see tables
+                    cursor = await conn.execute(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+                    )
+                    table_count = (await cursor.fetchone())[0]
+                    
+                    if table_count == 0:
+                        await conn.close()
+                        raise RuntimeError(
+                            f"Connection {i} cannot see database tables! "
+                            "This indicates a critical race condition."
+                        )
+                    
+                    await self.connections.put(conn)
+                    logger.debug(f"connection_{i}_added", table_count=table_count)
             
             self._initialized = True
             logger.info(
@@ -687,42 +716,57 @@ class AsyncLedger:
         params: Tuple = (),
         fetch_one: bool = False,
         fetch_all: bool = False,
-        commit: bool = False
+        commit: bool = False,
+        as_dict: bool = False,
     ):
         """
         Execute database query with metrics.
-        
+
         Args:
-            query: SQL query
-            params: Query parameters
-            fetch_one: Return one row
-            fetch_all: Return all rows
-            commit: Commit transaction
-        
+            query:     SQL query
+            params:    Query parameters
+            fetch_one: Return one row as a tuple (or dict when as_dict=True)
+            fetch_all: Return all rows as tuples (or dicts when as_dict=True)
+            commit:    Commit transaction
+            as_dict:   When True, convert rows to dicts keyed by column name.
+                       Only order-tracking helpers should set this; all other
+                       callers rely on positional tuple access and must NOT
+                       set this flag.
+
         Returns:
             Query result or None
         """
         conn = await self.pool.acquire()
-        
+
         try:
             start_time = time.time()
-            
+
             cursor = await conn.execute(query, params)
-            
+
             result = None
             if fetch_one:
                 result = await cursor.fetchone()
                 if result and cursor.description:
                     columns = [col[0] for col in cursor.description]
-                    result = dict(zip(columns, self._convert_row(result, columns)))
+                    converted = self._convert_row(result, columns)
+                    if as_dict:
+                        result = dict(zip(columns, converted))
+                    else:
+                        result = converted
             elif fetch_all:
                 result = await cursor.fetchall()
                 if result and cursor.description:
                     columns = [col[0] for col in cursor.description]
-                    result = [
-                        dict(zip(columns, self._convert_row(row, columns)))
-                        for row in result
-                    ]
+                    if as_dict:
+                        result = [
+                            dict(zip(columns, self._convert_row(row, columns)))
+                            for row in result
+                        ]
+                    else:
+                        result = [
+                            self._convert_row(row, columns)
+                            for row in result
+                        ]
             
             if commit:
                 await conn.commit()
@@ -758,24 +802,23 @@ class AsyncLedger:
         params: Tuple = (),
         fetch_one: bool = False,
         fetch_all: bool = False,
-        commit: bool = False
+        commit: bool = False,
+        as_dict: bool = False,
     ):
         return await self._execute_query(
             query,
             params=params,
             fetch_one=fetch_one,
             fetch_all=fetch_all,
-            commit=commit
+            commit=commit,
+            as_dict=as_dict,
         )
 
     async def execute_scalar(self, query: str, params: Tuple = ()) -> Any:
+        # _execute_query returns a plain tuple; grab the first column.
         result = await self._execute_query(query, params=params, fetch_one=True)
         if not result:
             return None
-        # _execute_query now returns a dict for fetch_one; grab the first value.
-        # Legacy tuple path retained as a safety fallback.
-        if isinstance(result, dict):
-            return next(iter(result.values()), None)
         return result[0]
 
     async def record_audit_event(
@@ -1525,8 +1568,9 @@ class AsyncLedger:
             " ORDER BY opened_at ASC",
             params=tuple(states),
             fetch_all=True,
+            as_dict=True,
         )
-        return await self._order_rows_as_dicts(rows or [])
+        return rows or []
 
     async def _order_rows_as_dicts(self, rows) -> List[Dict]:
         """
@@ -1559,8 +1603,9 @@ class AsyncLedger:
             "SELECT * FROM order_tracking ORDER BY opened_at DESC LIMIT ?",
             params=(limit,),
             fetch_all=True,
+            as_dict=True,
         )
-        return await self._order_rows_as_dicts(rows)
+        return rows or []
 
     async def reconcile_open_orders(self, api_client) -> Dict:
         """
@@ -1580,8 +1625,9 @@ class AsyncLedger:
             " ORDER BY opened_at ASC",
             params=tuple(states),
             fetch_all=True,
+            as_dict=True,
         )
-        open_orders = await self._order_rows_as_dicts(rows)
+        open_orders = rows or []
 
         if not open_orders:
             logger.info("ledger_reconcile_no_open_orders")
@@ -1685,8 +1731,9 @@ class AsyncLedger:
             "('CREATED','SUBMITTED','PARTIALLY_FILLED','FILLED')"
             " ORDER BY opened_at ASC",
             fetch_all=True,
+            as_dict=True,
         )
-        open_orders = await self._order_rows_as_dicts(rows)
+        open_orders = rows or []
 
         total_exposure = Decimal("0")
         mark_pnl = Decimal("0")

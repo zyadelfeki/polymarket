@@ -713,13 +713,14 @@ class ReplayEngine:
         )
         # Record cash outflow in the double-entry ledger so equity tracks properly.
         await ledger.record_trade_entry(
+            order_id=order_id,
             market_id=market_id,
             token_id=token_id,
             strategy="replay",
-            entry_price=market_price,
+            side="BUY",
             quantity=quantity,
-            fees=Decimal("0"),
-            entry_order_id=order_id,
+            price=market_price,
+            correlation_id="replay",
         )
         await ledger.transition_order_state(order_id, "FILLED")
 
