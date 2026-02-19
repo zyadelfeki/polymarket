@@ -1419,7 +1419,20 @@ class TradingSystem:
                 )
                 if not is_balanced:
                     logger.error("ledger_validation_failed", message="Ledger not balanced!")
-            
+
+            # -------------------------------------------------------------------
+            # Online settlement: settle any open orders whose market resolved
+            # while the bot is running.  Mirrors reconcile_open_orders (startup)
+            # but runs on a live polling cadence so PnL is booked immediately
+            # rather than waiting for next restart.
+            # -------------------------------------------------------------------
+            await self._safe_await(
+                "settle_resolved_open_orders",
+                self._settle_resolved_open_orders(),
+                timeout_seconds=self.network_timeout_seconds,
+                default=None,
+            )
+
             # Clean up execution service
             if self.execution:
                 cleaned = await self._safe_await(
@@ -1439,6 +1452,123 @@ class TradingSystem:
             logger.error(
                 "periodic_maintenance_failed",
                 error=str(e)
+            )
+
+    async def _settle_resolved_open_orders(self) -> None:
+        """
+        Online settlement path — runs every maintenance cycle (~60 s).
+
+        Walks all open ``order_tracking`` rows and, for each market that has
+        resolved (``closed=True`` or ``resolved=True`` on Polymarket), books
+        realized PnL and transitions the row to ``SETTLED``.
+
+        This is the live counterpart to ``AsyncLedger.reconcile_open_orders``
+        (which only runs at startup).  Together they guarantee that settlement
+        is booked at most two cycles after a market resolves, regardless of
+        whether the bot was running at the exact moment of resolution.
+
+        PnL formula (binary prediction market)
+        ----------------------------------------
+        quantity        = size_usdc / entry_price
+        realized_pnl    = quantity * payout_per_share − size_usdc
+
+        Where ``payout_per_share`` is either 1.0 (winner) or 0.0 (loser).
+        This is the same formula used in ``reconcile_open_orders``.
+        """
+        if self.ledger is None or self.api_client is None:
+            return
+
+        open_orders = await self._safe_await(
+            "ledger.get_open_orders.settlement_poll",
+            self.ledger.get_open_orders(),
+            timeout_seconds=10.0,
+            default=[],
+        )
+        if not open_orders:
+            return
+
+        # De-duplicate market_id lookups so we don't hammer the API for every
+        # order when multiple orders are open in the same market.
+        market_cache: Dict[str, Any] = {}
+        settled_count = 0
+
+        for row in open_orders:
+            order_id = row.get("order_id", "")
+            market_id = row.get("market_id", "")
+            if not order_id or not market_id:
+                continue
+
+            # Fetch (and cache) market metadata once per market per cycle.
+            if market_id not in market_cache:
+                market_data = await self._safe_await(
+                    f"api_client.get_market.settlement_poll.{market_id}",
+                    self.api_client.get_market(market_id),
+                    timeout_seconds=8.0,
+                    default=None,
+                ) if hasattr(self.api_client, "get_market") else None
+                market_cache[market_id] = market_data or {}
+
+            market = market_cache[market_id]
+            market_resolved = bool(market.get("closed") or market.get("resolved"))
+            if not market_resolved:
+                continue
+
+            # Compute PnL using the same formula as reconcile_open_orders.
+            raw_payout = market.get("payout_numerator") or market.get("payout_per_share")
+            if raw_payout is None:
+                # Market is closed but payout not yet posted — skip for now;
+                # the next maintenance cycle will retry.
+                logger.debug(
+                    "settlement_poll_payout_pending",
+                    order_id=order_id,
+                    market_id=market_id,
+                )
+                continue
+
+            try:
+                size = Decimal(str(row.get("size", "0")))
+                price = Decimal(str(row.get("price", "0")))
+                payout_per_share = Decimal(str(raw_payout))
+                quantity = size / price if price > Decimal("0") else Decimal("0")
+                pnl = quantity * payout_per_share - size
+            except Exception as exc:
+                logger.warning(
+                    "settlement_poll_pnl_compute_error",
+                    order_id=order_id,
+                    market_id=market_id,
+                    error=str(exc),
+                )
+                continue
+
+            winning_side = market.get("winning_side") or market.get("outcome")
+            await self._safe_await(
+                f"ledger.transition_order_state.settled_live.{order_id}",
+                self.ledger.transition_order_state(
+                    order_id,
+                    "SETTLED",
+                    pnl=pnl,
+                    notes=(
+                        f"resolved_live winning_side={winning_side} "
+                        f"payout={payout_per_share}"
+                    ),
+                ),
+                timeout_seconds=5.0,
+            )
+            settled_count += 1
+            logger.info(
+                "order_settled_live",
+                order_id=order_id,
+                market_id=market_id,
+                pnl=str(pnl),
+                winning_side=winning_side,
+                payout_per_share=str(payout_per_share),
+            )
+
+        if settled_count > 0:
+            logger.info(
+                "settlement_poll_complete",
+                settled=settled_count,
+                checked=len(open_orders),
             )
     
     async def stop(self):
@@ -1527,9 +1657,26 @@ async def main():
         help='Trading mode.  "replay" re-evaluates history against current thresholds.'
     )
     parser.add_argument(
-        '--replay-db',
-        default='data/orders_ledger.db',
-        help='Path to the order-ledger SQLite DB used by --mode replay.'
+        '--replay-log',
+        default='bot_production.log',
+        help='Path to structlog JSON-lines log file for --mode replay.'
+    )
+    parser.add_argument(
+        '--from', dest='from_ts',
+        default=None,
+        metavar='ISO8601',
+        help='Replay start timestamp (UTC ISO-8601), e.g. 2026-01-01T00:00:00Z'
+    )
+    parser.add_argument(
+        '--to', dest='to_ts',
+        default=None,
+        metavar='ISO8601',
+        help='Replay end timestamp (UTC ISO-8601), e.g. 2026-02-01T00:00:00Z'
+    )
+    parser.add_argument(
+        '--baseline',
+        default='data/replay_baseline.json',
+        help='Path to the regression-baseline JSON file read/written by --mode replay.'
     )
     args = parser.parse_args()
 
@@ -1562,9 +1709,24 @@ async def main():
     
     # Override paper trading mode from command line
     if args.mode == 'replay':
-        # Replay mode: re-evaluate settled order history. Never touches exchange.
+        # Replay mode: re-run historical events from log through strategy + Kelly logic.
+        # Never touches the exchange.
         from replay.engine import run_replay
-        await run_replay(db_path=args.replay_db)
+        from datetime import datetime, timezone
+
+        def _parse_iso(ts: str) -> datetime:
+            """Accept ISO-8601 UTC strings with or without trailing Z."""
+            ts = ts.rstrip('Z')
+            return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+
+        from_ts = _parse_iso(args.from_ts) if args.from_ts else None
+        to_ts = _parse_iso(args.to_ts) if args.to_ts else None
+        await run_replay(
+            log_file=args.replay_log,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            baseline_path=args.baseline,
+        )
         return
 
     if 'trading' not in config:

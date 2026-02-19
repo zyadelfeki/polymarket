@@ -714,12 +714,15 @@ class AsyncLedger:
                 result = await cursor.fetchone()
                 if result and cursor.description:
                     columns = [col[0] for col in cursor.description]
-                    result = self._convert_row(result, columns)
+                    result = dict(zip(columns, self._convert_row(result, columns)))
             elif fetch_all:
                 result = await cursor.fetchall()
                 if result and cursor.description:
                     columns = [col[0] for col in cursor.description]
-                    result = [self._convert_row(row, columns) for row in result]
+                    result = [
+                        dict(zip(columns, self._convert_row(row, columns)))
+                        for row in result
+                    ]
             
             if commit:
                 await conn.commit()
@@ -769,6 +772,10 @@ class AsyncLedger:
         result = await self._execute_query(query, params=params, fetch_one=True)
         if not result:
             return None
+        # _execute_query now returns a dict for fetch_one; grab the first value.
+        # Legacy tuple path retained as a safety fallback.
+        if isinstance(result, dict):
+            return next(iter(result.values()), None)
         return result[0]
 
     async def record_audit_event(
@@ -1519,20 +1526,31 @@ class AsyncLedger:
             params=tuple(states),
             fetch_all=True,
         )
-        return [dict(zip([d[0] for d in row.description], row)) if hasattr(row, 'description') else dict(row) for row in (rows or [])]
+        return await self._order_rows_as_dicts(rows or [])
 
     async def _order_rows_as_dicts(self, rows) -> List[Dict]:
-        """Convert aiosqlite Row objects to plain dicts."""
+        """
+        Normalise query results to plain dicts.
+
+        ``_execute_query`` already converts rows to ``dict`` objects; this
+        method exists as a stable conversion point so callers don't care
+        whether a row arrived as a dict (fast path from ``_execute_query``) or
+        as a raw ``sqlite3.Row`` / tuple (e.g. from a connection obtained
+        outside the pool).
+        """
         if not rows:
             return []
-        result = []
+        result: List[Dict] = []
         for row in rows:
-            # aiosqlite Row supports keys() and index access
-            try:
-                result.append(dict(row))
-            except TypeError:
-                # Fallback: row is a plain tuple — fetch column names via description
-                result.append({f"col_{i}": v for i, v in enumerate(row)})
+            if isinstance(row, dict):
+                result.append(row)
+            else:
+                # Raw sqlite3.Row or tuple — convert via dict() if possible,
+                # otherwise fall back to positional keys so nothing is silently lost.
+                try:
+                    result.append(dict(row))
+                except TypeError:
+                    result.append({f"col_{i}": v for i, v in enumerate(row)})
         return result
 
     async def get_all_tracked_orders(self, limit: int = 500) -> List[Dict]:
