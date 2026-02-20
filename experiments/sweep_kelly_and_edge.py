@@ -97,6 +97,21 @@ def _parse_iso(ts: str) -> datetime:
     return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
 
 
+def _to_float(val: Any, default: float = 0.0) -> float:
+    """Safely coerce a CSV field to float.
+
+    Handles Python None, the serialised string 'None', empty string,
+    and genuine numeric strings/floats.  Falls back to *default* on any
+    conversion failure so sort keys and filters never crash.
+    """
+    if val is None or str(val).strip().lower() in ("", "none", "nan"):
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
 def _iter_grid() -> List[Dict[str, Decimal]]:
     """
     Return the Cartesian product of _GRID as a list of parameter dicts.
@@ -150,7 +165,7 @@ def _print_table(
     """Print a ranked subset of rows to stdout in a fixed-width table."""
     sorted_rows = sorted(
         rows,
-        key=lambda r: float(r.get(sort_key) or 0),
+        key=lambda r: _to_float(r.get(sort_key)),
         reverse=reverse,
     )[:limit]
 
@@ -276,7 +291,7 @@ def _print_ranked_tables(rows: List[Dict[str, Any]]) -> None:
 
     low_dd = [
         r for r in clean_rows
-        if float(r.get("max_drawdown_pct") or 99) <= 5.0
+        if _to_float(r.get("max_drawdown_pct"), default=99.0) <= 5.0
     ]
     if low_dd:
         _print_table(
