@@ -1,16 +1,17 @@
-"""
-Performance Tracker — honest PnL accounting powered by the order ledger.
+"""Performance Tracker — honest PnL accounting powered by the order ledger.
 
-Reads from ``state/order_store.py`` and the double-entry ledger (via
-``database/ledger_async.py``) to compute real, on-chain-confirmed metrics.
+Reads exclusively from the double-entry ledger (``database/ledger_async.py``)
+via ``get_all_tracked_orders()`` to compute real, on-chain-confirmed metrics.
+The legacy ``state/order_store.py`` has been removed; all order tracking now
+lives in the ``order_tracking`` table of ``AsyncLedger``.
 
-No "would-have-been" estimates.  Only settled orders with stored PnL count
+No “would-have-been” estimates.  Only settled orders with stored PnL count
 toward win rate, drawdown, or equity-curve calculations.
 
 Public interface
 ----------------
-    tracker = PerformanceTracker(order_store, ledger)
-    await tracker.refresh()           # pull latest data from both sources
+    tracker = PerformanceTracker(ledger, ledger)
+    await tracker.refresh()           # pull latest data
 
     dd  = tracker.get_current_drawdown()          # Decimal, 0–1
     wr  = tracker.get_rolling_win_rate(30)        # float 0–1 or None
@@ -26,7 +27,6 @@ from decimal import Decimal
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from state.order_store import OrderStore
     from database.ledger_async import AsyncLedger
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ class PerformanceTracker:
 
     def __init__(
         self,
-        order_store: "OrderStore",
+        order_store: "AsyncLedger",
         ledger: Optional["AsyncLedger"] = None,
         initial_capital: Optional[Decimal] = None,
         model_feedback_callback: Optional[Callable[[bool], None]] = None,

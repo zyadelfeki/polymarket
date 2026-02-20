@@ -1,7 +1,9 @@
 import argparse
 import asyncio
 import logging
+import os
 import sys
+import structlog
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -32,18 +34,67 @@ DEFAULT_HEARTBEAT_PATH = Path("runtime/heartbeat.txt")
 PAPER_MODE_STATIC_BALANCE = Decimal("20")
 PAPER_MODE_NETWORK_PARTITION_THRESHOLD_SECONDS = 60
 
+# Structlog logger for emitting structured JSON events consumed by the replay
+# harness.  Separate from self.logger (stdlib) which handles operational text.
+_struct_logger = structlog.get_logger(__name__)
 
-def configure_logging() -> None:
-    logging.basicConfig(
-        level=getattr(logging, LOGGING_CONFIG["log_level"], logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[
-            logging.FileHandler(LOGGING_CONFIG["log_file"], encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
-        force=True,
+
+def configure_logging(mode: str = "paper") -> None:
+    """Configure stdlib + structlog handlers.
+
+    JSON mode is active when *either* condition holds:
+      - ``mode == 'live'`` (automatic in production, no env var required)
+      - ``LOG_FORMAT=json`` env var is set (explicit override, e.g. paper CI)
+    ConsoleRenderer is kept for all other cases (local dev / paper trading).
+    """
+    log_level = getattr(logging, LOGGING_CONFIG["log_level"], logging.INFO)
+    _use_json = (
+        mode == "live"
+        or os.environ.get("LOG_FORMAT", "").lower() == "json"
     )
-    logging.getLogger("phase6").setLevel(getattr(logging, LOGGING_CONFIG["log_level"], logging.INFO))
+
+    # Ensure log directory exists (handles e.g. "logs/bot_production.log").
+    Path(LOGGING_CONFIG["log_file"]).parent.mkdir(parents=True, exist_ok=True)
+
+    file_handler = logging.FileHandler(LOGGING_CONFIG["log_file"], encoding="utf-8")
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    )
+
+    if _use_json:
+        # ── JSON mode (LOG_FORMAT=json) ───────────────────────────────────────
+        # File handler writes raw %(message)s so structlog's JSONRenderer output
+        # lands as a clean JSON line.  Non-JSON stdlib messages will also appear
+        # in the file, but load_log_events() in the replay harness skips them
+        # via the json.JSONDecodeError guard — so the mixed file is safe.
+        file_handler.setFormatter(logging.Formatter("%(message)s"))
+        structlog.configure(
+            processors=[
+                structlog.stdlib.add_log_level,
+                structlog.stdlib.add_logger_name,
+                structlog.processors.TimeStamper(fmt="iso"),
+                structlog.processors.StackInfoRenderer(),
+                structlog.processors.format_exc_info,
+                structlog.processors.JSONRenderer(),
+            ],
+            wrapper_class=structlog.stdlib.BoundLogger,
+            context_class=dict,
+            logger_factory=structlog.stdlib.LoggerFactory(),
+            cache_logger_on_first_use=True,
+        )
+    else:
+        # ── Plain-text mode (local development default) ───────────────────────
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        )
+
+    root = logging.getLogger()
+    root.setLevel(log_level)
+    root.handlers.clear()
+    root.addHandler(file_handler)
+    root.addHandler(console_handler)
+    logging.getLogger("phase6").setLevel(log_level)
 
 
 class ProductionBot:
@@ -322,6 +373,19 @@ class ProductionBot:
             self.logger.warning("Invalid market price in opportunity: %s", opportunity)
             return
 
+        # Emit structured event so the replay harness can consume this opportunity.
+        _struct_logger.info(
+            "arbitrage_opportunity_detected",
+            market_id=str(opportunity.get("market_id", "")),
+            token_id=str(opportunity.get("token_id", "")),
+            market_price=str(market_price),
+            edge=str(edge),
+            side=str(opportunity.get("side", "")),
+            charlie_p_win=str(opportunity.get("charlie_p_win", "")),
+            technical_regime=str(opportunity.get("technical_regime", "")),
+            question=str(opportunity.get("question", "")),
+        )
+
         # In paper mode the bankroll is already available cash (total minus deployed),
         # so passing current_exposure again would double-count.  Live mode uses the
         # raw live balance from the exchange, so the ledger exposure is still needed.
@@ -383,6 +447,16 @@ class ProductionBot:
                 opportunity.get("edge"),
                 quantity,
             )
+            _struct_logger.info(
+                "order_filled",
+                order_id=str(getattr(result, "order_id", "") or ""),
+                market_id=str(opportunity.get("market_id", "")),
+                token_id=str(opportunity.get("token_id", "")),
+                side=str(opportunity.get("side", "")),
+                quantity=str(quantity),
+                market_price=str(market_price),
+                edge=str(edge),
+            )
         else:
             self.logger.warning("Trade failed | result=%s", result)
 
@@ -432,7 +506,7 @@ def parse_args() -> argparse.Namespace:
 
 async def _main() -> int:
     args = parse_args()
-    configure_logging()
+    configure_logging(mode=args.mode)  # JSON auto-enabled for --mode live
 
     banner = (
         "\n"
@@ -451,6 +525,9 @@ async def _main() -> int:
         return 0
     finally:
         await bot.shutdown()
+
+
+
 
 
 if __name__ == "__main__":

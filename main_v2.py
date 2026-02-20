@@ -546,7 +546,21 @@ async def main():
     
     # Configure logging level
     log_level = logging.DEBUG if args.debug else logging.INFO
-    
+
+    # Use JSONRenderer for live production runs so every event lands as a
+    # parseable JSON line in the log file.  Keep ConsoleRenderer for local
+    # development (paper mode) and explicit debug sessions.
+    _use_json = (
+        args.mode == "live"
+        and not args.debug
+        or os.environ.get("LOG_FORMAT", "").lower() == "json"
+    )
+    _final_renderer: object = (
+        structlog.processors.JSONRenderer()
+        if _use_json
+        else structlog.dev.ConsoleRenderer()
+    )
+
     structlog.configure(
         processors=[
             structlog_correlation_processor,
@@ -554,7 +568,7 @@ async def main():
             structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
-            structlog.dev.ConsoleRenderer()
+            _final_renderer,
         ],
         wrapper_class=structlog.stdlib.BoundLogger,
         context_class=dict,

@@ -15,6 +15,7 @@ Usage:
 """
 
 import asyncio
+import os
 import signal
 import sys
 import argparse
@@ -38,14 +39,12 @@ from strategies.latency_arbitrage_btc import LatencyArbitrageEngine as MultiTime
 from utils.decimal_helpers import quantize_quantity, to_decimal
 
 # Charlie integration — new modules
-from state.order_store import OrderStore, OrderState
 from risk.performance_tracker import PerformanceTracker
 from risk.kelly_sizing import KellySizer
 from integrations.charlie_booster import CharliePredictionGate, TradeRecommendation
 from config_production import (
     CHARLIE_CONFIG,
     KELLY_CONFIG,
-    ORDER_STORE_CONFIG,
     PERFORMANCE_TRACKER_CONFIG,
     REGIME_RISK_OVERRIDES,
     GLOBAL_RISK_BUDGET,
@@ -174,7 +173,7 @@ class TradingSystem:
         self.last_strategy_scan_at = 0.0
 
         # Charlie integration components
-        self.order_store: Optional[OrderStore] = None
+        self.order_store = None  # Removed — order tracking lives in ledger.order_tracking table
         self.performance_tracker: Optional[PerformanceTracker] = None
         self.kelly_sizer: Optional[KellySizer] = None
         self.charlie_gate: Optional[CharliePredictionGate] = None
@@ -729,26 +728,6 @@ class TradingSystem:
                     notes=charlie_rec.reason if charlie_rec else None,
                 ),
             )
-        # Legacy order_store write (transition period — kept until order_store is removed)
-        if self.order_store is not None:
-            await self._safe_await(
-                "order_store.upsert_pre_order",
-                self.order_store.upsert_order(
-                    order_id=pre_order_id,
-                    market_id=market_id,
-                    token_id=token_id,
-                    outcome=side,
-                    side="BUY",
-                    size=order_value,
-                    price=price,
-                    state=OrderState.CREATED,
-                    charlie_p_win=charlie_p_win,
-                    charlie_conf=charlie_conf_dec,
-                    charlie_regime=charlie_regime,
-                    strategy="latency_arbitrage_btc",
-                    notes=charlie_rec.reason if charlie_rec else None,
-                ),
-            )
 
         logger.info(
             "order_submission_attempt",
@@ -810,34 +789,6 @@ class TradingSystem:
                             exchange_order_id, new_state_str
                         ),
                     )
-                # Legacy order_store update (transition period)
-                if self.order_store is not None:
-                    from state.order_store import OrderState as _OS
-                    _new_os = _OS.FILLED if new_state_str == "FILLED" else _OS.SUBMITTED
-                    if exchange_order_id != pre_order_id:
-                        await self._safe_await(
-                            "order_store.upsert_submitted",
-                            self.order_store.upsert_order(
-                                order_id=exchange_order_id,
-                                market_id=market_id,
-                                token_id=token_id,
-                                outcome=side,
-                                side="BUY",
-                                size=order_value,
-                                price=price,
-                                state=_new_os,
-                                charlie_p_win=charlie_p_win,
-                                charlie_conf=charlie_conf_dec,
-                                charlie_regime=charlie_regime,
-                                strategy="latency_arbitrage_btc",
-                                notes=charlie_rec.reason if charlie_rec else None,
-                            ),
-                        )
-                    else:
-                        await self._safe_await(
-                            "order_store.transition_submitted",
-                            self.order_store.transition_state(exchange_order_id, _new_os),
-                        )
             elif not result.success and pre_order_id:
                 if self.ledger is not None:
                     await self._safe_await(
@@ -845,14 +796,6 @@ class TradingSystem:
                         self.ledger.transition_order_state(
                             pre_order_id, "ERROR",
                             notes=str(getattr(result, "error", "unknown")),
-                        ),
-                    )
-                if self.order_store is not None:
-                    await self._safe_await(
-                        "order_store.transition_error",
-                        self.order_store.transition_state(
-                            pre_order_id, OrderState.ERROR,
-                            notes=str(getattr(result, "error", "unknown"))
                         ),
                     )
 
@@ -1074,14 +1017,7 @@ class TradingSystem:
             await self._market_discovery_probe()
 
             # --- Charlie integration components ---
-            # 8. Order Store
-            order_store_path = ORDER_STORE_CONFIG.get("db_path", "data/orders_ledger.db")
-            logger.info("component_construct_begin", component="order_store")
-            self.order_store = OrderStore(db_path=order_store_path)
-            await self._await_step("order_store.initialize", self.order_store.initialize())
-            logger.info("component_construct_success", component="order_store", path=order_store_path)
-
-            # 9. Kelly Sizer
+            # 8. Kelly Sizer (OrderStore removed — order tracking lives in AsyncLedger)
             logger.info("component_construct_begin", component="kelly_sizer")
             self.kelly_sizer = KellySizer(config=KELLY_CONFIG)
             logger.info("component_construct_success", component="kelly_sizer")
@@ -1600,13 +1536,6 @@ class TradingSystem:
                     f"========================\n"
                 )
 
-            # Close legacy order_store if still present (transition period)
-            if self.order_store is not None:
-                await self._safe_await(
-                    "order_store.close", self.order_store.close(), timeout_seconds=5.0
-                )
-                logger.info("order_store_closed")
-
             # Stop health monitor
             if self.health_monitor:
                 await self._safe_await("health_monitor.stop", self.health_monitor.stop(), timeout_seconds=15.0)
@@ -1678,11 +1607,43 @@ async def main():
         default='data/replay_baseline.json',
         help='Path to the regression-baseline JSON file read/written by --mode replay.'
     )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Enable verbose debug logging; forces ConsoleRenderer even in live mode.'
+    )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format='%(message)s')
-    
-    # Configure logging
+    # JSON logging is active when:
+    #   a) --mode live and NOT --debug  (automatic in production), OR
+    #   b) LOG_FORMAT=json env var is set (explicit override, e.g. paper-run CI checks)
+    # All other cases (paper, replay, local dev) default to ConsoleRenderer.
+    _use_json = (
+        (args.mode == "live" and not args.debug)
+        or os.environ.get("LOG_FORMAT", "").lower() == "json"
+    )
+
+    _log_handlers: list = [logging.StreamHandler(sys.stderr)]
+    if _use_json:
+        Path("logs").mkdir(parents=True, exist_ok=True)
+        _log_handlers.append(
+            logging.FileHandler("logs/production.log", encoding="utf-8")
+        )
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        handlers=_log_handlers,
+        force=True,
+    )
+
+    # Configure structlog — JSONRenderer for live mode (auto) or LOG_FORMAT=json (explicit).
+    # ConsoleRenderer is used for local dev, paper mode, and explicit --debug sessions.
+    _final_renderer = (
+        structlog.processors.JSONRenderer()
+        if _use_json
+        else structlog.dev.ConsoleRenderer()
+    )
     structlog.configure(
         processors=[
             structlog.stdlib.add_log_level,
@@ -1690,7 +1651,7 @@ async def main():
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
-            structlog.processors.JSONRenderer()
+            _final_renderer,
         ],
         wrapper_class=structlog.stdlib.BoundLogger,
         context_class=dict,
