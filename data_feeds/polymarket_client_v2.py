@@ -264,6 +264,12 @@ class PolymarketClientV2:
         self._active_backup_key_index = 0
         self.emergency_shutdown_reason: Optional[str] = None
         self._auth_failure_handler: Optional[Callable[[str], Awaitable[None]]] = None
+
+        # Instance-level market lookup cache.  Keyed by market_id; each entry is
+        # (result_dict, timestamp).  Prevents the settlement loop from fetching the
+        # same market N times (once per open order) on every maintenance cycle.
+        self._get_market_cache: dict = {}
+        self._get_market_cache_ttl: float = 60.0  # seconds
         
         # Initialize client NOW (synchronously)
         self._force_authentication()
@@ -658,11 +664,22 @@ class PolymarketClientV2:
         iterating through get_markets() pagination.
         
         Args:
-            market_id: Market condition_id (0x...)
+            market_id: Market condition_id (0x...) or integer id
         
         Returns:
             Market dict or safe default with tokens field
         """
+        import time as _time
+        # Serve from instance-level TTL cache to avoid repeated Gamma API calls
+        # for the same market within one settlement scan (one call per open order
+        # would otherwise fire N sequential throttled requests for N orders).
+        _now = _time.monotonic()
+        _cached = self._get_market_cache.get(market_id)
+        if _cached is not None:
+            _result, _ts = _cached
+            if _now - _ts < self._get_market_cache_ttl:
+                return _result
+
         if not self.client:
             logger.error("cannot_fetch_market", reason="client_uninitialized", market_id=market_id)
             return {"tokens": [], "error": "client_uninitialized", "market_id": market_id}
@@ -670,22 +687,44 @@ class PolymarketClientV2:
         async def _fetch_market() -> Optional[Dict]:
             await self._throttle()
             logger.debug("fetching_market_via_direct_lookup", market_id=market_id)
+
+            # Integer IDs (e.g. "1403228") are Gamma/REST API IDs — CLOB only
+            # understands hex condition_ids.  Skip the CLOB call entirely and go
+            # straight to Gamma to avoid a guaranteed exception/None that would
+            # prevent the Gamma fallback from running.
             market = None
-            if hasattr(self.client, "get_market"):
+            if str(market_id).lstrip("-").isdigit():
+                logger.debug("integer_market_id_using_gamma_direct", market_id=market_id)
+            elif hasattr(self.client, "get_market"):
                 loop = asyncio.get_running_loop()
                 market = await loop.run_in_executor(
                     None,
                     lambda: self.client.get_market(market_id)
                 )
-
-            logger.debug("direct_market_lookup_response_type", type=type(market).__name__)
-
-            if not isinstance(market, dict):
-                logger.warning("market_response_not_dict", type=type(market).__name__)
-                market = None
+                logger.debug("direct_market_lookup_response_type", type=type(market).__name__)
+                if not isinstance(market, dict):
+                    logger.warning("market_response_not_dict", type=type(market).__name__)
+                    market = None
 
             if not market or 'tokens' not in market:
                 market = await self._fetch_market_via_gamma(market_id)
+
+            # Gamma API responses for integer-ID markets use outcomePrices/outcomes
+            # instead of a tokens array.  If the Gamma response has resolution fields
+            # return it as-is — the settlement loop only needs those, not token data.
+            if market and 'tokens' not in market and (
+                'outcomePrices' in market
+                or 'active' in market
+                or 'resolutionTime' in market
+            ):
+                logger.info(
+                    "market_found_via_gamma_resolution",
+                    market_id=market_id,
+                    active=market.get('active'),
+                    closed=market.get('closed'),
+                    question=market.get('question', 'N/A')[:50],
+                )
+                return market
             if not market or 'tokens' not in market:
                 logger.warning("market_missing_tokens_field", market_id=market_id)
                 return {"tokens": [], "error": "market_not_found", "market_id": market_id}
@@ -724,8 +763,9 @@ class PolymarketClientV2:
         try:
             market = await self._execute_with_retries("get_market", _fetch_market)
             if market is None:
-                return {"tokens": [], "error": "market_not_found", "market_id": market_id}
-            return market
+                result = {"tokens": [], "error": "market_not_found", "market_id": market_id}
+            else:
+                result = market
         except AttributeError as e:
             logger.error(
                 "get_market_method_not_available",
@@ -733,26 +773,42 @@ class PolymarketClientV2:
                 market_id=market_id,
                 message="get_market() not found in ClobClient"
             )
-            return {"tokens": [], "error": "method_not_available", "market_id": market_id}
+            result = {"tokens": [], "error": "method_not_available", "market_id": market_id}
+        # Store in instance cache (cache even errors to avoid retry storms).
+        import time as _time
+        self._get_market_cache[market_id] = (result, _time.monotonic())
+        return result
 
     async def _fetch_market_via_gamma(self, condition_id: str) -> Optional[Dict]:
-        """Fallback market lookup using Gamma API by condition id."""
+        """Fallback market lookup using Gamma API by condition_id or integer id."""
         import httpx
 
         async def _fetch_gamma() -> Optional[Dict]:
             await self._throttle()
             base_url = "https://gamma-api.polymarket.com/markets"
-            candidates = [
-                f"{base_url}?condition_ids={condition_id}",
-                f"{base_url}?condition_id={condition_id}",
-                f"{base_url}?conditionId={condition_id}"
-            ]
+            candidates = []
+            # Integer market IDs (e.g. "1403228" from the Gamma REST API) can be
+            # fetched directly via /markets/{id}.  Hex condition IDs use the
+            # query-param path.  Try integer path first to avoid wasted calls.
+            if str(condition_id).lstrip("-").isdigit():
+                candidates = [
+                    f"{base_url}/{condition_id}",
+                    f"{base_url}?id={condition_id}",
+                ]
+            else:
+                candidates = [
+                    f"{base_url}?condition_ids={condition_id}",
+                    f"{base_url}?condition_id={condition_id}",
+                    f"{base_url}?conditionId={condition_id}",
+                ]
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 for url in candidates:
                     resp = await client.get(url)
                     if resp.status_code != 200:
                         continue
                     data = resp.json()
+                    if isinstance(data, dict) and (data.get('id') or data.get('conditionId')):
+                        return data
                     if isinstance(data, list) and data:
                         return data[0]
                     if isinstance(data, dict) and data.get('data'):
@@ -1345,14 +1401,16 @@ class PolymarketClientV2:
         """
         try:
             import httpx
-            from datetime import datetime, timedelta
+            from datetime import datetime, timedelta, timezone as _tz
 
             markets: List[Dict] = []
             gamma_base = "https://gamma-api.polymarket.com/events/slug"
 
             assets = ["btc", "eth", "sol", "xrp"]
 
-            now_utc = datetime.utcnow()
+            # Use timezone-aware UTC now so that .timestamp() on all derived
+            # datetimes is correct regardless of the host machine's local timezone.
+            now_utc = datetime.now(_tz.utc)
             et_offset = timedelta(hours=-5)
             now_et = now_utc + et_offset
 
@@ -1379,97 +1437,117 @@ class PolymarketClientV2:
                 ],
             )
 
+            # Build the deduplicated slug list.  Only offset=0 is used because the
+            # ET→UTC interval computation is exact (EST = UTC-5 in Feb; no DST).
+            # The former ±1h/±2h offsets produced ~100 extra 404 requests per cycle,
+            # causing the asyncio.wait_for(timeout=10s) in _get_active_markets to
+            # always fire before the function could return any results.
+            slugs_to_check: List[tuple] = []  # (asset, slug)
+            seen_slugs: set = set()
+            for asset in assets:
+                for interval in intervals_to_check:
+                    unix_ts = int(interval.timestamp())
+                    slug = f"{asset}-updown-15m-{unix_ts}"
+                    if slug not in seen_slugs:
+                        seen_slugs.add(slug)
+                        slugs_to_check.append((asset, slug))
+
+            logger.debug(
+                "15min_slug_candidates",
+                total=len(slugs_to_check),
+                assets=assets,
+                intervals=len(intervals_to_check),
+            )
+
             diagnostic_logged = False
 
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                ts_offsets = [0, 3600, 7200, -3600, -7200]
-                seen_slugs = set()
-                for asset in assets:
-                    for interval in intervals_to_check:
-                        for ts_offset in ts_offsets:
-                            unix_ts = int(interval.timestamp()) + ts_offset
-                            slug = f"{asset}-updown-15m-{unix_ts}"
-                            if slug in seen_slugs:
-                                continue
-                            seen_slugs.add(slug)
+            async def _fetch_one(asset: str, slug: str, http_client: "httpx.AsyncClient") -> None:
+                """Fetch a single slug event and append valid markets to `markets`."""
+                nonlocal diagnostic_logged
+                try:
+                    url = f"{gamma_base}/{slug}"
+                    response = await http_client.get(url)
 
-                            try:
-                                url = f"{gamma_base}/{slug}"
-                                response = await client.get(url)
+                    if response.status_code == 200:
+                        event = response.json()
 
-                                if response.status_code == 200:
-                                    event = response.json()
+                        if not diagnostic_logged and asset == "btc":
+                            diagnostic_logged = True
+                            logger.info(
+                                "DIAGNOSTIC_event_structure",
+                                slug=slug,
+                                top_level_keys=list(event.keys()),
+                                closed=event.get("closed"),
+                                has_markets_array=("markets" in event),
+                                markets_count=(len(event.get("markets", [])) if "markets" in event else "N/A"),
+                                sample_event=str(event)[:500],
+                            )
 
-                                    if not diagnostic_logged and asset == "btc":
-                                        diagnostic_logged = True
-                                        logger.info(
-                                            "DIAGNOSTIC_event_structure",
-                                            slug=slug,
-                                            top_level_keys=list(event.keys()),
-                                            closed=event.get("closed"),
-                                            has_markets_array=("markets" in event),
-                                            markets_count=(len(event.get("markets", [])) if "markets" in event else "N/A"),
-                                            sample_event=str(event)[:500],
-                                        )
+                        if event.get("closed", False):
+                            logger.debug("event_closed", slug=slug)
+                            return
 
-                                    if event.get("closed", False):
-                                        logger.debug("event_closed", slug=slug)
-                                        continue
+                        event_markets = event.get("markets", [])
 
-                                    event_markets = event.get("markets", [])
+                        if not event_markets:
+                            if "conditionId" in event or "condition_id" in event:
+                                event_markets = [event]
+                            else:
+                                logger.debug(
+                                    "no_markets_in_event",
+                                    slug=slug,
+                                    event_keys=list(event.keys())[:10],
+                                )
+                                return
 
-                                    if not event_markets:
-                                        if "conditionId" in event or "condition_id" in event:
-                                            event_markets = [event]
-                                        else:
-                                            logger.debug(
-                                                "no_markets_in_event",
-                                                slug=slug,
-                                                event_keys=list(event.keys())[:10],
-                                            )
-                                            continue
+                        active_markets = [m for m in event_markets if not m.get("closed", False)]
 
-                                    active_markets = [m for m in event_markets if not m.get("closed", False)]
+                        if active_markets:
+                            normalized_markets: List[Dict] = []
+                            for market_item in active_markets:
+                                if not isinstance(market_item, dict):
+                                    continue
+                                normalized_markets.append(
+                                    {
+                                        **market_item,
+                                        "question": market_item.get("question") or event.get("title") or event.get("question"),
+                                        "title": market_item.get("title") or event.get("title") or event.get("question"),
+                                        "slug": market_item.get("slug") or event.get("slug") or event.get("ticker"),
+                                        "startDate": market_item.get("startDate") or event.get("startDate") or event.get("startTime"),
+                                        "endDate": market_item.get("endDate") or event.get("endDate") or event.get("closedTime"),
+                                        "end_date_iso": market_item.get("end_date_iso") or event.get("endDate"),
+                                        "event_id": market_item.get("event_id") or event.get("id"),
+                                    }
+                                )
 
-                                    if active_markets:
-                                        normalized_markets: List[Dict] = []
-                                        for market_item in active_markets:
-                                            if not isinstance(market_item, dict):
-                                                continue
-                                            normalized_markets.append(
-                                                {
-                                                    **market_item,
-                                                    "question": market_item.get("question") or event.get("title") or event.get("question"),
-                                                    "title": market_item.get("title") or event.get("title") or event.get("question"),
-                                                    "slug": market_item.get("slug") or event.get("slug") or event.get("ticker"),
-                                                    "startDate": market_item.get("startDate") or event.get("startDate") or event.get("startTime"),
-                                                    "endDate": market_item.get("endDate") or event.get("endDate") or event.get("closedTime"),
-                                                    "end_date_iso": market_item.get("end_date_iso") or event.get("endDate"),
-                                                    "event_id": market_item.get("event_id") or event.get("id"),
-                                                }
-                                            )
+                            markets.extend(normalized_markets)
+                            logger.info(
+                                "15min_market_found",
+                                asset=asset.upper(),
+                                slug=slug,
+                                markets_count=len(normalized_markets),
+                                end_date=event.get("endDate") or event.get("end_date"),
+                                market_ids=[
+                                    (m.get("conditionId") or m.get("condition_id") or m.get("id") or "unknown")[:8]
+                                    for m in normalized_markets
+                                ],
+                            )
+                        else:
+                            logger.debug("all_markets_closed", slug=slug)
+                    elif response.status_code == 404:
+                        logger.debug("market_not_found", slug=slug)
+                    else:
+                        logger.warning("unexpected_status", slug=slug, status=response.status_code)
+                except Exception as exc:
+                    logger.error("slug_fetch_failed", slug=slug, error=str(exc))
 
-                                        markets.extend(normalized_markets)
-                                        logger.info(
-                                            "15min_market_found",
-                                            asset=asset.upper(),
-                                            slug=slug,
-                                            markets_count=len(normalized_markets),
-                                            end_date=event.get("endDate") or event.get("end_date"),
-                                            market_ids=[
-                                                (m.get("conditionId") or m.get("condition_id") or m.get("id") or "unknown")[:8]
-                                                for m in normalized_markets
-                                            ],
-                                        )
-                                    else:
-                                        logger.debug("all_markets_closed", slug=slug)
-                                elif response.status_code == 404:
-                                    logger.debug("market_not_found", slug=slug)
-                                else:
-                                    logger.warning("unexpected_status", slug=slug, status=response.status_code)
-                            except Exception as exc:
-                                logger.error("slug_fetch_failed", slug=slug, error=str(exc))
-                                continue
+            # Run all slug fetches concurrently.  With 24 slugs at ~0.3 s each this
+            # completes in ~1–3 s instead of the former ~60 s serial execution.
+            async with httpx.AsyncClient(timeout=10.0) as http_client:
+                await asyncio.gather(
+                    *[_fetch_one(asset, slug, http_client) for asset, slug in slugs_to_check],
+                    return_exceptions=True,
+                )
 
             logger.info(
                 "crypto_15min_markets_discovered",

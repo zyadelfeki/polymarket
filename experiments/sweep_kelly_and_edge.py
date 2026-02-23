@@ -73,7 +73,8 @@ _GRID: Dict[str, List[Any]] = {
     "max_bet_pct": [Decimal("2.5"), Decimal("5.0")],
 }
 
-# Metrics we capture for ranking.  Mirrors ReplayMetrics.to_dict() keys.
+# Metrics we capture for ranking.  Mirrors ReplayMetrics.to_dict() + ReplayEngine
+# derived keys.  NOTE: the correct key is "settled_trades" not "total_settlements".
 _METRICS = [
     "total_pnl",
     "cagr",
@@ -81,7 +82,10 @@ _METRICS = [
     "max_drawdown_pct",
     "win_rate",
     "total_trades",
-    "total_settlements",
+    "settled_trades",      # fixed: was incorrectly "total_settlements"
+    "open_trades",         # total_trades - settled_trades
+    "deployed_capital",    # cash in open positions (initial_equity - replay_equity)
+    "final_replay_equity", # liquid capital remaining after deployments
     "auto_blocks",
     "days_covered",
 ]

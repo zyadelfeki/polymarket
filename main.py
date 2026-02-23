@@ -182,6 +182,11 @@ class TradingSystem:
             path="data/do_not_trade.json",
             auto_load=True,
         )
+        # Tracks the last submission time per (market_id, token_id) pair for
+        # paper mode.  Prevents duplicate orders when rapid price ticks fire
+        # multiple scans before the idempotency cache would dedup them (the
+        # cache key includes price, so a 1-tick price change defeats it).
+        self._paper_order_cooldowns: Dict[str, float] = {}
         self.last_discovered_markets = []
         startup_config = config.get('startup', {})
         self.init_timeout_seconds = float(startup_config.get('component_timeout_seconds', 25.0))
@@ -292,9 +297,12 @@ class TradingSystem:
             sample=sample_identifiers
         )
 
+    # Supported symbols that should trigger a strategy scan when price updates.
+    _STRATEGY_TRIGGER_SYMBOLS = {"BTC", "ETH", "SOL", "XRP"}
+
     async def _on_price_update(self, symbol: str, price_data) -> None:
         try:
-            if symbol != "BTC":
+            if symbol not in self._STRATEGY_TRIGGER_SYMBOLS:
                 return
 
             logger.info(
@@ -382,6 +390,63 @@ class TradingSystem:
                     trigger=trigger,
                 )
 
+                # Record paper position in order_tracking so the settlement loop
+                # (_settle_resolved_open_orders → ledger.get_open_orders) can find it.
+                #
+                # WHY HERE and not only inside _execute_opportunity:
+                # _execute_opportunity already calls record_order_created BUT only
+                # after passing the Charlie gate, risk checks, and execution service.
+                # In paper mode all three can fail (no live API key / Charlie
+                # unavailable), which either skips recording entirely or transitions
+                # the created row to ERROR (a terminal state invisible to
+                # get_open_orders).  By recording unconditionally here we guarantee
+                # a CREATED row in order_tracking for every detected opportunity,
+                # regardless of what the downstream execution path does.
+                #
+                # NOTE: record_order_created (→ order_tracking) is intentionally
+                # used over record_trade_entry (→ positions) because
+                # _settle_resolved_open_orders calls get_open_orders(), which only
+                # queries order_tracking.  Using record_trade_entry would write to
+                # the wrong table and the settlement scan would still see 0 rows.
+                if self.ledger is not None:
+                    _pm_market_id = str(opportunity.get("market_id") or "").strip()
+                    _pm_token_id = str(opportunity.get("token_id") or "").strip()
+                    _pm_side = str(opportunity.get("side") or "YES").upper()
+                    _pm_price_raw = opportunity.get("market_price") or opportunity.get("price")
+                    if _pm_market_id and _pm_token_id and _pm_price_raw is not None:
+                        try:
+                            # Deterministic: same market+token always produces the same
+                            # order_id.  record_order_created uses ON CONFLICT(order_id)
+                            # DO NOTHING, so repeated scans of the same opportunity are
+                            # no-ops — one row per market/token stays open until settled.
+                            _pm_order_id = f"paper_{_pm_market_id}_{_pm_token_id}"
+                            _pm_price = to_decimal(_pm_price_raw)
+                            _pm_size = to_decimal(
+                                self.config.get("trading", {}).get("min_position_size", "10.00")
+                            )
+                            await self.ledger.record_order_created(
+                                order_id=_pm_order_id,
+                                market_id=_pm_market_id,
+                                token_id=_pm_token_id,
+                                outcome=_pm_side,
+                                side="BUY",
+                                size=_pm_size,
+                                price=_pm_price,
+                                strategy="latency_arbitrage_btc",
+                            )
+                            logger.debug(
+                                "paper_trade_recorded",
+                                market_id=_pm_market_id,
+                                order_id=_pm_order_id,
+                                price=str(_pm_price),
+                                size=str(_pm_size),
+                            )
+                        except Exception as _pm_exc:
+                            logger.warning(
+                                "paper_trade_record_failed",
+                                error=str(_pm_exc),
+                            )
+
             await self._execute_opportunity(opportunity=opportunity, trigger=trigger)
 
     def _resolve_opportunity_confidence(self, confidence_value: Any) -> Decimal:
@@ -444,6 +509,28 @@ class TradingSystem:
                 trigger=trigger,
             )
             return
+
+        # --- Paper-mode per-market cooldown ---
+        # The idempotency key in execution_service_v2 includes price, so a
+        # 1-tick price change generates a new key and bypasses dedup, causing
+        # the same market to receive 2-3 orders in one 2-second scan window.
+        # Guard against this with a 60-second cooldown per market+token.
+        is_paper = self.config.get("trading", {}).get("paper_trading", True)
+        if is_paper:
+            _cooldown_key = f"{market_id}:{token_id}"
+            _cooldown_secs = 60.0
+            _now_mono = asyncio.get_event_loop().time()
+            _last_submitted = self._paper_order_cooldowns.get(_cooldown_key, 0.0)
+            if _now_mono - _last_submitted < _cooldown_secs:
+                logger.debug(
+                    "opportunity_skipped",
+                    reason="paper_order_cooldown",
+                    market_id=market_id,
+                    token_id=token_id,
+                    cooldown_remaining_seconds=round(_cooldown_secs - (_now_mono - _last_submitted), 1),
+                    trigger=trigger,
+                )
+                return
 
         try:
             edge = to_decimal(opportunity.get("edge"))
@@ -551,7 +638,10 @@ class TradingSystem:
             return
 
         order_value = quantize_quantity(quantity * price)
-        if order_value < min_position_size:
+        # Allow up to 1 cent below min_position_size: quantize_quantity rounds
+        # down so order_value can be $0.01 less than position_value even though
+        # position_value already passed the >= min_position_size guard above.
+        if order_value < min_position_size - Decimal("0.01"):
             logger.warning(
                 "opportunity_skipped",
                 reason="order_value_below_minimum",
@@ -600,6 +690,18 @@ class TradingSystem:
                     symbol=opp_symbol,
                     timeframe="15m",
                     bankroll=equity,
+                    # TODO(feature-pipeline): pass real Binance indicators here so
+                    # Charlie's ML models receive live data instead of synthetic
+                    # neutral values.  Compute from the live price history:
+                    #   extra_features={
+                    #       "rsi_14": <computed RSI-14 from binance_prices>,
+                    #       "macd": <MACD line>,
+                    #       "price_vs_sma20": <(price - sma20) / sma20>,
+                    #       "price_vs_sma50": <(price - sma50) / sma50>,
+                    #       "volatility_20d": <20-period std-dev of log returns>,
+                    #   }
+                    # Without this, all models return HOLD and p_win=0.5 is used
+                    # (charlie_degraded_mode warning fires every call).
                     override_win_rate=(
                         self.performance_tracker.get_rolling_win_rate(20)
                         if self.performance_tracker is not None
@@ -617,6 +719,14 @@ class TradingSystem:
                     trigger=trigger,
                 )
                 return
+
+            # Stamp the cooldown as soon as Charlie approves.  Without this,
+            # budget-blocked markets re-trigger Charlie on every price tick since
+            # the cooldown was previously only stamped after order_submitted.
+            # Stamping here ensures the 60 s guard fires regardless of whether
+            # the order ultimately clears the portfolio budget checks.
+            if is_paper:
+                self._paper_order_cooldowns[f"{market_id}:{token_id}"] = asyncio.get_event_loop().time()
 
             # Adopt Charlie's recommended side and Kelly size
             side = charlie_rec.side
@@ -676,7 +786,7 @@ class TradingSystem:
                     )
                     return
 
-            if order_value < min_position_size:
+            if order_value < min_position_size - Decimal("0.01"):
                 logger.info(
                     "order_blocked_kelly_size_too_small",
                     market_id=market_id,
@@ -818,6 +928,9 @@ class TradingSystem:
             token_id=token_id,
             trigger=trigger,
         )
+        # Record cooldown so rapid subsequent scans skip this market+token.
+        if is_paper:
+            self._paper_order_cooldowns[f"{market_id}:{token_id}"] = asyncio.get_event_loop().time()
 
         if result.filled_quantity and result.filled_quantity > Decimal("0"):
             logger.info(
@@ -894,14 +1007,47 @@ class TradingSystem:
             
             # Initialize with capital if needed
             equity = await self._await_step("ledger.get_equity", self.ledger.get_equity())
+            initial_capital = Decimal(str(self.config.get('trading', {}).get('initial_capital', 10000)))
             if equity == Decimal('0'):
-                initial_capital = Decimal(str(self.config.get('trading', {}).get('initial_capital', 10000)))
                 await self._await_step(
                     "ledger.record_deposit",
                     self.ledger.record_deposit(initial_capital, "Initial capital")
                 )
-                logger.info("initial_capital_deposited", amount=initial_capital)
-            
+                logger.info("initial_capital_deposited", amount=str(initial_capital))
+            elif paper_trading and equity < initial_capital:
+                # In paper mode the ledger balance is virtual — if it has drained
+                # below the configured starting level (e.g. from prior test runs),
+                # top it back up so Kelly sizing has a real bankroll to work with.
+                # This never runs in live mode, preserving real PnL history.
+                shortfall = initial_capital - equity
+                await self._await_step(
+                    "ledger.record_deposit.paper_topup",
+                    self.ledger.record_deposit(shortfall, f"Paper trading top-up (equity {equity} < initial_capital {initial_capital})")
+                )
+                logger.info(
+                    "paper_equity_restored",
+                    previous_equity=str(equity),
+                    deposited=str(shortfall),
+                    new_target=str(initial_capital),
+                )
+
+            if paper_trading:
+                # Paper mode: the `positions` accounting table may carry OPEN rows
+                # from prior real-mode or test runs that were never force-closed.
+                # portfolio_state reads from that table, so stale rows block every
+                # new paper order.  Safe to force-close all of them at startup
+                # because paper PnL is tracked exclusively via order_tracking, not
+                # via the double-entry positions table.
+                await self._await_step(
+                    "ledger.close_stale_paper_positions",
+                    self.ledger.execute(
+                        "UPDATE positions SET status='CLOSED',"
+                        " exit_timestamp=CURRENT_TIMESTAMP WHERE status='OPEN'"
+                    ),
+                )
+                logger.info("paper_positions_reset",
+                            msg="stale OPEN positions force-closed at paper startup")
+
             # 3. API Client
             api_config = self.config.get('api', {}).get('polymarket', {})
             
@@ -1365,7 +1511,11 @@ class TradingSystem:
             await self._safe_await(
                 "settle_resolved_open_orders",
                 self._settle_resolved_open_orders(),
-                timeout_seconds=self.network_timeout_seconds,
+                # Use a generous fixed timeout: with 190+ open orders the scan
+                # makes one Gamma API call per unique market (throttled ~0.6 s
+                # each).  20 s (network_timeout_seconds default) is far too short
+                # — the scan gets killed every cycle and never completes.
+                timeout_seconds=300.0,
                 default=None,
             )
 
@@ -1414,6 +1564,8 @@ class TradingSystem:
         if self.ledger is None or self.api_client is None:
             return
 
+        logger.info("settlement_scan_begin")
+
         open_orders = await self._safe_await(
             "ledger.get_open_orders.settlement_poll",
             self.ledger.get_open_orders(),
@@ -1421,12 +1573,19 @@ class TradingSystem:
             default=[],
         )
         if not open_orders:
+            logger.info(
+                "settlement_scan_complete",
+                open_positions_checked=0,
+                resolved_count=0,
+                settled_order_ids=[],
+            )
             return
 
         # De-duplicate market_id lookups so we don't hammer the API for every
         # order when multiple orders are open in the same market.
         market_cache: Dict[str, Any] = {}
         settled_count = 0
+        settled_order_ids: list = []
 
         for row in open_orders:
             order_id = row.get("order_id", "")
@@ -1445,12 +1604,45 @@ class TradingSystem:
                 market_cache[market_id] = market_data or {}
 
             market = market_cache[market_id]
-            market_resolved = bool(market.get("closed") or market.get("resolved"))
+            # Resolution check: handle both CLOB (closed/resolved bool) and Gamma
+            # API (active=False) response formats.  active=False means the market
+            # window has closed; paired with outcomePrices it means fully resolved.
+            market_resolved = bool(
+                market.get("closed")
+                or market.get("resolved")
+                or market.get("active") is False
+                or market.get("resolutionTime")
+            )
             if not market_resolved:
                 continue
 
             # Compute PnL using the same formula as reconcile_open_orders.
+            # Check CLOB fields first, then Gamma API outcomePrices/outcomes.
             raw_payout = market.get("payout_numerator") or market.get("payout_per_share")
+            if raw_payout is None:
+                # Gamma API: outcomePrices=["0","1"] paired with outcomes=["Up","Down"].
+                # Note: Gamma encodes outcomePrices as a JSON string, not an array —
+                # must json.loads() it before indexing.
+                # order_tracking stores outcome as "YES"/"NO" which always maps to the
+                # FIRST/SECOND token in Polymarket binary markets (YES=Up=index 0,
+                # NO=Down=index 1).  Use positional mapping, not string matching, to
+                # avoid "YES" vs "Up" mismatch causing ValueError.
+                import json as _json
+                outcome_prices_raw = market.get("outcomePrices")
+                order_outcome = (row.get("outcome") or "").strip().upper()  # YES or NO
+                if outcome_prices_raw and order_outcome:
+                    try:
+                        outcome_prices = (
+                            _json.loads(outcome_prices_raw)
+                            if isinstance(outcome_prices_raw, str)
+                            else outcome_prices_raw
+                        )
+                        if order_outcome in {"YES", "UP"}:
+                            raw_payout = outcome_prices[0]
+                        elif order_outcome in {"NO", "DOWN"}:
+                            raw_payout = outcome_prices[1]
+                    except (IndexError, ValueError, TypeError):
+                        raw_payout = None
             if raw_payout is None:
                 # Market is closed but payout not yet posted — skip for now;
                 # the next maintenance cycle will retry.
@@ -1490,7 +1682,21 @@ class TradingSystem:
                 ),
                 timeout_seconds=5.0,
             )
+            # Release exposure: close any OPEN positions rows for this market so
+            # portfolio_state.refresh() stops counting them against the risk budget.
+            if market_id:
+                await self._safe_await(
+                    f"ledger.close_positions_for_market.{market_id}",
+                    self.ledger.execute(
+                        "UPDATE positions SET status='CLOSED',"
+                        " exit_timestamp=CURRENT_TIMESTAMP"
+                        " WHERE market_id=? AND status='OPEN'",
+                        (market_id,),
+                    ),
+                    timeout_seconds=5.0,
+                )
             settled_count += 1
+            settled_order_ids.append(order_id)
             logger.info(
                 "order_settled_live",
                 order_id=order_id,
@@ -1500,12 +1706,12 @@ class TradingSystem:
                 payout_per_share=str(payout_per_share),
             )
 
-        if settled_count > 0:
-            logger.info(
-                "settlement_poll_complete",
-                settled=settled_count,
-                checked=len(open_orders),
-            )
+        logger.info(
+            "settlement_scan_complete",
+            open_positions_checked=len(open_orders),
+            resolved_count=settled_count,
+            settled_order_ids=settled_order_ids,
+        )
     
     async def stop(self):
         """Stop the trading system."""

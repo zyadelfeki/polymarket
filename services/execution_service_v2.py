@@ -559,7 +559,11 @@ class ExecutionServiceV2:
 
         with CorrelationContext.use(correlation_id):
             try:
-                if self.network_monitor.check_partition():
+                # Network partition detection is only meaningful in live mode.
+                # In paper mode no real API calls are made so record_success()
+                # is never called → the monitor always trips after 15 s → every
+                # paper order is blocked.  Skip the check entirely for paper runs.
+                if not is_paper_trading and self.network_monitor.check_partition():
                     raise NetworkPartitionError("Trading halted: network partition detected")
                 if not token_id or not isinstance(token_id, str):
                     raise ValueError("Invalid token_id")

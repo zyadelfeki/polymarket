@@ -195,10 +195,20 @@ class LatencyArbitrageEngine:
         return net_edge
 
     def _min_required_net_edge(self, price: Decimal, timeframe: Optional[str]) -> Decimal:
+        """Return the minimum net-edge (after fees + slippage) required to trade.
+
+        A small premium is added for mid-market prices (0.40–0.60) because
+        markets near 50% are typically the most efficient.  The premium was
+        previously hard-coded at 0.06, which effectively killed all near-even
+        trades regardless of the configured min_edge.  It is now capped at
+        0.04 so the configured threshold is still meaningful.
+        """
         base_min_edge = self._resolve_min_edge(timeframe)
         price_dec = to_decimal(price)
-        midpoint_min = max(base_min_edge, Decimal("0.06"))
-        outer_min = max(base_min_edge, Decimal("0.03"))
+        # Add a small 0.01 premium for prices near the midpoint; do NOT let
+        # the floor override user-configured thresholds by more than that.
+        midpoint_min = max(base_min_edge, base_min_edge + Decimal("0.01"))
+        outer_min = base_min_edge
         if Decimal("0.40") < price_dec < Decimal("0.60"):
             return midpoint_min
         return outer_min
@@ -340,14 +350,43 @@ class LatencyArbitrageEngine:
             self._maybe_log_scan_stats()
             return None
 
-        btc_price = await self._get_btc_price()
+        # ------------------------------------------------------------------ #
+        # Fetch spot prices for all supported assets.  The strategy was       #
+        # previously BTC-only, but Polymarket may not have active BTC 15-min  #
+        # markets at all times.  Support ETH/SOL/XRP so we never silently     #
+        # emit zero opportunities simply because BTC markets are absent.      #
+        # ------------------------------------------------------------------ #
+        _asset_keywords: Dict[str, List[str]] = {
+            "BTC": ["btc", "bitcoin"],
+            "ETH": ["eth", "ethereum"],
+            "SOL": ["sol", "solana"],
+            "XRP": ["xrp", "ripple"],
+        }
+        asset_prices: Dict[str, Optional[Decimal]] = {}
+        for _sym in _asset_keywords:
+            asset_prices[_sym] = await self._get_asset_price(_sym)
+
+        logger.info(
+            "diagnostic_asset_prices",
+            btc=str(asset_prices.get("BTC")),
+            eth=str(asset_prices.get("ETH")),
+            sol=str(asset_prices.get("SOL")),
+            xrp=str(asset_prices.get("XRP")),
+        )
+
+        # Backward-compat alias so downstream helpers keep working.
+        btc_price = asset_prices.get("BTC")
         if btc_price is None:
             logger.warning("no_btc_price")
             logger.info("diagnostic_btc_price", source="binance", value=None)
+        else:
+            logger.info("diagnostic_btc_price", source="binance", value=str(btc_price))
+
+        active_assets = [a for a, p in asset_prices.items() if p is not None]
+        if not active_assets:
+            logger.warning("no_asset_prices_available")
             self._maybe_log_scan_stats()
             return None
-
-        logger.info("diagnostic_btc_price", source="binance", value=str(btc_price))
 
         all_markets = await self._get_active_markets()
         if not all_markets:
@@ -369,31 +408,58 @@ class LatencyArbitrageEngine:
 
         logger.debug("markets_fetched", total=len(all_markets))
 
-        btc_markets = [
-            m for m in all_markets
-            if any(keyword in (m.get("question") or "").lower() for keyword in ["btc", "bitcoin"])
-        ]
+        # Build per-asset candidate lists; only include assets with a live price.
+        prioritized_markets: List[Dict] = []
+        for _asset, _keywords in _asset_keywords.items():
+            if asset_prices.get(_asset) is None:
+                logger.debug("asset_price_unavailable_skipping", asset=_asset)
+                continue
+            _asset_markets = [
+                m for m in all_markets
+                if any(kw in (m.get("question") or "").lower() for kw in _keywords)
+            ]
+            logger.debug("asset_markets_filtered", asset=_asset, count=len(_asset_markets))
+            _asset_prioritized = self._select_markets_for_all_timeframes(
+                asset=_asset, markets=_asset_markets
+            )
+            for _entry in _asset_prioritized:
+                _entry["asset"] = _asset  # tag so the scan loop knows which price to use
+            if not _asset_prioritized and _asset_markets:
+                sample_questions = [
+                    (m.get("question") or m.get("title") or "")[:120]
+                    for m in _asset_markets[:3]
+                ]
+                logger.warning(
+                    "no_supported_timeframe_markets_found",
+                    asset=_asset,
+                    samples=sample_questions,
+                )
+            prioritized_markets.extend(_asset_prioritized)
 
-        logger.debug("btc_markets_filtered", count=len(btc_markets))
-
-        prioritized_markets = self._select_markets_for_all_timeframes(asset="BTC", markets=btc_markets)
+        # Re-sort combined list by timeframe priority, then soonest expiry first.
+        prioritized_markets.sort(
+            key=lambda mi: (
+                mi["priority"],
+                self._extract_time_left_seconds(mi["data"]) or 10 ** 9,
+            )
+        )
 
         logger.debug("multi_timeframe_markets_found", count=len(prioritized_markets))
 
-        if not prioritized_markets and btc_markets:
-            sample_questions = [
-                (m.get("question") or m.get("title") or "")[:120]
-                for m in btc_markets[:3]
-            ]
-            logger.warning("no_supported_timeframe_markets_found", samples=sample_questions)
-
         for market_info in prioritized_markets:
             timeframe = market_info["timeframe"]
+            market_asset = market_info.get("asset", "BTC")  # tagged above; default BTC for compat
             market = await self._enrich_market_if_needed(market_info["data"])
+            market_asset_price = asset_prices.get(market_asset)
+
+            if market_asset_price is None:
+                logger.debug("scan_skipped_no_asset_price", asset=market_asset, timeframe=timeframe)
+                continue
 
             self.scan_stats["scans"] += 1
             logger.info(
                 "diagnostic_scanning_market",
+                asset=market_asset,
                 market_id=market.get("id") or market.get("condition_id"),
                 slug=market.get("slug"),
                 question=market.get("question"),
@@ -404,6 +470,7 @@ class LatencyArbitrageEngine:
             if not yes_token_id:
                 logger.warning(
                     "diagnostic_missing_token_ids",
+                    asset=market_asset,
                     market_id=market.get("id") or market.get("condition_id"),
                     timeframe=timeframe,
                 )
@@ -423,14 +490,17 @@ class LatencyArbitrageEngine:
                     spread_bps = None
                 logger.info(
                     "live_market_detected",
-                    asset="BTC",
+                    asset=market_asset,
                     timeframe=timeframe,
                     bid=str(summary.get("best_bid")),
                     ask=str(summary.get("best_ask")),
-                    spread=str(summary.get("best_ask") - summary.get("best_bid")),
+                    spread=str(
+                        to_decimal(summary.get("best_ask")) - to_decimal(summary.get("best_bid"))
+                    ),
                 )
                 logger.info(
                     "spread_calculation",
+                    asset=market_asset,
                     market_id=market.get("id") or market.get("condition_id"),
                     timeframe=timeframe,
                     bid=str(summary.get("best_bid")),
@@ -442,6 +512,7 @@ class LatencyArbitrageEngine:
                     logger.info(
                         "market_skipped",
                         reason="spread_too_wide",
+                        asset=market_asset,
                         spread_bps=spread_bps,
                         max_spread_bps=self.max_spread_bps,
                         market_id=market.get("id") or market.get("condition_id"),
@@ -450,12 +521,13 @@ class LatencyArbitrageEngine:
             else:
                 logger.warning(
                     "dead_market_detected",
-                    asset="BTC",
+                    asset=market_asset,
                     timeframe=timeframe,
                     market_id=market.get("id") or market.get("condition_id"),
                 )
                 logger.info(
                     "spread_calculation",
+                    asset=market_asset,
                     market_id=market.get("id") or market.get("condition_id"),
                     timeframe=timeframe,
                     bid=str(summary.get("best_bid")),
@@ -466,12 +538,14 @@ class LatencyArbitrageEngine:
                 if self.enforce_orderbook_validation:
                     continue
 
-            opportunity = await self._check_market_arbitrage(market, btc_price, timeframe=timeframe)
+            opportunity = await self._check_market_arbitrage(
+                market, market_asset_price, timeframe=timeframe, asset=market_asset
+            )
             if opportunity:
                 self.scan_stats["opportunities"] += 1
                 logger.info(
                     "opportunity_found",
-                    asset="BTC",
+                    asset=market_asset,
                     timeframe=timeframe,
                     edge_pct=str(opportunity.get("edge")),
                 )
@@ -479,6 +553,7 @@ class LatencyArbitrageEngine:
                 return opportunity
             logger.debug(
                 "diagnostic_no_opportunity",
+                asset=market_asset,
                 market_id=market.get("id") or market.get("condition_id"),
                 min_edge=str(self.min_edge),
                 timeframe=timeframe,
@@ -551,8 +626,24 @@ class LatencyArbitrageEngine:
                 )
                 continue
 
+            # Reject markets that are at or past expiry.  _extract_time_left_seconds
+            # returns 0 (clamped) for expired markets, so 0 < min_time_left_seconds
+            # correctly prunes them before they reach scan_opportunities and Charlie.
+            _time_left = self._extract_time_left_seconds(market)
+            if _time_left is not None and _time_left < self.min_time_left_seconds:
+                logger.info(
+                    "btc_market_rejected",
+                    market_id=market_id,
+                    reason="too_close_to_expiry",
+                    time_left_seconds=_time_left,
+                    min_time_left_seconds=self.min_time_left_seconds,
+                    question=(market.get("question") or market.get("title") or "")[:140],
+                )
+                continue
+
             logger.info(
                 "btc_market_accepted",
+
                 market_id=market_id,
                 timeframe=timeframe,
                 reason=detection_reason,
@@ -820,28 +911,41 @@ class LatencyArbitrageEngine:
     async def _check_market_arbitrage(
         self,
         market: Dict,
-        btc_price: Decimal,
+        btc_price: Decimal,  # kept as `btc_price` for backward-compat; holds the asset's spot price
         timeframe: Optional[str] = None,
+        asset: Optional[str] = None,
     ) -> Optional[Dict]:
         """
-        Check 15-minute UP/DOWN market for arbitrage opportunity.
+        Check an UP/DOWN market for a latency-arbitrage opportunity.
+
+        ``btc_price`` is now the *generic* spot price for whatever asset the
+        market tracks (BTC, ETH, SOL, XRP).  The parameter name is kept for
+        backward-compatibility with existing usages and tests.
+
+        ``asset`` is resolved from the question text when not supplied by the
+        caller (legacy code path).
         """
         question_raw = market.get("question", "")
         market_id = market.get("id") or market.get("condition_id") or market.get("market_id")
         question = question_raw.lower()
 
-        asset = None
-        if "bitcoin" in question or "btc" in question:
-            asset = "BTC"
-        elif "ethereum" in question or "eth" in question:
-            asset = "ETH"
-        elif "solana" in question or "sol" in question:
-            asset = "SOL"
-        elif "xrp" in question:
-            asset = "XRP"
-
-        if asset != "BTC":
-            return None
+        # Resolve asset from question when not injected by the caller.
+        if asset is None:
+            if "bitcoin" in question or "btc" in question:
+                asset = "BTC"
+            elif "ethereum" in question or "eth" in question:
+                asset = "ETH"
+            elif "solana" in question or "sol" in question:
+                asset = "SOL"
+            elif "xrp" in question:
+                asset = "XRP"
+            else:
+                logger.debug(
+                    "skipping_market_unknown_asset",
+                    market_id=market_id,
+                    question=(question_raw or "")[:60],
+                )
+                return None
 
         self._seed_market_start_price_from_tick(market=market, btc_price=btc_price)
 
@@ -919,7 +1023,14 @@ class LatencyArbitrageEngine:
             else:
                 true_prob_up, true_prob_down = Decimal("0.05"), Decimal("0.95")
         elif abs(price_change_pct) < Decimal("0.02"):
-            logger.debug("price_too_neutral", change_pct=str(price_change_pct))
+            logger.info(
+                "edge_candidate_rejected",
+                reason="price_too_neutral",
+                asset=asset,
+                market_id=market_id,
+                change_pct=str(price_change_pct),
+                threshold="0.02%",
+            )
             return None
         else:
             if self.charlie:
@@ -969,6 +1080,7 @@ class LatencyArbitrageEngine:
         logger.info(
             "diagnostic_edge_calculation",
             market_id=market_id,
+            asset=asset,
             true_prob_up=str(true_prob_up),
             true_prob_down=str(true_prob_down),
             yes_price=str(prices["yes"]),
@@ -985,12 +1097,29 @@ class LatencyArbitrageEngine:
         min_edge_threshold_up = self._min_required_net_edge(prices["yes"], timeframe)
         min_edge_threshold_down = self._min_required_net_edge(prices["no"], timeframe)
 
+        # ---- edge_candidate_computed: always emitted so replay / sweep can  ----
+        # ---- analyse the full decision frontier even for rejected trades.   ----
+        logger.info(
+            "edge_candidate_computed",
+            market_id=market_id,
+            asset=asset,
+            timeframe=timeframe,
+            net_edge_up=str(net_edge_up),
+            net_edge_down=str(net_edge_down),
+            min_edge_threshold_up=str(min_edge_threshold_up),
+            min_edge_threshold_down=str(min_edge_threshold_down),
+            passes_up=bool(net_edge_up > min_edge_threshold_up),
+            passes_down=bool(net_edge_down > min_edge_threshold_down and net_edge_down > net_edge_up),
+            question=(question_raw or "")[:80],
+        )
+
         if net_edge_up > min_edge_threshold_up and net_edge_up >= net_edge_down:
             return {
                 "market_id": market_id,
                 "token_id": prices["yes_token_id"],
                 "side": "YES",
                 "outcome": "UP",
+                "asset": asset,
                 "true_prob": true_prob_up,
                 "market_price": prices["yes"],
                 "edge": net_edge_up,
@@ -999,6 +1128,7 @@ class LatencyArbitrageEngine:
                 "charlie_confidence": charlie_confidence,
                 "direction": "UP",
                 "btc_price": btc_price,
+                "asset_price": btc_price,
                 "start_price": start_price,
                 "price_change_pct": price_change_pct,
                 "question": question_raw,
@@ -1011,6 +1141,7 @@ class LatencyArbitrageEngine:
                 "token_id": prices["no_token_id"],
                 "side": "NO",
                 "outcome": "DOWN",
+                "asset": asset,
                 "true_prob": true_prob_down,
                 "market_price": prices["no"],
                 "edge": net_edge_down,
@@ -1019,6 +1150,7 @@ class LatencyArbitrageEngine:
                 "charlie_confidence": charlie_confidence,
                 "direction": "DOWN",
                 "btc_price": btc_price,
+                "asset_price": btc_price,
                 "start_price": start_price,
                 "price_change_pct": price_change_pct,
                 "question": question_raw,
@@ -1558,18 +1690,23 @@ class LatencyArbitrageEngine:
         return best_price
 
     async def _get_btc_price(self) -> Optional[Decimal]:
+        return await self._get_asset_price("BTC")
+
+    async def _get_asset_price(self, asset: str) -> Optional[Decimal]:
+        """Get current spot price for any supported asset via the Binance feed."""
+        symbol = asset.upper()
         if hasattr(self.binance, "get_current_price"):
-            price = self.binance.get_current_price("BTC")
+            price = self.binance.get_current_price(symbol)
             if price is not None:
                 return Decimal(str(price))
 
         if hasattr(self.binance, "get_price"):
-            price = await self.binance.get_price("BTC")
+            price = await self.binance.get_price(symbol)
             if price is not None:
                 return Decimal(str(price))
 
         if hasattr(self.binance, "get_price_data"):
-            price_data = await self.binance.get_price_data("BTC")
+            price_data = await self.binance.get_price_data(symbol)
             if price_data is not None and getattr(price_data, "price", None) is not None:
                 return Decimal(str(price_data.price))
 
@@ -1670,7 +1807,7 @@ class LatencyArbitrageEngine:
             try:
                 fifteen_min_markets = await asyncio.wait_for(
                     self.polymarket.get_crypto_15min_markets(),
-                    timeout=10.0,
+                    timeout=45.0,  # was 10s; concurrent refactor brings actual runtime to ~2s
                 )
                 _append_unique(fifteen_min_markets)
             except asyncio.TimeoutError:

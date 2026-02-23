@@ -41,8 +41,12 @@ import os
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Dict, Optional
+import structlog
 
-logger = logging.getLogger(__name__)
+# structlog is used throughout the polymarket codebase — stdlib logging does
+# NOT accept keyword arguments (reason=, market_id=, …) so all structured
+# log calls here must go through structlog.
+logger = structlog.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,12 @@ class BoundaryValidator:
     MIN_QUANTITY = Decimal("0")
     MAX_QUANTITY = Decimal("100000")
 
-    MARKET_ID_PATTERN = re.compile(r"^0x[a-fA-F0-9]{64}$")
+    # Polymarket uses two valid market_id formats:
+    #   1. Condition ID  — 0x-prefixed 64-hex-char string (CLOB / MATIC format)
+    #   2. Integer ID    — plain decimal number string   (REST API / gamma format)
+    # Both must be accepted; rejecting numeric IDs blocks all paper trades where
+    # the strategy engine returns REST-API-style integer market IDs.
+    MARKET_ID_PATTERN = re.compile(r"^(0x[a-fA-F0-9]{64}|[0-9]+)$")
 
     @classmethod
     def _to_decimal(cls, value: Any, field_name: str) -> Decimal:

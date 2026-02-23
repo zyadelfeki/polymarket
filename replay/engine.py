@@ -460,6 +460,9 @@ class ReplayEngine:
         self._slippage_bps = slippage_bps
         self._baseline_path = baseline_path
         self._tolerances = regression_tolerances or dict(self.DEFAULT_REGRESSION_TOLERANCES)
+        # Mutable per-run replay state — reset at the start of every run() call.
+        self._replay_equity: float = self._initial_equity
+        self._open_market_ids: set = set()
 
     # ---- public interface ------------------------------------------------
 
@@ -482,6 +485,11 @@ class ReplayEngine:
             empty["config"] = self._kelly_config_summary()
             return empty
 
+        # Reset per-run mutable state so run() is safely re-entrant across
+        # sweep iterations that reuse the same ReplayEngine instance.
+        self._replay_equity = self._initial_equity
+        self._open_market_ids = set()
+
         # In-memory ledger — completely isolated from production data.
         ledger = AsyncLedger(db_path=":memory:", pool_size=1)
         await ledger.pool.initialize()
@@ -499,6 +507,13 @@ class ReplayEngine:
         )
 
         results: Dict[str, Any] = metrics.to_dict()
+        # Derived fields — require engine-level state not tracked in ReplayMetrics.
+        # deployed_capital = cash committed to open positions not yet settled.
+        # final_replay_equity = remaining liquid capital (initial - deployed).
+        # open_trades = positions entered but not yet resolved by a settlement.
+        results["open_trades"] = results["total_trades"] - results["settled_trades"]
+        results["deployed_capital"] = round(self._initial_equity - self._replay_equity, 4)
+        results["final_replay_equity"] = round(self._replay_equity, 4)
         results["summary"] = self._format_summary(results)
         results["config"] = self._kelly_config_summary()
 
@@ -597,6 +612,7 @@ class ReplayEngine:
                         ev, ledger, fake_client, do_not_trade, kelly_sizer, metrics
                     )
                 elif ev.event in (
+                    "order_settled",               # production bot event name
                     "order_settled_live",
                     "order_settled_offline",
                     "ledger_order_settled_offline",
@@ -633,6 +649,11 @@ class ReplayEngine:
         if not market_id:
             return
 
+        # BUG B fix: one open position per market at a time.
+        # The production bot never double-enters a market; replay must match.
+        if market_id in self._open_market_ids:
+            return
+
         if do_not_trade.is_blocked(market_id):
             return
 
@@ -645,6 +666,12 @@ class ReplayEngine:
         if market_price <= Decimal("0") or edge_raw <= Decimal("0"):
             return
 
+        # BUG C fix: reject extreme-probability tokens.
+        # Price < 0.05 → near-certain loser with massive quantity risk.
+        # Price > 0.95 → near-certain winner with near-zero edge vs 1.0 payout.
+        if market_price < Decimal("0.05") or market_price > Decimal("0.95"):
+            return
+
         # Register market in fake client so get_market() works during replay.
         fake_client.set_market(market_id, {
             "id": market_id,
@@ -653,8 +680,17 @@ class ReplayEngine:
             "closed": False,
         })
 
-        equity = await ledger.get_equity()
+        # BUG A fix: use a local running equity total instead of reading from
+        # the ledger cache.  The AsyncLedger uses a TTLCache (ttl=5 s) on
+        # get_equity(), so hundreds of replay events within one second all see
+        # the same stale value.  Tracking it locally is simpler and exact.
+        equity = Decimal(str(self._replay_equity))
         if equity <= Decimal("0"):
+            return
+        # Hard stop: preserve at least 10% of starting capital as a buffer.
+        # This prevents the engine from deploying 100% of the bankroll into
+        # open positions and then having no capital left for subsequent trades.
+        if self._replay_equity < (self._initial_equity * 0.10):
             return
 
         # p_win: prefer charlie_p_win logged by bot; fall back to price + edge.
@@ -685,9 +721,19 @@ class ReplayEngine:
             Decimal("0.01"), rounding=ROUND_DOWN
         )
 
-        # Minimum position guard (from production config).
-        min_pos = Decimal(str(CHARLIE_CONFIG.get("min_position_size", Decimal("1.00"))))
-        if order_value < min_pos:
+        # Minimum position guard — scaled to replay capital so a small account
+        # (e.g. $13.98) is never blocked by an absolute floor calibrated for a
+        # larger account.  We also guard against min_position_size being None
+        # (present in config but explicitly unset), which would cause
+        # Decimal(str(None)) → InvalidOperation and silently kill every trade.
+        _raw_min = CHARLIE_CONFIG.get("min_position_size") or "1.00"
+        configured_min = Decimal(str(_raw_min))
+        replay_min_pos = min(
+            configured_min,
+            (equity * Decimal("0.005")).quantize(Decimal("0.01"), rounding=ROUND_DOWN),
+        )
+        replay_min_pos = max(replay_min_pos, Decimal("0.01"))  # hard floor: 1 cent
+        if order_value < replay_min_pos:
             return
 
         side = str(d.get("side") or "YES").upper()
@@ -732,6 +778,9 @@ class ReplayEngine:
             edge=float(edge_raw),
             regime=technical_regime,
         )
+        # BUG A + B: deplete local equity and mark market as open.
+        self._replay_equity -= float(order_value)
+        self._open_market_ids.add(market_id)
 
     async def _handle_settlement(
         self,
@@ -759,6 +808,10 @@ class ReplayEngine:
             pnl=pnl,
             order_id=order_id,
         )
+        # BUG B: release the market so replay can re-enter if it re-lists.
+        self._open_market_ids.discard(d.get("market_id", ""))
+        # BUG A: restore settled capital (pnl can be positive or negative).
+        self._replay_equity += pnl
 
     # ---- formatting / output --------------------------------------------
 

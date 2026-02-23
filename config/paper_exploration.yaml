@@ -1,0 +1,246 @@
+# ==================================================================
+# PAPER EXPLORATION CONFIG — signal discovery with tight risk caps
+# ==================================================================
+#
+# Purpose: Deliberately relaxed edge thresholds so the bot actually
+# emits `arbitrage_opportunity_detected` and `order_settled` events
+# into production.log.  Those events feed the Kelly/edge sweep and
+# all downstream analysis.
+#
+# THIS IS NOT A PRODUCTION CONFIG.  Max bet is capped at 0.5% of
+# capital so paper-mode exposure is trivially small, while all other
+# risk guards (circuit breaker, DoNotTrade, liquidity) remain active.
+#
+# Usage:
+#   python main.py --config config/paper_exploration.yaml --mode paper
+#
+# Once you have ≥30 settled trades in production.log, switch back to
+# config/production.yaml and run the Kelly sweep to find optimal params.
+# ==================================================================
+
+environment: paper_exploration
+version: 1.0.1
+debug: false
+log_level: DEBUG   # DEBUG so diagnostic_* events surface fully
+
+secrets:
+  backend: local
+  aws_region: us-east-1
+  local_secrets_path: .secrets.enc
+
+trading:
+  paper_trading: true
+  initial_capital: 10000.00
+  max_position_size_pct: 0.5     # 0.5% — trivially small
+  max_total_exposure_pct: 5.0    # never more than 5% paper-exposure at once
+  min_position_size: 1.00
+  min_order_size: 1.00
+  max_order_size: 50.00          # hard $50 cap per order
+  min_price: 0.02
+  max_price: 0.98
+  max_orders_per_minute: 30
+  max_orders_per_hour: 500
+  max_daily_orders: 5000
+
+risk:
+  circuit_breaker_enabled: true
+  max_drawdown_pct: 15.0
+  max_loss_streak: 5
+  daily_loss_limit_pct: 10.0
+  recovery_threshold_pct: 5.0
+  cooldown_minutes: 30
+  half_open_max_position_pct: 0.5
+  max_open_positions: 20
+  max_positions_per_market: 3
+  max_exposure_per_strategy: 5.0
+
+api:
+  polymarket:
+    base_url: https://clob.polymarket.com
+    rate_limit: 8.0
+    timeout_seconds: 10.0
+    max_retries: 3
+    retry_delay_seconds: 1.0
+    max_retry_delay_seconds: 30.0
+  binance:
+    ws_url: wss://stream.binance.com:9443/ws
+    heartbeat_interval: 30.0
+    max_reconnect_delay: 60.0
+    message_queue_size: 1000
+
+database:
+  path: data/trading.db
+  pool_size: 5
+  cache_ttl_seconds: 5
+  enable_wal: true
+  vacuum_interval_hours: 24
+  backup_enabled: false          # skip backups during exploration runs
+
+monitoring:
+  health_check_interval: 30.0
+  health_check_timeout: 10.0
+  failure_threshold: 3
+  metrics_enabled: true
+  metrics_interval: 60.0
+  metrics_retention_days: 30
+  alerts_enabled: false          # suppress noise during exploration
+  alert_cooldown: 300.0
+  auto_restart_enabled: true
+  max_restart_attempts: 3
+  restart_cooldown: 60.0
+
+logging:
+  console_enabled: true
+  file_enabled: true
+  file_path: logs/production.log   # shared with sweep so events land in one file
+  max_file_size_mb: 100
+  max_backup_count: 10
+  format: json
+  include_timestamp: true
+  include_level: true
+  include_logger: true
+  levels:
+    root: DEBUG
+    api_client: DEBUG
+    execution: INFO
+    websocket: INFO
+    health_monitor: INFO
+    circuit_breaker: WARNING
+    database: WARNING
+
+strategies:
+  latency_arb:
+    enabled: true
+    max_position_size_pct: 0.5
+
+    # ---------- RELAXED thresholds for exploration ----------
+    # These are intentionally lower than production values so that
+    # realistic (but not cherry-picked) trades actually get logged.
+    # Run the Kelly sweep once you have data to find the optimal level.
+    min_edge: 0.005              # was 0.03; now 0.5% — expect more trades
+    max_edge: 0.50
+    slippage_buffer: 0.01
+
+    # Keep Polymarket's realistic fee model
+    # (calculate_dynamic_fee handles this dynamically)
+
+    min_orderbook_size: 5.0      # was 10; lower to accept thinner books
+    enforce_orderbook_validation: true
+    max_spread_bps: 800          # up from 500; allow slightly wider markets
+
+    market_cache_ttl_seconds: 10
+    market_scan_limit: 200
+    min_time_left_seconds: 15
+    max_time_left_seconds: 3600  # up to 1-hour markets
+
+    peak_hours_only: false
+    use_dynamic_edge_thresholds: true
+
+    # Per-timeframe edge gates (lower than production to log more candidates)
+    edge_thresholds:
+      15min: 0.005
+      hourly: 0.005
+      4hour: 0.005
+      daily: 0.005
+
+    # Scan interval floor — 5 seconds; BTC+ETH ticks fire more often
+    min_price_movement: 0.01     # 1% movement trigger (was 2%)
+    confidence_threshold: 0.6
+    timeframe_priority:
+      - hourly
+      - daily
+      - 4hour
+      - 15min
+
+  mean_reversion:
+    enabled: false               # not enough data yet; keep disabled
+  volatility_breakout:
+    enabled: false
+
+markets:
+  crypto_symbols:
+    - BTC
+    - ETH
+    - SOL
+    - XRP                        # XRP has active 15-min markets too
+  min_volume_24h: 1000           # lower filter to avoid empty universe
+  min_liquidity: 100
+  max_spread_pct: 8.0
+  market_data_refresh_seconds: 5
+  orderbook_refresh_seconds: 2
+  price_refresh_seconds: 1
+
+execution:
+  default_order_type: LIMIT
+  use_post_only: true
+  order_timeout_seconds: 60
+  fill_check_interval_seconds: 2
+  max_partial_fill_wait_seconds: 30
+  cleanup_interval_seconds: 300
+  max_order_age_seconds: 3600
+  dlq_enabled: true
+  dlq_max_size: 1000
+  # Slippage auto-block: wider in exploration to avoid blocking paper trades
+  auto_block_slippage_bps: 500
+
+performance:
+  max_concurrent_orders: 5
+  max_concurrent_api_calls: 5
+  enable_caching: true
+  cache_size: 1000
+  http_pool_size: 10
+  http_pool_maxsize: 20
+
+development:
+  dry_run: false
+  simulate_fills: true
+  simulate_latency: false
+  skip_market_data: false
+  mock_api_calls: false
+  enable_profiling: false
+  profile_output_path: logs/profile.json
+
+startup:
+  component_timeout_seconds: 25.0
+  network_timeout_seconds: 20.0
+  loop_tick_seconds: 5.0         # faster tick for exploration
+  market_probe_interval_seconds: 20.0
+  market_probe_limit: 20
+  strategy_scan_min_interval_seconds: 2.0
+  strategy_scan_timeout_seconds: 30.0
+
+notifications:
+  telegram:
+    enabled: false
+  email:
+    enabled: false
+  pagerduty:
+    enabled: false
+
+safety:
+  absolute_max_position_size: 50.00   # $50 hard cap (paper only)
+  absolute_max_total_exposure: 500.00
+  absolute_max_daily_loss: 100.00
+  absolute_max_drawdown: 150.00
+  emergency_stop_on_error: true
+  emergency_stop_on_disconnect: false
+  emergency_stop_on_health_fail: true
+  kill_switch_enabled: false
+  kill_switch_reason: ""
+
+# ==================================================================
+# NOTES
+#
+# What to watch after switching to this config:
+#   - `diagnostic_asset_prices` — confirms BTC/ETH/SOL/XRP all have prices
+#   - `asset_markets_filtered` — shows how many candidate markets per asset
+#   - `btc_market_accepted` / `btc_market_rejected` — explains why markets
+#     are included or excluded from the scan loop
+#   - `edge_candidate_computed` — always emitted; shows raw edge, net edge,
+#     and whether the trade WOULD pass the gate.  Key for gap analysis.
+#   - `arbitrage_opportunity_detected` — the money event; count should > 0
+#   - After settlement: `order_settled` events appear
+#
+# Once you have ≥30 settled trades, run:
+#   python experiments/sweep_kelly_and_edge.py --log-file logs/production.log
+# ==================================================================
