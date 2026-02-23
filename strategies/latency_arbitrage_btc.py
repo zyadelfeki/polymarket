@@ -25,6 +25,11 @@ from config.settings import settings
 from strategies.confidence_booster import ConfidenceBooster
 from utils.decimal_helpers import quantize_quantity, to_decimal
 
+try:
+    from data_feeds.binance_features import get_all_features as _get_all_binance_features
+except Exception:  # pragma: no cover
+    _get_all_binance_features = None
+
 getcontext().prec = 18
 
 
@@ -1919,7 +1924,7 @@ class LatencyArbitrageEngine:
         final_confidence = max(Decimal("0"), min(Decimal("1"), final_confidence))
         return probability, final_confidence
 
-    async def _get_charlie_prediction(self, **kwargs) -> Dict:
+    async def _get_charlie_prediction(self, symbol: str = "BTC", **kwargs) -> Dict:
         if not self.charlie:
             return {"probability": Decimal("0.5"), "confidence": Decimal("0.5")}
 
@@ -1927,7 +1932,19 @@ class LatencyArbitrageEngine:
         if not predictor:
             return {"probability": Decimal("0.5"), "confidence": Decimal("0.5")}
 
-        result = predictor(**kwargs)
+        # Fetch live Binance indicators so Charlie uses real features instead of
+        # the synthetic-neutral fallback (rsi=50, macd=0) that triggers degraded mode.
+        extra_features: Optional[Dict] = None
+        if _get_all_binance_features is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                extra_features = await loop.run_in_executor(
+                    None, _get_all_binance_features, symbol
+                )
+            except Exception:
+                extra_features = None  # fall through to synthetic fallback
+
+        result = predictor(symbol=symbol, extra_features=extra_features, **kwargs)
         if asyncio.iscoroutine(result):
             result = await result
 

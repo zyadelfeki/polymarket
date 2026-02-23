@@ -229,6 +229,20 @@ class CharliePredictionGate:
             implied_prob = no_implied
             edge = no_edge
 
+        # --- 2b. Coin-flip rejection: p_win within 3% of 0.5 = no signal ----
+        # Charlie is operating in degraded/neutral mode when it cannot
+        # distinguish direction.  A p_win of 0.5 ± 0.03 means the model has
+        # zero conviction — trading on it is pure noise.  Hard-block these.
+        if abs(p_win - 0.5) < 0.03:
+            logger.warning(
+                "charlie_coin_flip_rejected",
+                market_id=market_id,
+                p_win=p_win,
+                reason="p_win within 3% of 0.5 = no signal",
+                symbol=symbol,
+            )
+            return None
+
         # --- 3. Edge filter -------------------------------------------------
         if Decimal(str(edge)) < self._min_edge:
             logger.info(
@@ -394,19 +408,25 @@ class CharliePredictionGate:
 
     # ------------------------------------------------------------------ compat
 
-    async def predict_15min_move(self, symbol: str = "BTC", **_kwargs) -> Dict:
+    async def predict_15min_move(
+        self,
+        symbol: str = "BTC",
+        *,
+        extra_features: Optional[Dict] = None,
+        **_kwargs,
+    ) -> Dict:
         """
         Deprecated shim — kept for any existing call-sites.
         Migrate to ``evaluate_market`` for all new code.
+
+        ``extra_features`` is forwarded to ``get_signal_for_market`` so that
+        real Binance indicators are used instead of synthetic fallback values.
         """
-        logger.warning(
-            "predict_15min_move_called_directly — use evaluate_market() instead"
-        )
         if _get_signal_for_market is None:
             return {"probability": 0.5, "confidence": 0.0, "direction": "NEUTRAL"}
         try:
             sig = await asyncio.wait_for(
-                _get_signal_for_market(symbol, "15m"),
+                _get_signal_for_market(symbol, "15m", extra_features=extra_features),
                 timeout=self._signal_timeout,
             )
             p_win = sig["p_win"]

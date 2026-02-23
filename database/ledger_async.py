@@ -389,6 +389,7 @@ class ConnectionPool:
                 # Enable WAL mode and foreign keys
                 await temp_conn.execute("PRAGMA foreign_keys = ON")
                 await temp_conn.execute("PRAGMA journal_mode = WAL")
+                await temp_conn.execute("PRAGMA synchronous = NORMAL")  # safe + faster writes in WAL mode
                 
                 # Execute schema
                 await temp_conn.executescript(schema_sql)
@@ -431,6 +432,21 @@ class ConnectionPool:
                         """
                     )
                     await temp_conn.commit()
+                # Migration 2: mode column on positions (paper vs live)
+                # Real on-chain positions must NEVER be wiped by paper-mode startup.
+                if "mode" not in position_columns:
+                    await temp_conn.execute(
+                        "ALTER TABLE positions ADD COLUMN mode TEXT DEFAULT 'paper'"
+                    )
+                    # Mark any position with a non-synthetic entry_order_id as live.
+                    # Synthetic IDs always start with 'paper_'; real CLOB IDs are UUIDs.
+                    await temp_conn.execute(
+                        "UPDATE positions SET mode='live'"
+                        " WHERE entry_order_id IS NOT NULL"
+                        "   AND entry_order_id NOT LIKE 'paper%'"
+                        "   AND entry_order_id NOT LIKE 'pre_%'"
+                    )
+                    await temp_conn.commit()
 
                 cursor = await temp_conn.execute("PRAGMA table_info(transactions)")
                 transaction_columns = [row[1] for row in await cursor.fetchall()]
@@ -464,6 +480,53 @@ class ConnectionPool:
                     await temp_conn.execute("ALTER TABLE audit_log ADD COLUMN correlation_id TEXT")
                 if "details" not in audit_columns:
                     await temp_conn.execute("ALTER TABLE audit_log ADD COLUMN details TEXT")
+                await temp_conn.commit()
+
+                # Migration 2: order_tracking — mode, slippage tracking columns
+                cursor = await temp_conn.execute("PRAGMA table_info(order_tracking)")
+                ot_columns = [row[1] for row in await cursor.fetchall()]
+                if "mode" not in ot_columns:
+                    await temp_conn.execute(
+                        "ALTER TABLE order_tracking ADD COLUMN mode TEXT DEFAULT 'paper'"
+                    )
+                    # Mark real CLOB order IDs (non-paper, non-pre_ prefixed) as live
+                    await temp_conn.execute(
+                        "UPDATE order_tracking SET mode='live'"
+                        " WHERE order_id NOT LIKE 'paper%'"
+                        "   AND order_id NOT LIKE 'pre_%'"
+                    )
+                if "expected_price" not in ot_columns:
+                    await temp_conn.execute(
+                        "ALTER TABLE order_tracking ADD COLUMN expected_price REAL"
+                    )
+                if "filled_price" not in ot_columns:
+                    await temp_conn.execute(
+                        "ALTER TABLE order_tracking ADD COLUMN filled_price REAL"
+                    )
+                if "slippage_bps" not in ot_columns:
+                    await temp_conn.execute(
+                        "ALTER TABLE order_tracking ADD COLUMN slippage_bps REAL"
+                    )
+                await temp_conn.commit()
+
+                # Schema version table — tracks applied migrations
+                await temp_conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS schema_version (
+                        version     INTEGER PRIMARY KEY,
+                        applied_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+                        description TEXT
+                    )
+                    """
+                )
+                await temp_conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, description)"
+                    " VALUES (1, 'initial schema')"
+                )
+                await temp_conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, description)"
+                    " VALUES (2, 'mode column + slippage tracking on order_tracking and positions')"
+                )
                 await temp_conn.commit()
 
                 cursor = await temp_conn.execute(

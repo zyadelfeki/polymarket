@@ -52,6 +52,9 @@ from config_production import (
 )
 from services.portfolio_state import PortfolioState
 from services.do_not_trade import DoNotTradeRegistry
+from data_feeds.binance_features import get_all_features as _get_binance_features
+from risk.portfolio_risk import PortfolioRiskEngine, DrawdownMonitor
+from services.health_server import HealthServer
 
 
 def _build_model_feedback_callback():
@@ -178,6 +181,9 @@ class TradingSystem:
         self.kelly_sizer: Optional[KellySizer] = None
         self.charlie_gate: Optional[CharliePredictionGate] = None
         self.portfolio_state: Optional[PortfolioState] = None
+        self.portfolio_risk_engine: Optional[PortfolioRiskEngine] = None
+        self.drawdown_monitor: Optional[DrawdownMonitor] = None
+        self.health_server: Optional[HealthServer] = None
         self.do_not_trade: DoNotTradeRegistry = DoNotTradeRegistry(
             path="data/do_not_trade.json",
             auto_load=True,
@@ -333,6 +339,8 @@ class TradingSystem:
 
         async with self.strategy_scan_lock:
             self.last_strategy_scan_at = now
+            if self.health_server is not None:
+                self.health_server.record_scan()
             logger.info("strategy_scan_begin", trigger=trigger)
 
             try:
@@ -682,6 +690,26 @@ class TradingSystem:
         if self.charlie_gate is not None:
             # Map opportunity symbol to Charlie vocab (default BTC)
             opp_symbol = str(opportunity.get("symbol") or opportunity.get("btc_symbol") or "BTC")
+
+            # Fetch real Binance technical features (cached 60s; returns None on failure)
+            # This is what actually gives Charlie's ML models live market context.
+            # Without it every model returns HOLD → p_win=0.5 → coin-flip trades.
+            _extra_features = await asyncio.get_event_loop().run_in_executor(
+                None, _get_binance_features, opp_symbol
+            )
+            if _extra_features is not None:
+                logger.debug(
+                    "binance_features_ready",
+                    symbol=opp_symbol,
+                    rsi_14=round(_extra_features.get("rsi_14", 0), 2),
+                    macd=round(_extra_features.get("macd", 0), 6),
+                    book_imbalance=round(_extra_features.get("book_imbalance", 0), 4),
+                )
+            else:
+                logger.warning("binance_features_unavailable",
+                               symbol=opp_symbol,
+                               msg="Charlie will run in degraded mode — coin-flip rejection will block trade")
+
             charlie_rec = await self._safe_await(
                 "charlie_gate.evaluate_market",
                 self.charlie_gate.evaluate_market(
@@ -690,18 +718,7 @@ class TradingSystem:
                     symbol=opp_symbol,
                     timeframe="15m",
                     bankroll=equity,
-                    # TODO(feature-pipeline): pass real Binance indicators here so
-                    # Charlie's ML models receive live data instead of synthetic
-                    # neutral values.  Compute from the live price history:
-                    #   extra_features={
-                    #       "rsi_14": <computed RSI-14 from binance_prices>,
-                    #       "macd": <MACD line>,
-                    #       "price_vs_sma20": <(price - sma20) / sma20>,
-                    #       "price_vs_sma50": <(price - sma50) / sma50>,
-                    #       "volatility_20d": <20-period std-dev of log returns>,
-                    #   }
-                    # Without this, all models return HOLD and p_win=0.5 is used
-                    # (charlie_degraded_mode warning fires every call).
+                    extra_features=_extra_features,
                     override_win_rate=(
                         self.performance_tracker.get_rolling_win_rate(20)
                         if self.performance_tracker is not None
@@ -786,6 +803,65 @@ class TradingSystem:
                     )
                     return
 
+            # --- Institutional portfolio risk check (category + correlation) -
+            if self.portfolio_risk_engine is not None:
+                _open_pos = await self._safe_await(
+                    "ledger.get_open_orders.portfolio_risk",
+                    self.ledger.get_open_orders(),
+                    default=[],
+                )
+                # Build position list with cost = size * price and question from notes
+                _pos_list = []
+                for _p in (_open_pos or []):
+                    try:
+                        _cost = Decimal(str(_p.get("size", 0))) * Decimal(str(_p.get("price", 0) or 1))
+                    except Exception:
+                        _cost = Decimal("0")
+                    _notes = _p.get("notes", "") or ""
+                    _question = ""
+                    if "question=" in _notes:
+                        try:
+                            _question = _notes.split("question=")[1].split(" ")[0]
+                        except Exception:
+                            pass
+                    _pos_list.append({
+                        "market_id": _p.get("market_id", ""),
+                        "cost": _cost,
+                        "question": _question,
+                    })
+                _mkt_question = opportunity.get("question", "") or opportunity.get("market_question", "")
+                _approved_size, _reject_reason = self.portfolio_risk_engine.check_and_size(
+                    market_id=market_id,
+                    market_question=str(_mkt_question),
+                    kelly_size=order_value,
+                    equity=equity,
+                    open_positions=_pos_list,
+                )
+                _category = self.portfolio_risk_engine.categorize(str(_mkt_question))
+                _cat_exposure = sum(_p["cost"] for _p in _pos_list
+                                    if self.portfolio_risk_engine.categorize(_p["question"]) == _category)
+                _total_exposure = sum(_p["cost"] for _p in _pos_list)
+                logger.info(
+                    "portfolio_risk_check",
+                    market_id=market_id,
+                    category=_category,
+                    cat_exposure_pct=round(float(_cat_exposure / equity), 4) if equity else 0,
+                    total_exposure_pct=round(float(_total_exposure / equity), 4) if equity else 0,
+                    kelly_original=str(order_value),
+                    kelly_approved=str(_approved_size),
+                )
+                if _reject_reason:
+                    logger.warning(
+                        "order_blocked_portfolio_risk",
+                        market_id=market_id,
+                        reason=_reject_reason,
+                        trigger=trigger,
+                    )
+                    return
+                if _approved_size < order_value:
+                    order_value = _approved_size
+                    quantity = quantize_quantity(order_value / price) if price > Decimal("0") else quantity
+
             if order_value < min_position_size - Decimal("0.01"):
                 logger.info(
                     "order_blocked_kelly_size_too_small",
@@ -815,6 +891,16 @@ class TradingSystem:
             "charlie_edge": str(charlie_rec.edge) if charlie_rec is not None else None,
             "charlie_implied_prob": str(charlie_rec.implied_prob) if charlie_rec is not None else None,
         }
+
+        # Idempotent dedup key: 1-minute window prevents duplicate submissions
+        # when rapid price ticks fire multiple scans for the same opportunity.
+        import hashlib as _hashlib
+        from datetime import datetime as _dt, timezone as _tz
+        _minute_str = _dt.now(_tz.utc).strftime("%Y%m%dT%H%M")
+        _dedup_input = f"{market_id}:{token_id}:{side}:{price}:{order_value}:{_minute_str}"
+        _client_order_id = _hashlib.sha256(_dedup_input.encode()).hexdigest()[:16]
+        metadata["client_order_id"] = _client_order_id
+        metadata["expected_price"] = str(price)  # For slippage tracking on fill
 
         # Write CREATED row to unified order ledger before sending to exchange.
         # Stores model_votes so per-model feedback works on settlement.
@@ -899,6 +985,35 @@ class TradingSystem:
                             exchange_order_id, new_state_str
                         ),
                     )
+                # --- Slippage tracking: record filled_price vs expected_price ---
+                _fill_price = (
+                    getattr(result, "avg_price", None)
+                    or getattr(result, "average_price", None)
+                    or getattr(result, "fill_price", None)
+                )
+                if _fill_price is not None and self.ledger is not None:
+                    try:
+                        _expected = float(price)
+                        _filled   = float(_fill_price)
+                        _slip_bps = (_filled - _expected) / _expected * 10_000 if _expected else 0.0
+                        await self._safe_await(
+                            "ledger.update_slippage",
+                            self.ledger.execute(
+                                "UPDATE order_tracking SET filled_price=?, slippage_bps=?"
+                                " WHERE order_id=?",
+                                (_filled, round(_slip_bps, 2), exchange_order_id),
+                            ),
+                            timeout_seconds=3.0,
+                        )
+                        logger.info(
+                            "slippage_recorded",
+                            order_id=exchange_order_id,
+                            expected_price=_expected,
+                            filled_price=_filled,
+                            slippage_bps=round(_slip_bps, 2),
+                        )
+                    except Exception as _se:
+                        logger.warning("slippage_record_failed", error=str(_se))
             elif not result.success and pre_order_id:
                 if self.ledger is not None:
                     await self._safe_await(
@@ -1032,21 +1147,24 @@ class TradingSystem:
                 )
 
             if paper_trading:
-                # Paper mode: the `positions` accounting table may carry OPEN rows
-                # from prior real-mode or test runs that were never force-closed.
-                # portfolio_state reads from that table, so stale rows block every
-                # new paper order.  Safe to force-close all of them at startup
-                # because paper PnL is tracked exclusively via order_tracking, not
-                # via the double-entry positions table.
+                # Paper mode: force-close stale OPEN positions from prior paper runs
+                # so portfolio_state.refresh() doesn't count them against the budget.
+                #
+                # SAFETY: Only close rows where mode='paper' (or mode IS NULL for
+                # legacy rows that pre-date the mode column).  Rows where mode='live'
+                # represent real on-chain positions and must NEVER be auto-closed by
+                # a paper-mode startup — their P&L is real money.
                 await self._await_step(
                     "ledger.close_stale_paper_positions",
                     self.ledger.execute(
                         "UPDATE positions SET status='CLOSED',"
-                        " exit_timestamp=CURRENT_TIMESTAMP WHERE status='OPEN'"
+                        " exit_timestamp=CURRENT_TIMESTAMP"
+                        " WHERE status='OPEN'"
+                        "   AND (mode IS NULL OR mode='paper')"
                     ),
                 )
                 logger.info("paper_positions_reset",
-                            msg="stale OPEN positions force-closed at paper startup")
+                            msg="stale OPEN paper positions force-closed at paper startup (live positions preserved)")
 
             # 3. API Client
             api_config = self.config.get('api', {}).get('polymarket', {})
@@ -1242,6 +1360,25 @@ class TradingSystem:
             )
             logger.info("component_construct_success", component="portfolio_state")
 
+            # 14. Portfolio risk engine (category-aware exposure + drawdown kill switch)
+            risk_cfg = self.config.get("risk", {})
+            logger.info("component_construct_begin", component="portfolio_risk_engine")
+            self.portfolio_risk_engine = PortfolioRiskEngine(config={
+                "max_total_exposure_pct":    risk_cfg.get("max_total_exposure_pct",    0.30),
+                "max_category_exposure_pct": risk_cfg.get("max_category_exposure_pct", 0.10),
+                "max_single_market_pct":     risk_cfg.get("max_single_market_pct",     0.05),
+                "max_same_asset_positions":  risk_cfg.get("max_same_asset_positions",  2),
+            })
+            self.drawdown_monitor = DrawdownMonitor(
+                max_drawdown_pct=float(risk_cfg.get("max_drawdown_pct", 15.0)) / 100.0
+            )
+            logger.info("component_construct_success", component="portfolio_risk_engine")
+
+            # 15. Health HTTP server — serves GET /health on port 8765
+            logger.info("component_construct_begin", component="health_server")
+            self.health_server = HealthServer(state_ref=self)
+            logger.info("component_construct_success", component="health_server")
+
             logger.info("all_components_initialized")
             
         except Exception as e:
@@ -1269,6 +1406,29 @@ class TradingSystem:
         logger.info("starting_trading_system")
         
         try:
+            # --- Load nightly Kelly optimizer config if present --------------
+            import json as _json
+            _kelly_live_path = Path("config/kelly_live.json")
+            if _kelly_live_path.exists():
+                try:
+                    _live_cfg = _json.loads(_kelly_live_path.read_text())
+                    if "min_edge_required" in _live_cfg:
+                        KELLY_CONFIG["min_edge"] = Decimal(str(_live_cfg["min_edge_required"]))
+                    if "fractional_kelly" in _live_cfg:
+                        KELLY_CONFIG["fractional_kelly"] = Decimal(str(_live_cfg["fractional_kelly"]))
+                    if "max_bet_pct" in _live_cfg:
+                        KELLY_CONFIG["max_bet_fraction"] = Decimal(str(_live_cfg["max_bet_pct"]))
+                    logger.info(
+                        "kelly_config_loaded_from_optimizer",
+                        sharpe=_live_cfg.get("sharpe"),
+                        trade_count=_live_cfg.get("trade_count"),
+                        optimized_at=_live_cfg.get("optimized_at"),
+                        min_edge=str(KELLY_CONFIG.get("min_edge")),
+                        fractional_kelly=str(KELLY_CONFIG.get("fractional_kelly")),
+                    )
+                except Exception as _e:
+                    logger.warning("kelly_live_config_load_failed", error=str(_e))
+
             # Initialize all components
             await self._await_step("initialize_components", self.initialize_components(), timeout_seconds=120.0)
 
@@ -1311,7 +1471,11 @@ class TradingSystem:
                 status="operational"
             )
 
-            # Main loop
+            # Main loop — start health server as background task first
+            if self.health_server is not None:
+                asyncio.create_task(self.health_server.serve())
+                logger.info("health_server_task_started", port=int(os.environ.get("HEALTH_PORT", "8765")))
+
             await self._main_loop()
             
         except Exception as e:
@@ -1363,6 +1527,19 @@ class TradingSystem:
                 if (now - self.last_market_probe_at) >= self.market_probe_interval_seconds:
                     self.last_market_probe_at = now
                     await self._market_discovery_probe()
+
+                # Drawdown kill switch: check before every scan
+                if self.drawdown_monitor is not None and self.ledger is not None:
+                    _dd_equity = await self._safe_await(
+                        "ledger.get_equity.drawdown_check",
+                        self.ledger.get_equity(),
+                        default=Decimal("0"),
+                    )
+                    _dd_equity = _dd_equity if isinstance(_dd_equity, Decimal) else Decimal(str(_dd_equity))
+                    if not self.drawdown_monitor.update(_dd_equity, logger):
+                        logger.warning("strategy_scan_skipped_drawdown_halt",
+                                       equity=str(_dd_equity))
+                        continue
 
                 await self._run_strategy_scan(trigger="main_loop")
                 
@@ -1529,6 +1706,14 @@ class TradingSystem:
                 )
                 if cleaned > 0:
                     logger.info("orders_cleaned_up", count=cleaned)
+
+            # --- Cancel stale SUBMITTED orders (> 10 min unmatched) -------------
+            await self._safe_await(
+                "cancel_stale_orders",
+                self._cancel_stale_orders(stale_after_seconds=600),
+                timeout_seconds=60.0,
+                default=None,
+            )
             
             # Clear cache
             if self.secrets_manager:
@@ -1538,6 +1723,89 @@ class TradingSystem:
             logger.error(
                 "periodic_maintenance_failed",
                 error=str(e)
+            )
+
+    async def _cancel_stale_orders(self, stale_after_seconds: int = 600) -> None:
+        """
+        Cancel any order_tracking rows in SUBMITTED state older than
+        ``stale_after_seconds`` seconds (default 10 min).
+
+        Steps
+        -----
+        1. Query order_tracking for stale SUBMITTED rows.
+        2. For each, send DELETE /order/{id} to the CLOB.
+        3. Transition state → CANCELLED in the ledger.
+
+        Rationale: unmatched limit orders sitting for > 10 min imply the
+        market has moved away from our price.  Cancelling frees risk budget
+        and prevents phantom exposure accumulating in the portfolio engine.
+        """
+        if self.ledger is None:
+            return
+
+        cutoff_iso = (
+            __import__("datetime").datetime.utcnow()
+            - __import__("datetime").timedelta(seconds=stale_after_seconds)
+        ).isoformat(sep=" ")
+
+        stale_rows = await self._safe_await(
+            "ledger.get_stale_submitted_orders",
+            self.ledger.execute(
+                "SELECT order_id, market_id FROM order_tracking"
+                " WHERE order_state='SUBMITTED'"
+                " AND created_at < ?",
+                (cutoff_iso,),
+                fetch_all=True,
+                as_dict=True,
+            ),
+            timeout_seconds=5.0,
+            default=[],
+        )
+        if not stale_rows:
+            return
+
+        cancelled_ids: list = []
+        for row in stale_rows:
+            order_id = row.get("order_id", "") if isinstance(row, dict) else row[0]
+            if not order_id or order_id.startswith("paper_"):
+                # Skip paper orders — they have no real CLOB entry to cancel
+                await self._safe_await(
+                    f"ledger.cancel_paper_stale.{order_id}",
+                    self.ledger.transition_order_state(order_id, "CANCELLED",
+                                                       notes="stale_paper_order"),
+                    timeout_seconds=3.0,
+                )
+                cancelled_ids.append(order_id)
+                continue
+
+            # Attempt CLOB cancellation for real orders
+            cancel_ok = False
+            if self.api_client and hasattr(self.api_client, "cancel_order"):
+                try:
+                    cancel_ok = await asyncio.wait_for(
+                        self.api_client.cancel_order(order_id), timeout=8.0
+                    )
+                except Exception as exc:
+                    logger.warning("cancel_order_api_error", order_id=order_id,
+                                   error=str(exc))
+            # Transition ledger regardless (even if CLOB call failed, the order
+            # is stale and we no longer want to track it as open exposure)
+            await self._safe_await(
+                f"ledger.transition_cancelled.{order_id}",
+                self.ledger.transition_order_state(
+                    order_id, "CANCELLED",
+                    notes=f"stale_order_cancelled clob_ok={cancel_ok}",
+                ),
+                timeout_seconds=3.0,
+            )
+            cancelled_ids.append(order_id)
+
+        if cancelled_ids:
+            logger.info(
+                "stale_orders_cancelled",
+                count=len(cancelled_ids),
+                order_ids=cancelled_ids,
+                stale_threshold_s=stale_after_seconds,
             )
 
     async def _settle_resolved_open_orders(self) -> None:
