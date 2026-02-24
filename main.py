@@ -20,6 +20,7 @@ import signal
 import sys
 import argparse
 import logging
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from decimal import Decimal
@@ -204,7 +205,7 @@ class TradingSystem:
         self.strategy_scan_timeout_seconds = float(startup_config.get('strategy_scan_timeout_seconds', 30.0))
         self.last_market_probe_at = 0.0
         self.last_heartbeat_at = 0.0
-        self.start_time = asyncio.get_event_loop().time()
+        self.start_time = time.monotonic()  # monotonic wall clock; asyncio loop.time() is the same source
         
         logger.info(
             "trading_system_initialized",
@@ -330,7 +331,7 @@ class TradingSystem:
         if not self.strategy_engine:
             return
 
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         if (now - self.last_strategy_scan_at) < self.strategy_scan_min_interval_seconds:
             return
 
@@ -527,7 +528,7 @@ class TradingSystem:
         if is_paper:
             _cooldown_key = f"{market_id}:{token_id}"
             _cooldown_secs = 60.0
-            _now_mono = asyncio.get_event_loop().time()
+            _now_mono = asyncio.get_running_loop().time()
             _last_submitted = self._paper_order_cooldowns.get(_cooldown_key, 0.0)
             if _now_mono - _last_submitted < _cooldown_secs:
                 logger.debug(
@@ -694,7 +695,7 @@ class TradingSystem:
             # Fetch real Binance technical features (cached 60s; returns None on failure)
             # This is what actually gives Charlie's ML models live market context.
             # Without it every model returns HOLD → p_win=0.5 → coin-flip trades.
-            _extra_features = await asyncio.get_event_loop().run_in_executor(
+            _extra_features = await asyncio.get_running_loop().run_in_executor(
                 None, _get_binance_features, opp_symbol
             )
             if _extra_features is not None:
@@ -743,7 +744,7 @@ class TradingSystem:
             # Stamping here ensures the 60 s guard fires regardless of whether
             # the order ultimately clears the portfolio budget checks.
             if is_paper:
-                self._paper_order_cooldowns[f"{market_id}:{token_id}"] = asyncio.get_event_loop().time()
+                self._paper_order_cooldowns[f"{market_id}:{token_id}"] = asyncio.get_running_loop().time()
 
             # Adopt Charlie's recommended side and Kelly size
             side = charlie_rec.side
@@ -904,7 +905,7 @@ class TradingSystem:
 
         # Write CREATED row to unified order ledger before sending to exchange.
         # Stores model_votes so per-model feedback works on settlement.
-        pre_order_id = f"pre_{market_id}_{token_id}_{int(asyncio.get_event_loop().time()*1000)}"
+        pre_order_id = f"pre_{market_id}_{token_id}_{int(asyncio.get_running_loop().time()*1000)}"
         if self.ledger is not None:
             await self._safe_await(
                 "ledger.record_order_created",
@@ -1045,7 +1046,7 @@ class TradingSystem:
         )
         # Record cooldown so rapid subsequent scans skip this market+token.
         if is_paper:
-            self._paper_order_cooldowns[f"{market_id}:{token_id}"] = asyncio.get_event_loop().time()
+            self._paper_order_cooldowns[f"{market_id}:{token_id}"] = asyncio.get_running_loop().time()
 
         if result.filled_quantity and result.filled_quantity > Decimal("0"):
             logger.info(
@@ -1464,6 +1465,60 @@ class TradingSystem:
                     self.performance_tracker.refresh(),
                 )
 
+            # --- Paper-mode peak_equity guard -----------------------------------
+            # Each paper session starts fresh equity at STARTING_CAPITAL.  If the
+            # performance tracker's equity-curve peak is from a prior session (and
+            # is therefore higher than today's starting equity), the drawdown
+            # calculation would immediately fire a halt.  In paper mode only we
+            # reset peak_equity to the current equity so the session starts with a
+            # clean baseline.  In live mode the peak is NEVER auto-reset.
+            _is_paper = self.config.get("trading", {}).get("paper_trading", True)
+            if _is_paper and self.performance_tracker is not None:
+                _current_eq = self.performance_tracker._current_equity
+                _peak_eq = self.performance_tracker._peak_equity
+                if _peak_eq > _current_eq and _current_eq > Decimal("0"):
+                    self.performance_tracker._peak_equity = _current_eq
+                    logger.info(
+                        "paper_peak_equity_reset",
+                        previous_peak=str(_peak_eq),
+                        reset_to=str(_current_eq),
+                        reason="paper_session_fresh_start",
+                    )
+            if _is_paper and self.drawdown_monitor is not None:
+                # DrawdownMonitor is constructed fresh each session with peak=0;
+                # seed it with the real current equity so drawdown math is valid.
+                if hasattr(self.drawdown_monitor, "peak_equity"):
+                    _current_eq = (
+                        self.performance_tracker._current_equity
+                        if self.performance_tracker is not None
+                        else Decimal("0")
+                    )
+                    if _current_eq > Decimal("0"):
+                        self.drawdown_monitor.peak_equity = _current_eq
+                        logger.info(
+                            "paper_drawdown_monitor_seeded",
+                            peak_equity=str(_current_eq),
+                        )
+            # -------------------------------------------------------------------
+
+            # Paper mode: force circuit breaker to CLOSED so a stale OPEN state
+            # from a prior session (e.g. old drawdown or win-rate trip) never
+            # silently blocks a fresh paper session.  In live mode the circuit
+            # breaker state is NEVER auto-reset — the operator must reset it.
+            if _is_paper and self.circuit_breaker is not None:
+                from risk.circuit_breaker_v2 import CircuitState as _CS
+                if self.circuit_breaker.state != _CS.CLOSED:
+                    await self._safe_await(
+                        "circuit_breaker.paper_startup_reset",
+                        self.circuit_breaker.manual_reset(),
+                        default=None,
+                    )
+                    logger.info(
+                        "paper_circuit_breaker_reset",
+                        reason="fresh_paper_session_startup",
+                    )
+            # -------------------------------------------------------------------
+
             self.running = True
 
             logger.info(
@@ -1506,7 +1561,7 @@ class TradingSystem:
                 except asyncio.TimeoutError:
                     pass  # Continue normal operation
 
-                now = asyncio.get_event_loop().time()
+                now = asyncio.get_running_loop().time()
                 if (now - self.last_heartbeat_at) >= self.loop_tick_seconds:
                     self.last_heartbeat_at = now
                     logger.info(

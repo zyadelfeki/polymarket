@@ -26,10 +26,34 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
+try:
+    import structlog
+    logger = structlog.get_logger(__name__)
+except ImportError:
+    _stdlib_logger = logging.getLogger(__name__)
+
+    class _FallbackLogger:
+        """Thin structlog-compatible shim for environments without structlog."""
+        def _emit(self, level: int, event: str, **kw):
+            msg = event + (" | " + str(kw) if kw else "")
+            _stdlib_logger.log(level, msg)
+
+        def debug(self, event: str, **kw):
+            self._emit(logging.DEBUG, event, **kw)
+
+        def info(self, event: str, **kw):
+            self._emit(logging.INFO, event, **kw)
+
+        def warning(self, event: str, **kw):
+            self._emit(logging.WARNING, event, **kw)
+
+        def error(self, event: str, **kw):
+            self._emit(logging.ERROR, event, **kw)
+
+    logger = _FallbackLogger()  # type: ignore[assignment]
+
 if TYPE_CHECKING:
     from database.ledger_async import AsyncLedger
-
-logger = logging.getLogger(__name__)
 
 
 class PerformanceTracker:

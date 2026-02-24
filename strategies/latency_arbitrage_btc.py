@@ -1937,8 +1937,7 @@ class LatencyArbitrageEngine:
         extra_features: Optional[Dict] = None
         if _get_all_binance_features is not None:
             try:
-                loop = asyncio.get_event_loop()
-                extra_features = await loop.run_in_executor(
+                extra_features = await asyncio.get_running_loop().run_in_executor(
                     None, _get_all_binance_features, symbol
                 )
             except Exception:
