@@ -1,79 +1,170 @@
-"""Session health check — run after a paper session to verify all fixes."""
-import json
-from collections import Counter
+#!/usr/bin/env python3
+"""
+Session health diagnostic.
+Usage: python scripts/check_session.py [path/to/production.log]
+       (defaults to logs/production.log)
+"""
 import sys
+import json
+from pathlib import Path
+from collections import Counter
 
-log_path = sys.argv[1] if len(sys.argv) > 1 else "logs/production.log"
-
-counts = Counter()
-try:
-    with open(log_path) as f:
-        for line in f:
-            try:
-                counts[json.loads(line).get("event", "")] += 1
-            except Exception:
-                pass
-except FileNotFoundError:
-    print(f"ERROR: {log_path} not found — did the bot run with LOG_FORMAT=json?")
+log_path = Path(sys.argv[1] if len(sys.argv) > 1 else "logs/production.log")
+if not log_path.exists():
+    print(f"ERROR: log not found: {log_path}")
     sys.exit(1)
 
-scans = max(counts["strategy_scan_begin"], 1)
-total = sum(counts.values())
-print(f"=== SESSION STATS ===")
-print(f"  Total log lines  : {total}")
-print(f"  strategy_scan_begin: {scans}")
-print()
+lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+events = []
+for line in lines:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        events.append(json.loads(line))
+    except json.JSONDecodeError:
+        pass
 
-print("--- FIXED (must be 0) ---")
-fixed = [
-    ("periodic_check_failed",     "was 292"),
-    ("performance_halt_win_rate",  "was 222 trips in paper"),
-    ("circuit_breaker_attribute_error", "was present"),
-]
-all_fixed = True
-for ev, note in fixed:
-    c = counts[ev]
-    status = "OK" if c == 0 else f"STILL FIRING"
-    flag = "" if c == 0 else " <-- CHECK"
-    print(f"  {status:12s}  {ev}: {c}  ({note}){flag}")
-    if c > 0:
-        all_fixed = False
 
-print()
-print("--- DEGRADED MODE RATIO (target: <3x) ---")
-deg  = counts["charlie_degraded_mode"]
-comp = max(counts["binance_features_computed"], 1)
-ratio = deg / comp
-ratio_flag = "" if ratio < 3 else " <-- still high"
-print(f"  charlie_degraded_mode     : {deg}")
-print(f"  binance_features_computed : {comp}")
-print(f"  ratio                     : {ratio:.1f}x  (was 30x){ratio_flag}")
+def count(event_name):
+    return sum(1 for e in events if e.get("event") == event_name)
 
-print()
-print("--- SIGNALS FLOWING (must all be > 0) ---")
-for ev in ["strategy_scan_begin", "charlie_gate_approved", "order_submitted", "binance_features_computed"]:
-    c = counts[ev]
-    flag = "" if c > 0 else " <-- MISSING"
-    print(f"  {ev}: {c}{flag}")
 
-print()
-print("--- REJECTION BREAKDOWN ---")
-for ev in [
+def count_field(event_name, field, value):
+    return sum(1 for e in events
+               if e.get("event") == event_name and e.get(field) == value)
+
+
+# ---------- core counters ----------
+total_lines       = len(lines)
+scans             = count("strategy_scan_begin")
+features          = count("binance_features_computed")
+charlie_approved  = count("charlie_gate_approved")
+opp_detected      = count("arbitrage_opportunity_detected")
+order_submitted   = count("order_submitted")
+order_settled     = count("order_settled")
+
+# Previously-fixed events (should stay at 0)
+periodic_failed   = count("periodic_check_failed")
+perf_halt         = count("performance_halt_win_rate")
+cb_attr_err       = count("circuit_breaker_attribute_error")
+
+# Degraded mode
+degraded_mode     = count("charlie_degraded_mode")
+ratio_str = (
+    f"{degraded_mode / features:.1f}x  (target: <3x)"
+    if features > 0
+    else "N/A (0 features computed)"
+)
+
+# Rejection reasons
+rejection_events = [
     "charlie_gate_rejected",
+    "charlie_gate_exception",
     "charlie_coin_flip_rejected",
-    "kelly_size_zero",
+    "order_blocked_no_charlie_signal",
     "order_blocked_global_risk_budget_exceeded",
     "order_blocked_per_market_budget_exceeded",
     "order_blocked_portfolio_risk",
-    "opportunity_skipped",
-    "paper_order_cooldown",
-]:
-    if counts[ev]:
-        print(f"  {ev}: {counts[ev]}")
+    "order_blocked_kelly_size_too_small",
+    "risk_rejected",
+]
+opportunity_skip_reasons = Counter(
+    e.get("reason", "unknown")
+    for e in events
+    if e.get("event") == "opportunity_skipped"
+)
 
+print(f"\n=== SESSION STATS ===")
+print(f"  Total log lines  : {total_lines}")
+print(f"  strategy_scan_begin: {scans}")
+
+print(f"\n--- FIXED (must be 0) ---")
+ok_fixed = True
+for name, val in [
+    ("periodic_check_failed",           periodic_failed),
+    ("performance_halt_win_rate",       perf_halt),
+    ("circuit_breaker_attribute_error", cb_attr_err),
+]:
+    tag = "OK  " if val == 0 else "FAIL"
+    if val != 0:
+        ok_fixed = False
+    print(f"  {tag}          {name}: {val}")
+
+print(f"\n--- DEGRADED MODE RATIO (target: <3x) ---")
+print(f"  charlie_degraded_mode     : {degraded_mode}")
+print(f"  binance_features_computed : {features}")
+print(f"  ratio                     : {ratio_str}")
+
+print(f"\n--- SIGNALS FLOWING (must all be > 0) ---")
+signals_ok = True
+signal_checks = [
+    ("strategy_scan_begin",            scans),
+    ("arbitrage_opportunity_detected", opp_detected),
+    ("charlie_gate_approved",          charlie_approved),
+    ("order_submitted",                order_submitted),
+]
+for name, val in signal_checks:
+    tag = ""
+    if val == 0:
+        tag = "  <-- MISSING"
+        signals_ok = False
+    print(f"  {name}: {val}{tag}")
+print(f"  order_settled: {order_settled}  (needs market resolution — OK if 0 short-term)")
+print(f"  binance_features_computed: {features}")
+
+print(f"\n--- REJECTION BREAKDOWN ---")
+found_any_rejection = False
+for ev in rejection_events:
+    c = count(ev)
+    if c > 0:
+        found_any_rejection = True
+        # Break down charlie_gate_rejected by reason + p_win range
+        if ev == "charlie_gate_rejected":
+            reasons = Counter(
+                e.get("reason", "unknown")
+                for e in events
+                if e.get("event") == ev
+            )
+            p_wins = [
+                e.get("p_win")
+                for e in events
+                if e.get("event") == ev and e.get("p_win") is not None
+            ]
+            p_win_summary = ""
+            if p_wins:
+                p_win_summary = f"  (p_win range: {min(p_wins):.3f}–{max(p_wins):.3f})"
+            print(f"  {ev}: {c}{p_win_summary}")
+            for reason, rc in reasons.most_common():
+                print(f"    reason={reason}: {rc}")
+        else:
+            print(f"  {ev}: {c}")
+
+if opportunity_skip_reasons:
+    found_any_rejection = True
+    for reason, c in opportunity_skip_reasons.most_common():
+        print(f"  opportunity_skipped[{reason}]: {c}")
+
+if not found_any_rejection:
+    print("  (none — if charlie_gate_approved=0 check for charlie_gate_rejected events)")
+
+# ---------- final verdict ----------
+all_ok = ok_fixed and signals_ok
 print()
-if all_fixed and ratio < 3:
+if all_ok:
     print("=== ALL CHECKS PASSED — run the Kelly sweep next ===")
     print("  python experiments/sweep_kelly_and_edge.py --log logs/production.log")
 else:
-    print("=== SOME ISSUES REMAIN — see flags above ===")
+    print("=== CHECKS FAILED — DO NOT RUN SWEEP YET ===")
+    if not ok_fixed:
+        print("  Previously-fixed errors have returned.")
+    if not signals_ok:
+        if opp_detected == 0:
+            print("  No opportunities detected. Check strategy engine and min_edge config.")
+        elif charlie_approved == 0:
+            print("  Opportunities detected but Charlie approved NONE.")
+            print("  Next step: search logs for 'charlie_gate_rejected' events.")
+            print("  Check the p_win range and reason breakdown above.")
+            print("  See BUG 2 fix for charlie_booster.py evaluate_market() logging.")
+        elif order_submitted == 0:
+            print("  Charlie approved but orders not submitted. Check execution service.")

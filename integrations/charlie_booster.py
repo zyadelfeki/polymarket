@@ -173,11 +173,46 @@ class CharliePredictionGate:
         Returns ``None`` (no bet) if any filter fails.
         Returns a ``TradeRecommendation`` only when all filters pass.
         """
+        try:
+            return await self._evaluate_market_inner(
+                market_id=market_id,
+                market_price=market_price,
+                symbol=symbol,
+                timeframe=timeframe,
+                bankroll=bankroll,
+                extra_features=extra_features,
+                override_win_rate=override_win_rate,
+            )
+        except Exception as exc:
+            logger.error(
+                "charlie_gate_exception",
+                market_id=market_id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return None
+
+    async def _evaluate_market_inner(
+        self,
+        *,
+        market_id: str,
+        market_price: Decimal,
+        symbol: str = "BTC",
+        timeframe: str = "15m",
+        bankroll: Decimal = Decimal("0"),
+        extra_features: Optional[Dict] = None,
+        override_win_rate: Optional[float] = None,
+    ) -> Optional[TradeRecommendation]:
+        """Inner implementation of evaluate_market, wrapped by the outer try/except."""
         if _get_signal_for_market is None:
             logger.warning(
-                "charlie_gate_blocked",
+                "charlie_gate_rejected",
                 reason="charlie_api_unavailable",
                 market_id=market_id,
+                p_win=None,
+                min_win_probability=None,
+                confidence=None,
+                ensemble_votes=None,
             )
             return None
 
@@ -189,18 +224,21 @@ class CharliePredictionGate:
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "charlie_gate_blocked",
+                "charlie_gate_rejected",
                 reason="signal_timeout",
                 market_id=market_id,
                 symbol=symbol,
+                p_win=None,
+                min_win_probability=None,
             )
             return None
         except Exception as exc:
             logger.warning(
-                "charlie_gate_blocked",
+                "charlie_gate_rejected",
                 reason="signal_error",
                 market_id=market_id,
                 error=str(exc),
+                p_win=None,
             )
             return None
 
@@ -246,13 +284,16 @@ class CharliePredictionGate:
         # --- 3. Edge filter -------------------------------------------------
         if Decimal(str(edge)) < self._min_edge:
             logger.info(
-                "charlie_gate_blocked",
+                "charlie_gate_rejected",
                 reason="edge_below_threshold",
                 market_id=market_id,
                 edge=f"{edge:.4f}",
                 min_edge=str(self._min_edge),
-                p_win=p_win,
+                p_win=float(p_win),
+                min_win_probability=None,
                 implied_prob=yes_implied,
+                confidence=float(confidence),
+                ensemble_votes=str(model_votes),
                 symbol=symbol,
             )
             return None
@@ -260,11 +301,14 @@ class CharliePredictionGate:
         # --- 4. Confidence filter ------------------------------------------
         if Decimal(str(confidence)) < self._min_confidence:
             logger.info(
-                "charlie_gate_blocked",
+                "charlie_gate_rejected",
                 reason="confidence_below_threshold",
                 market_id=market_id,
-                confidence=f"{confidence:.4f}",
+                p_win=float(p_win),
+                min_win_probability=None,
+                confidence=float(confidence),
                 min_confidence=str(self._min_confidence),
+                ensemble_votes=str(model_votes),
                 symbol=symbol,
             )
             return None
@@ -272,11 +316,15 @@ class CharliePredictionGate:
         # --- 5. Regime filter ----------------------------------------------
         if self._allowed_regimes is not None and regime not in self._allowed_regimes:
             logger.info(
-                "charlie_gate_blocked",
+                "charlie_gate_rejected",
                 reason="regime_filtered",
                 market_id=market_id,
+                p_win=float(p_win),
+                min_win_probability=None,
+                confidence=float(confidence),
                 regime=regime,
                 allowed=list(self._allowed_regimes),
+                ensemble_votes=str(model_votes),
             )
             return None
 
@@ -296,10 +344,14 @@ class CharliePredictionGate:
         # defensive).
         if smooth_mult <= 0.0:
             logger.info(
-                "charlie_gate_blocked",
+                "charlie_gate_rejected",
                 reason="smooth_kelly_multiplier_zero",
                 market_id=market_id,
+                p_win=float(p_win),
+                min_win_probability=None,
+                confidence=float(confidence),
                 edge=f"{edge:.4f}",
+                ensemble_votes=str(model_votes),
             )
             return None
 
@@ -317,9 +369,13 @@ class CharliePredictionGate:
 
             if size <= Decimal("0"):
                 logger.info(
-                    "charlie_gate_blocked",
+                    "charlie_gate_rejected",
                     reason="kelly_size_zero",
                     market_id=market_id,
+                    p_win=float(effective_p_win),
+                    min_win_probability=None,
+                    confidence=float(confidence),
+                    ensemble_votes=str(model_votes),
                     capped_reason=kelly_result.capped_reason,
                 )
                 return None
