@@ -1801,21 +1801,28 @@ class AsyncLedger:
         total_exposure = Decimal("0")
         mark_pnl = Decimal("0")
 
+        # Build per-market price cache first (one API call per unique market)
+        market_price_cache: dict = {}
+        if price_feed is not None:
+            unique_market_ids = list({row["market_id"] for row in open_orders if row.get("market_id")})
+            for mid_id in unique_market_ids:
+                try:
+                    _mid = await asyncio.wait_for(
+                        price_feed.get_price(mid_id), timeout=3.0
+                    )
+                    if _mid is not None:
+                        market_price_cache[mid_id] = Decimal(str(_mid))
+                except Exception:
+                    pass
+
         for row in open_orders:
             size = Decimal(str(row.get("size", "0")))
             total_exposure += size
-            if price_feed is not None:
-                try:
-                    mid = await asyncio.wait_for(
-                        price_feed.get_price(row["market_id"]), timeout=3.0
-                    )
-                    if mid is not None:
-                        mark_price = Decimal(str(mid))
-                        entry_price = Decimal(str(row.get("price", "0")))
-                        quantity = size / entry_price if entry_price > Decimal("0") else Decimal("0")
-                        mark_pnl += (mark_price - entry_price) * quantity
-                except Exception:
-                    pass
+            mid_price = market_price_cache.get(row.get("market_id", ""))
+            if mid_price is not None:
+                entry_price = Decimal(str(row.get("price", "0")))
+                quantity = size / entry_price if entry_price > Decimal("0") else Decimal("0")
+                mark_pnl += (mid_price - entry_price) * quantity
 
         # Realized PnL from settled orders
         realized_pnl_row = await self.execute_scalar(

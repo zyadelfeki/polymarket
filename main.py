@@ -194,6 +194,7 @@ class TradingSystem:
         # multiple scans before the idempotency cache would dedup them (the
         # cache key includes price, so a 1-tick price change defeats it).
         self._paper_order_cooldowns: Dict[str, float] = {}
+        self._paper_session_start: Optional[str] = None
         self.last_discovered_markets = []
         startup_config = config.get('startup', {})
         self.init_timeout_seconds = float(startup_config.get('component_timeout_seconds', 25.0))
@@ -1517,6 +1518,12 @@ class TradingSystem:
                         "paper_circuit_breaker_reset",
                         reason="fresh_paper_session_startup",
                     )
+            # Mark paper session start so performance checks are session-scoped
+            if _is_paper:
+                from datetime import datetime as _dt, timezone as _tz
+                self._paper_session_start = _dt.now(_tz.utc).isoformat()
+                logger.info("paper_session_start_marked",
+                            session_start=self._paper_session_start)
             # -------------------------------------------------------------------
 
             self.running = True
@@ -1619,6 +1626,7 @@ class TradingSystem:
     async def _periodic_check(self):
         """Periodic health and status check."""
         try:
+            equity = Decimal("0")   # Safe default — prevents UnboundLocalError if circuit_breaker is None
             # Check circuit breaker
             if self.circuit_breaker:
                 equity = await self._safe_await("ledger.get_equity.periodic", self.ledger.get_equity(), default=Decimal('0'))
@@ -1700,24 +1708,42 @@ class TradingSystem:
 
                 rolling_wr = self.performance_tracker.get_rolling_win_rate(win_rate_sample)
                 if rolling_wr is not None and Decimal(str(rolling_wr)) < Decimal(str(min_wr)):
-                    logger.critical(
-                        "performance_halt_win_rate",
-                        rolling_win_rate=f"{rolling_wr:.2%}",
-                        threshold=str(min_wr),
-                        sample_size=win_rate_sample,
-                    )
-                    if self.circuit_breaker:
-                        from risk.circuit_breaker_v2 import TripReason
-                        await self._safe_await(
-                            "circuit_breaker.trip_loss_streak",
-                            self.circuit_breaker.trip(TripReason.LOSS_STREAK),
-                            default=None,
+                    _is_paper_mode = self.config.get("trading", {}).get("paper_trading", True)
+                    if _is_paper_mode:
+                        # Paper mode: warn only — stale historical orders from prior
+                        # sessions would otherwise immediately kill every fresh session.
+                        logger.warning(
+                            "performance_halt_win_rate",
+                            rolling_win_rate=f"{rolling_wr:.2%}",
+                            threshold=str(min_wr),
+                            sample_size=win_rate_sample,
+                            paper_mode=True,
+                            action="log_only",
                         )
+                    else:
+                        # Live mode: enforce the halt.
+                        logger.critical(
+                            "performance_halt_win_rate",
+                            rolling_win_rate=f"{rolling_wr:.2%}",
+                            threshold=str(min_wr),
+                            sample_size=win_rate_sample,
+                            paper_mode=False,
+                            action="circuit_breaker_trip",
+                        )
+                        if self.circuit_breaker:
+                            from risk.circuit_breaker_v2 import TripReason
+                            await self._safe_await(
+                                "circuit_breaker.trip_loss_streak",
+                                self.circuit_breaker.trip(TripReason.LOSS_STREAK),
+                                default=None,
+                            )
 
         except Exception as e:
             logger.error(
                 "periodic_check_failed",
-                error=str(e)
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True,
             )
     
     async def _periodic_maintenance(self):
@@ -1798,17 +1824,18 @@ class TradingSystem:
         if self.ledger is None:
             return
 
+        from datetime import datetime, timezone, timedelta
         cutoff_iso = (
-            __import__("datetime").datetime.utcnow()
-            - __import__("datetime").timedelta(seconds=stale_after_seconds)
-        ).isoformat(sep=" ")
+            datetime.now(timezone.utc)
+            - timedelta(seconds=stale_after_seconds)
+        ).isoformat()
 
         stale_rows = await self._safe_await(
             "ledger.get_stale_submitted_orders",
             self.ledger.execute(
                 "SELECT order_id, market_id FROM order_tracking"
                 " WHERE order_state='SUBMITTED'"
-                " AND created_at < ?",
+                " AND opened_at < ?",
                 (cutoff_iso,),
                 fetch_all=True,
                 as_dict=True,
@@ -2051,7 +2078,7 @@ class TradingSystem:
                 snapshot = await self._safe_await(
                     "ledger.shutdown_snapshot",
                     self.ledger.shutdown_snapshot(price_feed=price_feed),
-                    timeout_seconds=15.0,
+                    timeout_seconds=45.0,
                     default={},
                 )
                 print(

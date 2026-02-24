@@ -36,8 +36,9 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 _CANDLE_CACHE: Dict[str, tuple] = {}   # symbol -> (timestamp, features_dict)
 _BOOK_CACHE:   Dict[str, tuple] = {}   # symbol -> (timestamp, imbalance_float)
-_CANDLE_TTL = 60.0   # seconds
-_BOOK_TTL   = 5.0    # seconds
+_CANDLE_TTL         = 60.0   # seconds — successful fetch TTL
+_CANDLE_FAILURE_TTL = 30.0   # seconds — failed fetch TTL (prevent hammering)
+_BOOK_TTL           = 5.0    # seconds
 
 _BINANCE_BASE = "https://api.binance.com"
 
@@ -117,7 +118,8 @@ def _fetch_candles(symbol: str, interval: str = "15m", limit: int = 60) -> Optio
         closes = [float(k[4]) for k in raw]
         return closes
     except Exception as exc:
-        logger.warning("binance_cantle_fetch_failed", symbol=symbol, error=str(exc))
+        logger.warning("binance_candle_fetch_failed", symbol=symbol, error=str(exc))
+        _CANDLE_CACHE[symbol] = (time.monotonic(), None)   # Cache the failure — prevents retry spam
         return None
 
 
@@ -175,18 +177,20 @@ def get_candle_features(asset: str) -> Optional[Dict[str, float]]:
     symbol = symbol_for_asset(asset)
     now = time.monotonic()
 
-    # Check cache
+    # Check cache — uses a shorter TTL for cached failures to suppress retry spam
     cached = _CANDLE_CACHE.get(symbol)
     if cached is not None:
         ts, features = cached
-        if now - ts < _CANDLE_TTL:
-            return features
+        ttl = _CANDLE_TTL if features is not None else _CANDLE_FAILURE_TTL
+        if now - ts < ttl:
+            return features   # Returns None for cached failures — correct
 
     closes = _fetch_candles(symbol, interval="15m", limit=60)
     if closes is None or len(closes) < 27:
         # Need at least 27 candles for EMA(26) seed
         logger.warning("binance_features_insufficient_data",
                        symbol=symbol, candles=len(closes) if closes else 0)
+        _CANDLE_CACHE[symbol] = (now, None)   # Cache the failure — prevents retry spam
         return None
 
     try:
@@ -241,6 +245,7 @@ def get_candle_features(asset: str) -> Optional[Dict[str, float]]:
 
     except Exception as exc:
         logger.warning("binance_features_compute_failed", symbol=symbol, error=str(exc))
+        _CANDLE_CACHE[symbol] = (now, None)   # Cache the failure — prevents retry spam
         return None
 
 
