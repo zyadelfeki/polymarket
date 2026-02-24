@@ -65,7 +65,10 @@ class PortfolioRiskEngine:
         self.max_single_market_pct      = Decimal(str(cfg.get("max_single_market_pct",      0.05)))
         self.max_correlated_pct         = Decimal(str(cfg.get("max_correlated_pct",         0.15)))
         self.max_same_asset_positions   = int(cfg.get("max_same_asset_positions", 2))
-        self._min_tradeable             = Decimal(str(cfg.get("min_tradeable_usdc",         10.0)))
+        # $0.25 floor: below Polymarket's practical minimum order (~$1), so this
+        # never silently vetoes a genuinely-sized trade.  Real protection comes
+        # from the percentage caps above.  Callers can raise this via config.
+        self._min_tradeable             = Decimal(str(cfg.get("min_tradeable_usdc",          0.25)))
 
     # ------------------------------------------------------------------
 

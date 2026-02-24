@@ -1370,6 +1370,9 @@ class TradingSystem:
                 "max_category_exposure_pct": risk_cfg.get("max_category_exposure_pct", 0.10),
                 "max_single_market_pct":     risk_cfg.get("max_single_market_pct",     0.05),
                 "max_same_asset_positions":  risk_cfg.get("max_same_asset_positions",  2),
+                # Source from GLOBAL_RISK_BUDGET so it is explicit and reviewable.
+                # Default falls back to portfolio_risk.py's own default (0.25).
+                "min_tradeable_usdc":        float(GLOBAL_RISK_BUDGET.get("min_tradeable_usdc", 0.25)),
             })
             self.drawdown_monitor = DrawdownMonitor(
                 max_drawdown_pct=float(risk_cfg.get("max_drawdown_pct", 15.0)) / 100.0

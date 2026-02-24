@@ -65,14 +65,24 @@ rejection_events = [
     "order_blocked_no_charlie_signal",
     "order_blocked_global_risk_budget_exceeded",
     "order_blocked_per_market_budget_exceeded",
-    "order_blocked_portfolio_risk",
     "order_blocked_kelly_size_too_small",
-    "risk_rejected",
 ]
 opportunity_skip_reasons = Counter(
     e.get("reason", "unknown")
     for e in events
     if e.get("event") == "opportunity_skipped"
+)
+# risk_rejected = circuit breaker blocked (fires BEFORE Charlie is called)
+risk_rejected_reasons = Counter(
+    e.get("reason", "unknown")
+    for e in events
+    if e.get("event") == "risk_rejected"
+)
+# order_blocked_portfolio_risk = portfolio risk engine cap (fires AFTER Charlie)
+portfolio_blocked_reasons = Counter(
+    e.get("reason", "unknown")
+    for e in events
+    if e.get("event") == "order_blocked_portfolio_risk"
 )
 
 print(f"\n=== SESSION STATS ===")
@@ -115,11 +125,20 @@ print(f"  binance_features_computed: {features}")
 
 print(f"\n--- REJECTION BREAKDOWN ---")
 found_any_rejection = False
+
+# 1. Circuit breaker (fires BEFORE Charlie — if non-zero, Charlie was never called)
+total_rr = sum(risk_rejected_reasons.values())
+if total_rr > 0:
+    found_any_rejection = True
+    print(f"  risk_rejected (circuit_breaker): {total_rr}  <-- fires BEFORE Charlie")
+    for reason, c in risk_rejected_reasons.most_common():
+        print(f"    └─ {reason}: {c}")
+
+# 2. Per-event rejection items (Charlie, global/per-market budget, etc.)
 for ev in rejection_events:
     c = count(ev)
     if c > 0:
         found_any_rejection = True
-        # Break down charlie_gate_rejected by reason + p_win range
         if ev == "charlie_gate_rejected":
             reasons = Counter(
                 e.get("reason", "unknown")
@@ -136,9 +155,17 @@ for ev in rejection_events:
                 p_win_summary = f"  (p_win range: {min(p_wins):.3f}–{max(p_wins):.3f})"
             print(f"  {ev}: {c}{p_win_summary}")
             for reason, rc in reasons.most_common():
-                print(f"    reason={reason}: {rc}")
+                print(f"    └─ reason={reason}: {rc}")
         else:
             print(f"  {ev}: {c}")
+
+# 3. Portfolio risk engine breakdown (fires AFTER circuit breaker + Charlie)
+if portfolio_blocked_reasons:
+    found_any_rejection = True
+    total_pb = sum(portfolio_blocked_reasons.values())
+    print(f"  order_blocked_portfolio_risk: {total_pb}")
+    for reason, c in portfolio_blocked_reasons.most_common():
+        print(f"    └─ {reason}: {c}")
 
 if opportunity_skip_reasons:
     found_any_rejection = True
@@ -159,12 +186,18 @@ else:
     if not ok_fixed:
         print("  Previously-fixed errors have returned.")
     if not signals_ok:
+        total_circuit_blocked = sum(risk_rejected_reasons.values())
         if opp_detected == 0:
             print("  No opportunities detected. Check strategy engine and min_edge config.")
+        elif total_circuit_blocked > 0 and charlie_approved == 0:
+            print("  Circuit breaker blocked all opportunities BEFORE Charlie was called.")
+            for reason, c in risk_rejected_reasons.most_common():
+                print(f"    \u2514\u2500 {reason}: {c}")
+            print("  Check: risk/system_circuit_breaker.py and daily_loss / drawdown state in DB.")
+            print("  If circuit_breaker_blocked: the CB may have tripped from prior paper losses.")
         elif charlie_approved == 0:
             print("  Opportunities detected but Charlie approved NONE.")
             print("  Next step: search logs for 'charlie_gate_rejected' events.")
             print("  Check the p_win range and reason breakdown above.")
-            print("  See BUG 2 fix for charlie_booster.py evaluate_market() logging.")
         elif order_submitted == 0:
             print("  Charlie approved but orders not submitted. Check execution service.")
