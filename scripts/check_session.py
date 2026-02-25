@@ -49,6 +49,17 @@ periodic_failed   = count("periodic_check_failed")
 perf_halt         = count("performance_halt_win_rate")
 cb_attr_err       = count("circuit_breaker_attribute_error")
 
+# performance_halt_drawdown: CRITICAL in live mode (trips CB), WARNING in paper mode.
+# Count live-mode (actionable) halts only — paper-mode fires are cross-session artefact.
+perf_halt_drawdown_live = sum(
+    1 for e in events
+    if e.get("event") == "performance_halt_drawdown" and e.get("action") != "log_only"
+)
+perf_halt_drawdown_paper = sum(
+    1 for e in events
+    if e.get("event") == "performance_halt_drawdown" and e.get("action") == "log_only"
+)
+
 # Degraded mode
 degraded_mode     = count("charlie_degraded_mode")
 ratio_str = (
@@ -98,14 +109,18 @@ print(f"  strategy_scan_begin: {scans}")
 print(f"\n--- FIXED (must be 0) ---")
 ok_fixed = True
 for name, val in [
-    ("periodic_check_failed",           periodic_failed),
-    ("performance_halt_win_rate",       perf_halt),
-    ("circuit_breaker_attribute_error", cb_attr_err),
+    ("periodic_check_failed",                 periodic_failed),
+    ("performance_halt_win_rate",             perf_halt),
+    ("circuit_breaker_attribute_error",       cb_attr_err),
+    ("performance_halt_drawdown [live-mode]", perf_halt_drawdown_live),
 ]:
     tag = "OK  " if val == 0 else "FAIL"
     if val != 0:
         ok_fixed = False
     print(f"  {tag}          {name}: {val}")
+if perf_halt_drawdown_paper > 0:
+    print(f"  INFO          performance_halt_drawdown [paper log_only]: {perf_halt_drawdown_paper}"
+          f"  (cross-session historical drawdown \u2014 CB not tripped, safe to ignore)")
 
 print(f"\n--- DEGRADED MODE RATIO (target: <3x) ---")
 print(f"  charlie_degraded_mode     : {degraded_mode}")

@@ -1723,18 +1723,36 @@ class TradingSystem:
 
                 current_dd = self.performance_tracker.get_current_drawdown()
                 if current_dd >= Decimal(str(max_dd_halt)):
-                    logger.critical(
-                        "performance_halt_drawdown",
-                        current_drawdown_pct=str(current_dd * 100),
-                        threshold_pct=str(Decimal(str(max_dd_halt)) * 100),
-                    )
-                    if self.circuit_breaker:
-                        from risk.circuit_breaker_v2 import TripReason
-                        await self._safe_await(
-                            "circuit_breaker.trip_drawdown",
-                            self.circuit_breaker.trip(TripReason.MAX_DRAWDOWN),
-                            default=None,
+                    _is_paper_mode = self.config.get("trading", {}).get("paper_trading", True)
+                    if _is_paper_mode:
+                        # Paper mode: warn only — the performance tracker's peak_equity
+                        # is built from the cumulative all-session equity curve, so a prior
+                        # session peak of e.g. $36k against today's $10k starting capital
+                        # produces a 73% "drawdown" that is purely historical artefact.
+                        # The CB already enforces session-scoped drawdown from initial_equity;
+                        # firing a cross-session halt here would trip it on every paper start.
+                        logger.warning(
+                            "performance_halt_drawdown",
+                            current_drawdown_pct=str(current_dd * 100),
+                            threshold_pct=str(Decimal(str(max_dd_halt)) * 100),
+                            paper_mode=True,
+                            action="log_only",
                         )
+                    else:
+                        logger.critical(
+                            "performance_halt_drawdown",
+                            current_drawdown_pct=str(current_dd * 100),
+                            threshold_pct=str(Decimal(str(max_dd_halt)) * 100),
+                            paper_mode=False,
+                            action="circuit_breaker_trip",
+                        )
+                        if self.circuit_breaker:
+                            from risk.circuit_breaker_v2 import TripReason
+                            await self._safe_await(
+                                "circuit_breaker.trip_drawdown",
+                                self.circuit_breaker.trip(TripReason.MAX_DRAWDOWN),
+                                default=None,
+                            )
 
                 rolling_wr = self.performance_tracker.get_rolling_win_rate(win_rate_sample)
                 if rolling_wr is not None and Decimal(str(rolling_wr)) < Decimal(str(min_wr)):
