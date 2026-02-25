@@ -155,6 +155,10 @@ class CircuitBreakerV2:
             self.max_drawdown_pct = max(self.max_drawdown_pct, 50.0)
             self.daily_loss_limit_pct = max(self.daily_loss_limit_pct, 30.0)
             self.max_loss_streak = max(self.max_loss_streak, 10)
+            # 2% of $14 = $0.28 — below any realistic min order.  HALF_OPEN must
+            # allow a probe trade to pass.  10% of $14 = $1.40 is workable while
+            # still constraining position size during recovery.
+            half_open_max_position_pct = max(half_open_max_position_pct, 10.0)
 
         self.recovery_threshold_pct = recovery_threshold_pct
         self.cooldown_period = timedelta(minutes=cooldown_minutes)

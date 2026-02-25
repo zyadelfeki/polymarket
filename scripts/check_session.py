@@ -85,6 +85,12 @@ portfolio_blocked_reasons = Counter(
     if e.get("event") == "order_blocked_portfolio_risk"
 )
 
+# Circuit breaker state history events
+cb_trip_events     = [e for e in events if e.get("event") == "circuit_breaker_tripped"]
+cb_half_open_events = [e for e in events if e.get("event") == "circuit_breaker_half_open"]
+cb_recovered_events = [e for e in events if e.get("event") == "circuit_breaker_recovered"]
+cb_init_events      = [e for e in events if e.get("event") == "circuit_breaker_initialized"]
+
 print(f"\n=== SESSION STATS ===")
 print(f"  Total log lines  : {total_lines}")
 print(f"  strategy_scan_begin: {scans}")
@@ -122,6 +128,32 @@ for name, val in signal_checks:
     print(f"  {name}: {val}{tag}")
 print(f"  order_settled: {order_settled}  (needs market resolution — OK if 0 short-term)")
 print(f"  binance_features_computed: {features}")
+
+print(f"\n--- CIRCUIT BREAKER HISTORY ---")
+if cb_init_events:
+    e0 = cb_init_events[0]
+    print(f"  initialized: equity={e0.get('initial_equity')}, "
+          f"max_drawdown={e0.get('max_drawdown_pct')}%, "
+          f"daily_loss={e0.get('daily_loss_limit_pct')}%")
+if cb_trip_events:
+    for e in cb_trip_events:
+        print(f"  TRIPPED: reason={e.get('reason')}  equity={e.get('equity')}  "
+              f"drawdown={e.get('drawdown_pct', 0):.1f}%  "
+              f"losses={e.get('consecutive_losses')}")
+else:
+    print("  (no trips this session)")
+if cb_half_open_events:
+    print(f"  half_open transitions: {len(cb_half_open_events)}")
+if cb_recovered_events:
+    print(f"  full recoveries: {len(cb_recovered_events)}")
+
+# risk_rejected events include cb_state/half_open_max_pct since latest fix
+if risk_rejected_reasons:
+    first_rr = next((e for e in events if e.get("event") == "risk_rejected"), None)
+    if first_rr and first_rr.get("cb_state"):
+        print(f"  last known CB state when blocking: state={first_rr.get('cb_state')}  "
+              f"half_open_max={first_rr.get('half_open_max_pct')}%  "
+              f"peak_equity={first_rr.get('peak_equity')}")
 
 print(f"\n--- REJECTION BREAKDOWN ---")
 found_any_rejection = False

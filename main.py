@@ -665,6 +665,15 @@ class TradingSystem:
 
         position_size_pct = float((order_value / equity) * Decimal("100"))
         if self.circuit_breaker:
+            logger.debug(
+                "circuit_breaker_check",
+                equity=str(equity),
+                position_size_pct=round(position_size_pct, 2),
+                cb_state=self.circuit_breaker.state.value,
+                half_open_max_pct=self.circuit_breaker.half_open_max_position_pct,
+                peak_equity=float(self.circuit_breaker.peak_equity),
+                consecutive_losses=self.circuit_breaker.consecutive_losses,
+            )
             can_trade = await self._safe_await(
                 "circuit_breaker.can_trade.execute_opportunity",
                 self.circuit_breaker.can_trade(equity, position_size_pct=position_size_pct),
@@ -676,7 +685,10 @@ class TradingSystem:
                     reason="circuit_breaker_blocked",
                     market_id=market_id,
                     token_id=token_id,
-                    position_size_pct=position_size_pct,
+                    position_size_pct=round(position_size_pct, 2),
+                    cb_state=self.circuit_breaker.state.value,
+                    half_open_max_pct=self.circuit_breaker.half_open_max_position_pct,
+                    peak_equity=float(self.circuit_breaker.peak_equity),
                     trigger=trigger,
                 )
                 return
