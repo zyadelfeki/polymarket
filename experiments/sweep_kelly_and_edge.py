@@ -43,6 +43,7 @@ import argparse
 import asyncio
 import csv
 import copy
+import math
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
