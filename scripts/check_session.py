@@ -260,3 +260,38 @@ else:
                 print("  Check the p_win range and reason breakdown above.")
         elif order_submitted == 0:
             print("  Charlie approved but orders not submitted. Check execution service.")
+
+# ---------- PnL attribution by market ----------
+print(f"\n--- PnL ATTRIBUTION BY MARKET ---")
+import asyncio as _asyncio
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+async def _print_pnl_by_market():
+    try:
+        from database.ledger_async import AsyncLedger
+        ledger = AsyncLedger()
+        await ledger.pool.initialize()
+        rows = await ledger.get_pnl_by_market()
+        await ledger.close()
+
+        if not rows:
+            print("  (no settled orders yet)")
+            return
+
+        hdr = f"  {'market_id':>12}  {'trades':>6}  {'wins':>5}  {'win%':>6}  {'total_pnl':>10}  {'avg_edge':>9}  {'avg_p_win':>9}"
+        print(hdr)
+        print("  " + "-" * (len(hdr) - 2))
+        for r in rows:
+            win_pct = f"{100*r['win_count']/r['trade_count']:.0f}%" if r["trade_count"] > 0 else " N/A"
+            avg_e   = f"{r['avg_edge']:.4f}" if r["avg_edge"] is not None else "  N/A"
+            avg_pw  = f"{r['avg_p_win']:.4f}" if r["avg_p_win"] is not None else "  N/A"
+            print(
+                f"  {str(r['market_id']):>12}  {r['trade_count']:>6}  {r['win_count']:>5}"
+                f"  {win_pct:>6}  {float(r['total_pnl']):>+10.4f}  {avg_e:>9}  {avg_pw:>9}"
+            )
+    except Exception as _e:
+        print(f"  (pnl_by_market unavailable: {_e})")
+
+_asyncio.run(_print_pnl_by_market())
+

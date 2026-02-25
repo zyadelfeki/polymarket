@@ -1471,6 +1471,43 @@ class TradingSystem:
                 except Exception as _e:
                     logger.warning("kelly_live_config_load_failed", error=str(_e))
 
+            # --- Load rolling Kelly snapshot (YAML) if present --------------
+            # rolling_kelly_optimizer.py writes config/kelly_config_snapshot_{date}.yaml
+            # and correctly uses KELLY_CONFIG's canonical keys (min_edge_required,
+            # fractional_kelly, max_bet_pct).  The JSON loader above has key-name
+            # discrepancies (writes 'min_edge' / 'max_bet_fraction'); the YAML loader
+            # runs after it and correctly overwrites with canonical keys.
+            import glob as _glob
+            import yaml as _yaml
+            _snap_files = sorted(
+                _glob.glob(str(Path("config") / "kelly_config_snapshot_*.yaml"))
+            )
+            if _snap_files:
+                _snap_path = _snap_files[-1]  # lexicographic = latest date
+                try:
+                    with open(_snap_path) as _f:
+                        _snap = _yaml.safe_load(_f)
+                    _best = _snap.get("best_combo", {})
+                    if "min_edge_required" in _best:
+                        KELLY_CONFIG["min_edge_required"] = Decimal(str(_best["min_edge_required"]))
+                    if "fractional_kelly" in _best:
+                        KELLY_CONFIG["fractional_kelly"] = Decimal(str(_best["fractional_kelly"]))
+                    if "max_bet_pct" in _best:
+                        KELLY_CONFIG["max_bet_pct"] = Decimal(str(_best["max_bet_pct"]))
+                    _snap_meta = _snap.get("metrics", {})
+                    logger.info(
+                        "kelly_config_loaded_from_snapshot",
+                        snapshot=str(_snap_path),
+                        sharpe=_snap_meta.get("sharpe"),
+                        trade_count=_snap_meta.get("trade_count"),
+                        generated_at=_snap.get("generated_at"),
+                        min_edge_required=str(KELLY_CONFIG.get("min_edge_required")),
+                        fractional_kelly=str(KELLY_CONFIG.get("fractional_kelly")),
+                        max_bet_pct=str(KELLY_CONFIG.get("max_bet_pct")),
+                    )
+                except Exception as _e:
+                    logger.warning("kelly_snapshot_load_failed", path=_snap_path, error=str(_e))
+
             # Initialize all components
             await self._await_step("initialize_components", self.initialize_components(), timeout_seconds=120.0)
 

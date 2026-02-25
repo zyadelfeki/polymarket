@@ -1940,6 +1940,61 @@ class AsyncLedger:
             )
         return result
 
+    async def get_pnl_by_market(self) -> List[Dict]:
+        """
+        Return PnL attribution grouped by market for all SETTLED orders.
+
+        This is the primary tool for understanding which markets are profitable
+        vs noise.  Only closed/settled rows are included — open orders have no
+        realized PnL.
+
+        Returns a list of dicts, each with:
+          market_id   – Polymarket condition_id
+          trade_count – total number of settled trades for this market
+          win_count   – trades where pnl > 0
+          total_pnl   – sum of realized PnL (Decimal, may be negative)
+          avg_edge    – mean charlie_p_win - price at entry (proxy for edge; None if unavailable)
+          avg_p_win   – mean charlie_p_win across settled trades (None if unavailable)
+        """
+        rows = await self._execute_query(
+            """
+            SELECT
+                market_id,
+                COUNT(*)                                           AS trade_count,
+                SUM(CASE WHEN CAST(pnl AS REAL) > 0 THEN 1 ELSE 0 END) AS win_count,
+                SUM(CAST(pnl AS REAL))                            AS total_pnl,
+                AVG(
+                    CASE WHEN charlie_p_win IS NOT NULL AND price IS NOT NULL
+                         THEN CAST(charlie_p_win AS REAL) - CAST(price AS REAL)
+                         ELSE NULL END
+                )                                                 AS avg_edge,
+                AVG(
+                    CASE WHEN charlie_p_win IS NOT NULL
+                         THEN CAST(charlie_p_win AS REAL)
+                         ELSE NULL END
+                )                                                 AS avg_p_win
+            FROM order_tracking
+            WHERE order_state = 'SETTLED'
+              AND pnl IS NOT NULL
+            GROUP BY market_id
+            ORDER BY total_pnl DESC
+            """,
+            fetch_all=True,
+        )
+        result = []
+        for row in (rows or []):
+            result.append(
+                {
+                    "market_id":   row[0],
+                    "trade_count": int(row[1]) if row[1] is not None else 0,
+                    "win_count":   int(row[2]) if row[2] is not None else 0,
+                    "total_pnl":   Decimal(str(round(row[3], 6))) if row[3] is not None else Decimal("0"),
+                    "avg_edge":    round(float(row[4]), 4) if row[4] is not None else None,
+                    "avg_p_win":   round(float(row[5]), 4) if row[5] is not None else None,
+                }
+            )
+        return result
+
     async def get_metrics(self) -> Dict:
         """
         Get ledger metrics.
