@@ -1180,6 +1180,21 @@ class TradingSystem:
                 logger.info("paper_positions_reset",
                             msg="stale OPEN paper positions force-closed at paper startup (live positions preserved)")
 
+                # Expire stale order_tracking rows from prior paper sessions.
+                # CREATED/SUBMITTED rows left by crashes are counted as active
+                # exposure by portfolio_risk_engine (via get_open_orders()), which
+                # can silently reject every new trade as over-exposed.  This must
+                # run BEFORE the CB is initialized so the equity view is clean.
+                _expired = await self._await_step(
+                    "ledger.cancel_stale_paper_orders",
+                    self.ledger.cancel_stale_paper_orders(),
+                )
+                logger.info(
+                    "stale_paper_orders_cleaned",
+                    expired_count=_expired,
+                    msg="stale paper CREATED/SUBMITTED rows expired before CB init",
+                )
+
             # 3. API Client
             api_config = self.config.get('api', {}).get('polymarket', {})
             

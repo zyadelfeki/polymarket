@@ -263,6 +263,26 @@ class LatencyArbitrageEngine:
         edge_up = true_prob_up - yes_odds_dec
         edge_down = true_prob_down - no_odds_dec
 
+        logger.debug(
+            "edge_candidate_computed",
+            market_id=market_id,
+            price_change_pct=float(round(price_change_pct, 5)),
+            edge_up=float(round(edge_up, 5)),
+            edge_down=float(round(edge_down, 5)),
+            min_edge_required=float(min_edge_dec),
+            up_passes=bool(current_price_dec > start_price_dec and edge_up > min_edge_dec),
+            down_passes=bool(current_price_dec < start_price_dec and edge_down > min_edge_dec),
+            reject_reason=(
+                None if (
+                    (current_price_dec > start_price_dec and edge_up > min_edge_dec) or
+                    (current_price_dec < start_price_dec and edge_down > min_edge_dec)
+                ) else (
+                    "edge_below_threshold" if abs(edge_up) < min_edge_dec and abs(edge_down) < min_edge_dec
+                    else "price_direction_mismatch"
+                )
+            ),
+        )
+
         if current_price_dec > start_price_dec and edge_up > min_edge_dec:
             return {
                 "market_id": market_id,

@@ -1406,6 +1406,43 @@ class AsyncLedger:
         logger.info("stale_positions_cleared", count=count)
         return count
 
+    async def cancel_stale_paper_orders(self) -> int:
+        """
+        Expire stale paper-mode order_tracking rows left from prior sessions.
+
+        Called once at paper-mode startup.  Rows in CREATED / SUBMITTED /
+        PARTIALLY_FILLED state from previous runs are phantom exposure — they
+        inflate get_open_orders() and cause portfolio_risk_engine to reject
+        every new trade as over-exposed.  Transitioning them to EXPIRED removes
+        them from the active-order window without deleting audit history.
+
+        SAFETY: Only touches rows where mode='paper' (or mode IS NULL for
+        legacy rows).  Live-mode rows are never modified by this method.
+
+        Returns:
+            Number of rows transitioned to EXPIRED.
+        """
+        conn = await self.pool.acquire()
+        try:
+            cursor = await conn.execute(
+                """
+                UPDATE order_tracking
+                SET order_state  = 'EXPIRED',
+                    closed_at    = CURRENT_TIMESTAMP,
+                    notes        = COALESCE(notes || ' | ', '') ||
+                                   'expired_on_startup_stale_session'
+                WHERE order_state IN ('CREATED', 'SUBMITTED', 'PARTIALLY_FILLED')
+                  AND (mode IS NULL OR mode = 'paper')
+                """
+            )
+            count = cursor.rowcount if cursor.rowcount is not None else 0
+            await conn.commit()
+        finally:
+            await self.pool.release(conn)
+
+        logger.info("stale_paper_orders_expired", count=count)
+        return count
+
     async def get_open_positions(self) -> List[PositionData]:
         """
         Get all open positions.
