@@ -381,6 +381,8 @@ class TradingSystem:
                 "arbitrage_opportunity_detected",
                 trigger=trigger,
                 market_id=opportunity.get("market_id"),
+                asset=opportunity.get("asset"),
+                question=(opportunity.get("question") or "")[:80],
                 side=opportunity.get("side"),
                 timeframe=opportunity.get("timeframe"),
                 btc_price=str(opportunity.get("btc_price")),
@@ -702,8 +704,15 @@ class TradingSystem:
         charlie_regime: Optional[str] = None
 
         if self.charlie_gate is not None:
-            # Map opportunity symbol to Charlie vocab (default BTC)
-            opp_symbol = str(opportunity.get("symbol") or opportunity.get("btc_symbol") or "BTC")
+            # Map opportunity asset to Charlie vocab (default BTC).
+            # The opportunity dict uses "asset" (e.g. "SOL", "BTC") not "symbol".
+            # Falling back to "symbol" / "btc_symbol" for legacy compatibility.
+            opp_symbol = str(
+                opportunity.get("asset")
+                or opportunity.get("symbol")
+                or opportunity.get("btc_symbol")
+                or "BTC"
+            )
 
             # Fetch real Binance technical features (cached 60s; returns None on failure)
             # This is what actually gives Charlie's ML models live market context.
@@ -733,6 +742,7 @@ class TradingSystem:
                     timeframe="15m",
                     bankroll=equity,
                     extra_features=_extra_features,
+                    market_question=str(opportunity.get("question") or "")[:80],
                     override_win_rate=(
                         self.performance_tracker.get_rolling_win_rate(20)
                         if self.performance_tracker is not None

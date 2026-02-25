@@ -165,6 +165,7 @@ class CharliePredictionGate:
         timeframe: str = "15m",
         bankroll: Decimal = Decimal("0"),
         extra_features: Optional[Dict] = None,
+        market_question: str = "",
         override_win_rate: Optional[float] = None,
     ) -> Optional[TradeRecommendation]:
         """
@@ -172,6 +173,8 @@ class CharliePredictionGate:
 
         Returns ``None`` (no bet) if any filter fails.
         Returns a ``TradeRecommendation`` only when all filters pass.
+
+        ``market_question`` is used for BTC-relevance guard and log enrichment.
         """
         try:
             return await self._evaluate_market_inner(
@@ -181,6 +184,7 @@ class CharliePredictionGate:
                 timeframe=timeframe,
                 bankroll=bankroll,
                 extra_features=extra_features,
+                market_question=market_question,
                 override_win_rate=override_win_rate,
             )
         except Exception as exc:
@@ -201,14 +205,37 @@ class CharliePredictionGate:
         timeframe: str = "15m",
         bankroll: Decimal = Decimal("0"),
         extra_features: Optional[Dict] = None,
+        market_question: str = "",
         override_win_rate: Optional[float] = None,
     ) -> Optional[TradeRecommendation]:
         """Inner implementation of evaluate_market, wrapped by the outer try/except."""
+
+        # --- 0. BTC-relevance guard ----------------------------------------
+        # Charlie's ensemble models are trained exclusively on BTC OHLCV
+        # indicators (RSI-14, MACD, price-vs-SMA, book imbalance).  Applying
+        # those features to Solana / ETH / XRP markets produces p_win values
+        # that have zero predictive power for the non-BTC asset.
+        # Skip markets whose symbol AND question text contain no BTC keyword.
+        _sym_upper = symbol.strip().upper()
+        _is_btc_symbol = _sym_upper.startswith("BTC") or _sym_upper == "XBTUSDT"
+        _q_lower = market_question.lower()
+        _has_btc_keyword = "bitcoin" in _q_lower or "btc" in _q_lower
+        if not _is_btc_symbol and not _has_btc_keyword:
+            logger.info(
+                "charlie_skipped_irrelevant_market",
+                market_id=market_id,
+                symbol=symbol,
+                market_question=market_question[:80],
+                reason="charlie_models_are_btc_only_no_btc_keyword_in_question",
+            )
+            return None
+
         if _get_signal_for_market is None:
             logger.warning(
                 "charlie_gate_rejected",
                 reason="charlie_api_unavailable",
                 market_id=market_id,
+                market_question=market_question[:80],
                 p_win=None,
                 min_win_probability=None,
                 confidence=None,
@@ -275,6 +302,7 @@ class CharliePredictionGate:
             logger.warning(
                 "charlie_coin_flip_rejected",
                 market_id=market_id,
+                market_question=market_question[:80],
                 p_win=p_win,
                 reason="p_win within 3% of 0.5 = no signal",
                 symbol=symbol,
@@ -287,6 +315,7 @@ class CharliePredictionGate:
                 "charlie_gate_rejected",
                 reason="edge_below_threshold",
                 market_id=market_id,
+                market_question=market_question[:80],
                 edge=f"{edge:.4f}",
                 min_edge=str(self._min_edge),
                 p_win=float(p_win),
@@ -304,6 +333,7 @@ class CharliePredictionGate:
                 "charlie_gate_rejected",
                 reason="confidence_below_threshold",
                 market_id=market_id,
+                market_question=market_question[:80],
                 p_win=float(p_win),
                 min_win_probability=None,
                 confidence=float(confidence),
@@ -372,6 +402,7 @@ class CharliePredictionGate:
                     "charlie_gate_rejected",
                     reason="kelly_size_zero",
                     market_id=market_id,
+                    market_question=market_question[:80],
                     p_win=float(effective_p_win),
                     min_win_probability=None,
                     confidence=float(confidence),
@@ -403,6 +434,7 @@ class CharliePredictionGate:
         logger.info(
             "charlie_gate_approved",
             market_id=market_id,
+            market_question=market_question[:80],
             side=side,
             size=str(size),
             kelly_fraction=str(kelly_fraction),
