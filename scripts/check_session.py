@@ -21,7 +21,9 @@ for line in lines:
     if not line:
         continue
     try:
-        events.append(json.loads(line))
+        obj = json.loads(line)
+        if isinstance(obj, dict):   # skip plain strings like "HTTP/2 200 OK"
+            events.append(obj)
     except json.JSONDecodeError:
         pass
 
