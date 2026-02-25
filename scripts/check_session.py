@@ -243,8 +243,20 @@ else:
             print("  Check: risk/system_circuit_breaker.py and daily_loss / drawdown state in DB.")
             print("  If circuit_breaker_blocked: the CB may have tripped from prior paper losses.")
         elif charlie_approved == 0:
-            print("  Opportunities detected but Charlie approved NONE.")
-            print("  Next step: search logs for 'charlie_gate_rejected' events.")
-            print("  Check the p_win range and reason breakdown above.")
+            coin_flip = count("charlie_coin_flip_rejected")
+            if coin_flip > 0 and features < opp_detected // 3:
+                print("  charlie_coin_flip_rejected fired — Binance features not reaching Charlie.")
+                print(f"  binance_features_computed={features}  vs  opportunities={opp_detected}")
+                print("  Likely cause: api.binance.com unreachable or throttled.")
+                print("  Fix: check logs for 'binance_candle_fetch_failed'.  Re-run after network check.")
+                print("  Run: python scripts/diagnose_charlie.py to test signal pipeline directly.")
+            elif coin_flip > 0:
+                print("  charlie_coin_flip_rejected: features arriving but models return HOLD.")
+                print("  Run: python scripts/diagnose_charlie.py to inspect per-model votes.")
+                print("  Check: prediction_engine.py SVM rsi threshold vs current live RSI value.")
+            else:
+                print("  Opportunities detected but Charlie approved NONE.")
+                print("  Next step: search logs for 'charlie_gate_rejected' events.")
+                print("  Check the p_win range and reason breakdown above.")
         elif order_submitted == 0:
             print("  Charlie approved but orders not submitted. Check execution service.")
