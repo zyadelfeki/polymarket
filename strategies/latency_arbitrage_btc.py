@@ -171,13 +171,25 @@ class LatencyArbitrageEngine:
         )
 
     def calculate_dynamic_fee(self, price: Decimal) -> Decimal:
-        """Estimate taker fee as function of outcome price (peak near midpoint)."""
-        clamped_price = max(Decimal("0.0"), min(Decimal("1.0"), to_decimal(price)))
-        base_fee_rate = Decimal("0.03")
-        distance_from_midpoint = abs(clamped_price - Decimal("0.5"))
-        fee_multiplier = Decimal("1.0") - (distance_from_midpoint * Decimal("2"))
-        estimated_fee = base_fee_rate * max(Decimal("0"), fee_multiplier)
-        return max(estimated_fee, Decimal("0.005"))
+        """Estimate Polymarket taker fee as a fraction of stake.
+
+        Polymarket charges 2% of WINNINGS (profit on the bet), NOT 2% of notional.
+        For a token bought at price P that resolves in your favour:
+          - Net profit per share = (1 - P)
+          - Fee per share        = 2% × (1 - P)
+          - Fee as fraction of stake = 2% × (1 - P) / P
+
+        The old model returned up to 3% of notional for mid-market prices, which
+        overcounted fees by 2–3x and caused net_edge to go negative on real
+        opportunities (e.g. P=0.55: old=2.7%, new=1.6%).
+
+        A minimum floor of 0.3% handles near-certain markets (P → 0.99).
+        Price is clamped to [0.01, 0.99] to avoid division by zero.
+        """
+        fee_rate = Decimal("0.02")
+        clamped_price = max(Decimal("0.01"), min(Decimal("0.99"), to_decimal(price)))
+        fee_fraction = fee_rate * (Decimal("1") - clamped_price) / clamped_price
+        return max(fee_fraction, Decimal("0.003"))
 
     def calculate_net_edge(self, raw_edge: Decimal, yes_price: Decimal) -> Decimal:
         """Adjust edge for taker fee and slippage."""
@@ -376,16 +388,15 @@ class LatencyArbitrageEngine:
             return None
 
         # ------------------------------------------------------------------ #
-        # Fetch spot prices for all supported assets.  The strategy was       #
-        # previously BTC-only, but Polymarket may not have active BTC 15-min  #
-        # markets at all times.  Support ETH/SOL/XRP so we never silently     #
-        # emit zero opportunities simply because BTC markets are absent.      #
+        # BTC-only scanning: Charlie ensemble models are trained on BTC OHLCV #
+        # features only.  Scanning ETH/SOL/XRP wastes ~75% of API quota with  #
+        # zero chance of producing trades (charlie_booster skips non-BTC).    #
+        # Re-enable when per-asset models are available in project-charlie.   #
         # ------------------------------------------------------------------ #
         _asset_keywords: Dict[str, List[str]] = {
+            # ETH/SOL/XRP scanning disabled: Charlie models are trained on BTC features only.
+            # Re-enable when per-asset models are available in project-charlie.
             "BTC": ["btc", "bitcoin"],
-            "ETH": ["eth", "ethereum"],
-            "SOL": ["sol", "solana"],
-            "XRP": ["xrp", "ripple"],
         }
         asset_prices: Dict[str, Optional[Decimal]] = {}
         for _sym in _asset_keywords:
@@ -394,9 +405,6 @@ class LatencyArbitrageEngine:
         logger.info(
             "diagnostic_asset_prices",
             btc=str(asset_prices.get("BTC")),
-            eth=str(asset_prices.get("ETH")),
-            sol=str(asset_prices.get("SOL")),
-            xrp=str(asset_prices.get("XRP")),
         )
 
         # Backward-compat alias so downstream helpers keep working.
