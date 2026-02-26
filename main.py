@@ -1468,17 +1468,17 @@ class TradingSystem:
                 try:
                     _live_cfg = _json.loads(_kelly_live_path.read_text())
                     if "min_edge_required" in _live_cfg:
-                        KELLY_CONFIG["min_edge"] = Decimal(str(_live_cfg["min_edge_required"]))
+                        KELLY_CONFIG["min_edge_required"] = Decimal(str(_live_cfg["min_edge_required"]))
                     if "fractional_kelly" in _live_cfg:
                         KELLY_CONFIG["fractional_kelly"] = Decimal(str(_live_cfg["fractional_kelly"]))
                     if "max_bet_pct" in _live_cfg:
-                        KELLY_CONFIG["max_bet_fraction"] = Decimal(str(_live_cfg["max_bet_pct"]))
+                        KELLY_CONFIG["max_bet_pct"] = Decimal(str(_live_cfg["max_bet_pct"]))
                     logger.info(
                         "kelly_config_loaded_from_optimizer",
                         sharpe=_live_cfg.get("sharpe"),
                         trade_count=_live_cfg.get("trade_count"),
                         optimized_at=_live_cfg.get("optimized_at"),
-                        min_edge=str(KELLY_CONFIG.get("min_edge")),
+                        min_edge=str(KELLY_CONFIG.get("min_edge_required")),
                         fractional_kelly=str(KELLY_CONFIG.get("fractional_kelly")),
                     )
                 except Exception as _e:
@@ -1487,9 +1487,8 @@ class TradingSystem:
             # --- Load rolling Kelly snapshot (YAML) if present --------------
             # rolling_kelly_optimizer.py writes config/kelly_config_snapshot_{date}.yaml
             # and correctly uses KELLY_CONFIG's canonical keys (min_edge_required,
-            # fractional_kelly, max_bet_pct).  The JSON loader above has key-name
-            # discrepancies (writes 'min_edge' / 'max_bet_fraction'); the YAML loader
-            # runs after it and correctly overwrites with canonical keys.
+            # fractional_kelly, max_bet_pct).  The JSON loader above also now uses
+            # the same canonical keys after the fix in commit 69f463a.
             import glob as _glob
             import yaml as _yaml
             _snap_files = sorted(

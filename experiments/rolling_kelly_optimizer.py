@@ -65,7 +65,9 @@ _GRID: Dict[str, List[Any]] = {
     "max_bet_pct":      [Decimal("2.5"),  Decimal("5.0")],
 }
 
-MIN_SETTLED_TRADES = 5   # Do not rank combos with fewer settled trades.
+MIN_SETTLED_TRADES = 50  # Minimum settled trades required before writing kelly_live.json.
+                         # Below this threshold the Sharpe estimate is noise; the optimizer
+                         # must not overwrite a manually-vetted config with a tiebreaker.
 CONFIG_DIR = _REPO_ROOT / "config"
 
 
@@ -171,7 +173,7 @@ async def _run_sweep(
     results  = []
 
     print(f"Rolling Kelly optimizer | log={log_file} | window={window_days}d")
-    print(f"  period: {from_ts.date()} → {to_ts.date()} | combos: {len(combos)}")
+    print(f"  period: {from_ts.date()} -> {to_ts.date()} | combos: {len(combos)}")
 
     for i, combo in enumerate(combos, 1):
         label = (
@@ -288,8 +290,24 @@ def main() -> None:
     if winner is None:
         print(
             f"\n[OPTIMIZER] No combo has >= {MIN_SETTLED_TRADES} settled trades in the window."
-            f"\n            kelly_live.json NOT updated — current config remains active."
+            f"\n            kelly_live.json NOT updated - current config remains active."
             f"\n            Run again after more trades settle."
+        )
+        return
+
+    # Guard: if every eligible combo has identical Sharpe=0.0, the winner was
+    # selected by tiebreaker alone (not by data).  Overwriting kelly_live.json
+    # in this state silently replaces a manually-vetted min_edge with the
+    # lowest value in the grid (0.005).  This has happened twice in production.
+    all_sharpes = [r["sharpe"] for r in results if r["trade_count"] >= MIN_SETTLED_TRADES]
+    all_tied_at_zero = len(set(all_sharpes)) == 1 and (not all_sharpes or all_sharpes[0] == 0.0)
+    if all_tied_at_zero:
+        print(
+            f"\n[OPTIMIZER] WARNING: all {len(all_sharpes)} eligible combos tied at Sharpe=0.0"
+            f" ({winner['trade_count']} trades in window)."
+            f"\n            Tiebreaker selection is not data-driven."
+            f"\n            kelly_live.json NOT updated - current config remains active."
+            f"\n            Run again when >= 100 trades are available in the rolling window."
         )
         return
 
