@@ -1004,6 +1004,17 @@ class TradingSystem:
                             notes=charlie_rec.reason if charlie_rec else None,
                         ),
                     )
+                    # pre_ row is superseded by the confirmed exchange order ID.
+                    # Mark it terminal so get_open_orders() never returns it and
+                    # the settlement loop cannot double-count PnL.
+                    if pre_order_id:
+                        await self._safe_await(
+                            "ledger.transition_order_state_superseded",
+                            self.ledger.transition_order_state(
+                                pre_order_id, "SUPERSEDED",
+                                notes=f"superseded_by={exchange_order_id}",
+                            ),
+                        )
                 if self.ledger is not None:
                     await self._safe_await(
                         "ledger.transition_order_state_submitted",

@@ -1566,7 +1566,7 @@ class AsyncLedger:
         "CREATED", "SUBMITTED", "PARTIALLY_FILLED", "FILLED",
     })
     _TERMINAL_ORDER_STATES = frozenset({
-        "CANCELLED", "EXPIRED", "SETTLED", "ERROR",
+        "CANCELLED", "EXPIRED", "SETTLED", "ERROR", "SUPERSEDED",
     })
 
     async def record_order_created(

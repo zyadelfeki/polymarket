@@ -1,0 +1,9 @@
+{
+  "min_edge_required": 0.02,
+  "fractional_kelly": 0.25,
+  "max_bet_pct": 0.025,
+  "sharpe": 0.0,
+  "trade_count": 25,
+  "optimized_at": "2026-02-26T13:54:51.438410+00:00",
+  "selected_by": "manual_override_tiebreaker_reset"
+}
