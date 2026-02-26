@@ -48,8 +48,18 @@ order_settled     = count("order_settled")
 
 # Previously-fixed events (should stay at 0)
 periodic_failed   = count("periodic_check_failed")
-perf_halt         = count("performance_halt_win_rate")
 cb_attr_err       = count("circuit_breaker_attribute_error")
+
+# performance_halt_win_rate: CRITICAL in live mode (trips CB), WARNING in paper mode.
+# Count live-mode (actionable) halts only — paper-mode fires are log_only artefacts.
+perf_halt_win_rate_live = sum(
+    1 for e in events
+    if e.get("event") == "performance_halt_win_rate" and e.get("action") != "log_only"
+)
+perf_halt_win_rate_paper = sum(
+    1 for e in events
+    if e.get("event") == "performance_halt_win_rate" and e.get("action") == "log_only"
+)
 
 # performance_halt_drawdown: CRITICAL in live mode (trips CB), WARNING in paper mode.
 # Count live-mode (actionable) halts only — paper-mode fires are cross-session artefact.
@@ -111,15 +121,18 @@ print(f"  strategy_scan_begin: {scans}")
 print(f"\n--- FIXED (must be 0) ---")
 ok_fixed = True
 for name, val in [
-    ("periodic_check_failed",                 periodic_failed),
-    ("performance_halt_win_rate",             perf_halt),
-    ("circuit_breaker_attribute_error",       cb_attr_err),
-    ("performance_halt_drawdown [live-mode]", perf_halt_drawdown_live),
+    ("periodic_check_failed",                    periodic_failed),
+    ("performance_halt_win_rate [live-mode]",     perf_halt_win_rate_live),
+    ("circuit_breaker_attribute_error",           cb_attr_err),
+    ("performance_halt_drawdown [live-mode]",     perf_halt_drawdown_live),
 ]:
     tag = "OK  " if val == 0 else "FAIL"
     if val != 0:
         ok_fixed = False
     print(f"  {tag}          {name}: {val}")
+if perf_halt_win_rate_paper > 0:
+    print(f"  INFO          performance_halt_win_rate [paper log_only]: {perf_halt_win_rate_paper}"
+          f"  (paper-mode win-rate warning \u2014 CB not tripped, safe to ignore)")
 if perf_halt_drawdown_paper > 0:
     print(f"  INFO          performance_halt_drawdown [paper log_only]: {perf_halt_drawdown_paper}"
           f"  (cross-session historical drawdown \u2014 CB not tripped, safe to ignore)")

@@ -133,23 +133,22 @@ async def _run_combo(
     engine = ReplayEngine(
         log_file=log_file,
         kelly_config=cfg,
-        starting_capital=STARTING_CAPITAL,
+        initial_equity=STARTING_CAPITAL,
         from_ts=from_ts,
         to_ts=to_ts,
     )
-    await engine.run()
-    stats = engine.stats()
+    # run() returns the full metrics dict — ReplayEngine has no separate stats() method.
+    stats = await engine.run()
 
     settled = stats.get("settled_trades", 0) or stats.get("total_trades", 0) or 0
     wins    = stats.get("wins", 0) or 0
     win_pct = (wins / settled * 100) if settled > 0 else None
 
-    returns       = stats.get("trade_returns", []) or []
-    equity_curve  = stats.get("equity_curve", []) or []
-
-    sharpe   = _compute_sharpe([float(r) for r in returns]) if returns else 0.0
-    max_dd   = _compute_max_drawdown([float(e) for e in equity_curve]) if equity_curve else 0.0
-    cagr     = stats.get("cagr", None)
+    # sharpe and max_drawdown_pct are already computed inside ReplayMetrics.to_dict();
+    # equity_series is available if custom recomputation is ever needed.
+    sharpe = stats.get("sharpe") or 0.0
+    max_dd = stats.get("max_drawdown_pct", 0.0)
+    cagr   = stats.get("cagr", None)
 
     return {
         "min_edge":       float(combo["min_edge_required"]),
