@@ -22,7 +22,7 @@ if (Test-Path .env) {
     }
     Write-Host "Loaded .env"
 } else {
-    Write-Warning ".env not found — proceeding with existing environment variables"
+    Write-Warning ".env not found - proceeding with existing environment variables"
 }
 
 $env:LOG_FORMAT = "json"
