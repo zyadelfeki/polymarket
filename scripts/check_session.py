@@ -194,7 +194,7 @@ if total_rr > 0:
     found_any_rejection = True
     print(f"  risk_rejected (circuit_breaker): {total_rr}  <-- fires BEFORE Charlie")
     for reason, c in risk_rejected_reasons.most_common():
-        print(f"    └─ {reason}: {c}")
+        print(f"    +-- {reason}: {c}")
 
 # 2. Per-event rejection items (Charlie, global/per-market budget, etc.)
 for ev in rejection_events:
@@ -214,10 +214,10 @@ for ev in rejection_events:
             ]
             p_win_summary = ""
             if p_wins:
-                p_win_summary = f"  (p_win range: {min(p_wins):.3f}–{max(p_wins):.3f})"
+                p_win_summary = f"  (p_win range: {min(p_wins):.3f}-{max(p_wins):.3f})"
             print(f"  {ev}: {c}{p_win_summary}")
             for reason, rc in reasons.most_common():
-                print(f"    └─ reason={reason}: {rc}")
+                print(f"    +-- reason={reason}: {rc}")
         else:
             print(f"  {ev}: {c}")
 
@@ -227,7 +227,7 @@ if portfolio_blocked_reasons:
     total_pb = sum(portfolio_blocked_reasons.values())
     print(f"  order_blocked_portfolio_risk: {total_pb}")
     for reason, c in portfolio_blocked_reasons.most_common():
-        print(f"    └─ {reason}: {c}")
+        print(f"    +-- {reason}: {c}")
 
 if opportunity_skip_reasons:
     found_any_rejection = True
@@ -235,16 +235,27 @@ if opportunity_skip_reasons:
         print(f"  opportunity_skipped[{reason}]: {c}")
 
 if not found_any_rejection:
-    print("  (none — if charlie_gate_approved=0 check for charlie_gate_rejected events)")
+    print("  (none -- if charlie_gate_approved=0 check for charlie_gate_rejected events)")
+
+# ---------- Phase 3-6 features ----------
+print(f"\n--- ADVANCED FEATURES ---")
+_arb_found = count("yes_no_arb_found")
+_snipe_would = count("snipe_would_fire")
+_snipe_attempt = count("snipe_attempt")
+_oracle_window = count("oracle_window_detected")
+print(f"  yes_no_arb_found: {_arb_found}")
+print(f"  snipe_would_fire: {_snipe_would}")
+print(f"  snipe_attempt: {_snipe_attempt}")
+print(f"  oracle_window_detected: {_oracle_window}")
 
 # ---------- final verdict ----------
 all_ok = ok_fixed and signals_ok
 print()
 if all_ok:
-    print("=== ALL CHECKS PASSED — run the Kelly sweep next ===")
+    print("=== ALL CHECKS PASSED -- run the Kelly sweep next ===")
     print("  python experiments/sweep_kelly_and_edge.py --log logs/production.log")
 else:
-    print("=== CHECKS FAILED — DO NOT RUN SWEEP YET ===")
+    print("=== CHECKS FAILED -- DO NOT RUN SWEEP YET ===")
     if not ok_fixed:
         print("  Previously-fixed errors have returned.")
     if not signals_ok:
@@ -254,7 +265,7 @@ else:
         elif total_circuit_blocked > 0 and charlie_approved == 0:
             print("  Circuit breaker blocked all opportunities BEFORE Charlie was called.")
             for reason, c in risk_rejected_reasons.most_common():
-                print(f"    \u2514\u2500 {reason}: {c}")
+                print(f"    +-- {reason}: {c}")
             print("  Check: risk/system_circuit_breaker.py and daily_loss / drawdown state in DB.")
             print("  If circuit_breaker_blocked: the CB may have tripped from prior paper losses.")
         elif charlie_approved == 0:

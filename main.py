@@ -59,6 +59,12 @@ from data_feeds.binance_features import get_all_features as _get_binance_feature
 from risk.portfolio_risk import PortfolioRiskEngine, DrawdownMonitor
 from services.health_server import HealthServer
 
+# Phase 3-6 features (log-only)
+from data_feeds.arb_scanner import scan_yes_no_arb
+from execution.sniper import MarketSniper
+from execution.oracle_monitor import check_oracle_window
+from data_feeds.binance_feed import BinanceTradeFeed
+
 
 def _build_model_feedback_callback():
     """
@@ -198,6 +204,8 @@ class TradingSystem:
         self._paper_order_cooldowns: Dict[str, float] = {}
         self._paper_session_start: Optional[str] = None
         self.last_discovered_markets = []
+        self.market_sniper = MarketSniper()
+        self.binance_trade_feed: Optional[BinanceTradeFeed] = None
         startup_config = config.get('startup', {})
         self.init_timeout_seconds = float(startup_config.get('component_timeout_seconds', 25.0))
         self.network_timeout_seconds = float(startup_config.get('network_timeout_seconds', 20.0))
@@ -1434,6 +1442,17 @@ class TradingSystem:
             self.health_server = HealthServer(state_ref=self)
             logger.info("component_construct_success", component="health_server")
 
+            # 16. Binance @trade feed (per-fill granularity for sniper)
+            _trade_feed_symbols = self.config.get('markets', {}).get('crypto_symbols', ['BTC', 'ETH'])
+            logger.info("component_construct_begin", component="binance_trade_feed")
+            self.binance_trade_feed = BinanceTradeFeed(symbols=_trade_feed_symbols)
+            asyncio.get_running_loop().create_task(self.binance_trade_feed.run())
+            logger.info(
+                "component_construct_success",
+                component="binance_trade_feed",
+                symbols=_trade_feed_symbols,
+            )
+
             logger.info("all_components_initialized")
             
         except Exception as e:
@@ -1693,6 +1712,56 @@ class TradingSystem:
                         continue
 
                 await self._run_strategy_scan(trigger="main_loop")
+
+                # --- Phase 3-6: arb scanner + oracle monitor on discovered markets ---
+                if self.last_discovered_markets:
+                    # Yes/No sum arb (risk-free) — log only
+                    try:
+                        _arb_opps = scan_yes_no_arb(
+                            self.last_discovered_markets, self.api_client
+                        )
+                        if _arb_opps:
+                            logger.info(
+                                "arb_scan_complete",
+                                opportunities_found=len(_arb_opps),
+                                best_net_arb_pct=_arb_opps[0]["net_arb_pct"],
+                            )
+                    except Exception as _arb_exc:
+                        logger.warning("arb_scan_failed", error=str(_arb_exc))
+
+                    # Oracle window monitor — log only
+                    try:
+                        for _mkt in self.last_discovered_markets:
+                            check_oracle_window(_mkt)
+                    except Exception as _oracle_exc:
+                        logger.warning("oracle_scan_failed", error=str(_oracle_exc))
+
+                    # Last-second sniper check — log only
+                    if self.market_sniper:
+                        for _mkt in self.last_discovered_markets:
+                            try:
+                                _secs = self.market_sniper.seconds_to_close(_mkt)
+                                if 0 < _secs <= 30:  # within 30s of close
+                                    _btc_price = (
+                                        self.binance_trade_feed.get_price("BTC")
+                                        if self.binance_trade_feed
+                                        else None
+                                    )
+                                    if _btc_price is not None:
+                                        _mkt_price = Decimal(
+                                            str(_mkt.get("market_price") or "0.50")
+                                        )
+                                        _p_win = Decimal("0.5")  # placeholder until Charlie signal
+                                        if self.market_sniper.should_snipe(
+                                            _mkt, _p_win, _mkt_price
+                                        ):
+                                            self.market_sniper.evaluate_snipe(
+                                                _mkt, "YES", _p_win, _mkt_price
+                                            )
+                            except Exception as _snipe_exc:
+                                logger.debug(
+                                    "snipe_check_error", error=str(_snipe_exc)
+                                )
                 
             except Exception as e:
                 logger.error(
