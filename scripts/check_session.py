@@ -276,6 +276,48 @@ else:
         elif order_submitted == 0:
             print("  Charlie approved but orders not submitted. Check execution service.")
 
+# ---------- calibration progress ----------
+print(f"\n--- CALIBRATION PROGRESS ---")
+_cal_csv = Path("data/calibration_dataset.csv")
+if _cal_csv.exists():
+    import csv as _csv
+    _cal_p, _cal_a = [], []
+    with open(_cal_csv, "r", newline="") as _cf:
+        for _row in _csv.DictReader(_cf):
+            try:
+                _cal_p.append(float(_row["p_win_raw"]))
+                _cal_a.append(int(_row["actual_outcome"]))
+            except (KeyError, ValueError):
+                pass
+    _cal_n = len(_cal_p)
+    print(f"  Calibration samples: {_cal_n}")
+    if _cal_n > 0:
+        # ECE (10-bin)
+        _n_bins = 10
+        _bins = [[] for _ in range(_n_bins)]
+        for _p, _a in zip(_cal_p, _cal_a):
+            _idx = min(int(_p * _n_bins), _n_bins - 1)
+            _bins[_idx].append((_p, _a))
+        _ece = 0.0
+        for _b in _bins:
+            if not _b:
+                continue
+            _mc = sum(x[0] for x in _b) / len(_b)
+            _ma = sum(x[1] for x in _b) / len(_b)
+            _ece += (len(_b) / _cal_n) * abs(_mc - _ma)
+        _avg_p = sum(_cal_p) / _cal_n
+        _win_rate = sum(_cal_a) / _cal_n
+        print(f"  Uncalibrated ECE: {_ece:.4f}")
+        print(f"  Avg p_win_raw: {_avg_p:.4f}  |  Actual win rate: {_win_rate:.4f}")
+    if _cal_n >= 100:
+        print(f"  ✓ CALIBRATION READY — run: python scripts/fit_calibration.py")
+    else:
+        _remaining = 100 - _cal_n
+        print(f"  ⏳ Need {_remaining} more samples before fitting (target: 100)")
+        print(f"     At ~20-30 settlements/day → ~{max(1, _remaining // 25)} more days")
+else:
+    print("  (no calibration data yet — run: python scripts/build_calibration_dataset.py)")
+
 # ---------- PnL attribution by market ----------
 print(f"\n--- PnL ATTRIBUTION BY MARKET ---")
 import asyncio as _asyncio

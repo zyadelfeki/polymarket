@@ -43,6 +43,9 @@ from decimal import Decimal
 from typing import Dict, Optional
 import structlog
 
+from models.calibration import calibrate_p_win
+from utils.fee_calculator import taker_fee_rate, net_edge as _net_edge_calc
+
 # structlog is used throughout the polymarket codebase — stdlib logging does
 # NOT accept keyword arguments (reason=, market_id=, …) so all structured
 # log calls here must go through structlog.
@@ -269,7 +272,8 @@ class CharliePredictionGate:
             )
             return None
 
-        p_win: float = float(signal["p_win"])
+        p_win_raw: float = float(signal["p_win"])
+        p_win: float = calibrate_p_win(p_win_raw)  # Platt-calibrated (passthrough if no scaler)
         confidence: float = float(signal["confidence"])
         regime: str = signal["regime"]
         technical_regime: str = signal.get("technical_regime", "UNKNOWN")
@@ -287,12 +291,16 @@ class CharliePredictionGate:
             side = "YES"
             effective_p_win = p_win
             implied_prob = yes_implied
-            edge = yes_edge
+            gross_edge = yes_edge
         else:
             side = "NO"
             effective_p_win = no_p_win
             implied_prob = no_implied
-            edge = no_edge
+            gross_edge = no_edge
+
+        # --- 2c. Fee-aware edge: subtract dynamic Polymarket taker fee ------
+        _fee = float(taker_fee_rate(Decimal(str(implied_prob))))
+        edge = gross_edge - _fee  # net edge after fees
 
         # --- 2b. Coin-flip rejection: p_win within 3% of 0.5 = no signal ----
         # Charlie is operating in degraded/neutral mode when it cannot
@@ -309,16 +317,19 @@ class CharliePredictionGate:
             )
             return None
 
-        # --- 3. Edge filter -------------------------------------------------
+        # --- 3. Edge filter (fee-aware) --------------------------------------
         if Decimal(str(edge)) < self._min_edge:
             logger.info(
                 "charlie_gate_rejected",
                 reason="edge_below_threshold",
                 market_id=market_id,
                 market_question=market_question[:80],
-                edge=f"{edge:.4f}",
+                gross_edge=f"{gross_edge:.4f}",
+                net_edge=f"{edge:.4f}",
+                fee=f"{_fee:.4f}",
                 min_edge=str(self._min_edge),
                 p_win=float(p_win),
+                p_win_raw=float(p_win_raw),
                 min_win_probability=None,
                 implied_prob=yes_implied,
                 confidence=float(confidence),
@@ -439,8 +450,11 @@ class CharliePredictionGate:
             size=str(size),
             kelly_fraction=str(kelly_fraction),
             p_win=effective_p_win,
+            p_win_raw=float(p_win_raw),
             implied_prob=implied_prob,
-            edge=edge,
+            gross_edge=gross_edge,
+            net_edge=edge,
+            fee=_fee,
             confidence=confidence,
             regime=regime,
             symbol=symbol,

@@ -2163,6 +2163,39 @@ class TradingSystem:
                 payout_per_share=str(payout_per_share),
             )
 
+            # --- Calibration data collection: append (p_win, actual) to CSV --
+            _cal_p_win = row.get("charlie_p_win")
+            if _cal_p_win is not None:
+                try:
+                    import csv as _csv
+                    from pathlib import Path as _Path
+                    _cal_csv = _Path("data/calibration_dataset.csv")
+                    _write_header = not _cal_csv.exists()
+                    _actual = 1 if pnl > Decimal("0") else 0
+                    with open(_cal_csv, "a", newline="") as _cf:
+                        _w = _csv.DictWriter(
+                            _cf,
+                            fieldnames=["market_id", "p_win_raw", "actual_outcome"],
+                        )
+                        if _write_header:
+                            _w.writeheader()
+                        _w.writerow({
+                            "market_id": market_id,
+                            "p_win_raw": round(float(_cal_p_win), 6),
+                            "actual_outcome": _actual,
+                        })
+                    logger.debug(
+                        "calibration_data_appended",
+                        market_id=market_id,
+                        p_win_raw=float(_cal_p_win),
+                        actual=_actual,
+                    )
+                except Exception as _cal_exc:
+                    logger.warning(
+                        "calibration_data_append_failed",
+                        error=str(_cal_exc),
+                    )
+
         logger.info(
             "settlement_scan_complete",
             open_positions_checked=len(open_orders),
