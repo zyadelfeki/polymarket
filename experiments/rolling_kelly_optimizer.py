@@ -232,12 +232,16 @@ def _write_snapshot(winner: Dict[str, Any], optimized_at: str) -> Path:
     with open(snap_path, "w") as fh:
         yaml.dump(snap_data, fh, default_flow_style=False, sort_keys=False)
 
-    # Machine-readable JSON for main.py's existing startup loader
+    # Machine-readable JSON for main.py's existing startup loader.
+    # max_bet_pct is written as a PERCENTAGE (e.g. 2.5) because KellySizer
+    # reads it with config.get('max_bet_pct', "5.0") and then divides by 100
+    # internally (see risk/kelly_sizer.py line ~235: bankroll * max_bet_pct / 100).
+    # Do NOT divide by 100 here — that would make bets 100x too small.
     live_path = CONFIG_DIR / "kelly_live.json"
     live_data = {
         "min_edge_required":  winner["min_edge"],
         "fractional_kelly":   winner["fractional_kelly"],
-        "max_bet_pct":        winner["max_bet_pct"] / 100.0,  # stored as fraction in KELLY_CONFIG
+        "max_bet_pct":        winner["max_bet_pct"],  # percentage, e.g. 2.5 (not fraction 0.025)
         "sharpe":             winner["sharpe"],
         "trade_count":        winner["trade_count"],
         "optimized_at":       optimized_at,
