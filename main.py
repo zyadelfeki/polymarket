@@ -27,6 +27,8 @@ from decimal import Decimal
 import yaml
 import structlog
 
+from scripts.ensure_single_instance import acquire_instance_lock
+
 # Import core components
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
 from data_feeds.binance_websocket_v2 import BinanceWebSocketV2
@@ -2223,6 +2225,11 @@ class TradingSystem:
 
 async def main():
     """Main entry point."""
+    # Prevent two bot instances from running simultaneously.
+    # Two instances sharing separate in-memory cooldown dicts would double-fire
+    # the same orders within the same second, bypassing per-market rate limits.
+    acquire_instance_lock()
+
     # Parse arguments
     parser = argparse.ArgumentParser(description='Polymarket Trading Bot')
     parser.add_argument(
