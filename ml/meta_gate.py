@@ -42,7 +42,9 @@ Latency budget: <2 ms per call (single logistic regression prediction).
 IRONCLAD:
 - No I/O on the hot path.  Model is loaded once at import time.
 - No multiprocessing or threading inside inference.
-- Threadsafety: the inference path is read-only; safe for concurrent callers.
+- Threadsafety: inference path writes to CPython int counters (_meta_gate_*).
+  Safe under CPython GIL.  For non-CPython runtimes, wrap counter updates
+  in a threading.Lock() if needed.
 """
 
 from __future__ import annotations
@@ -138,6 +140,7 @@ def should_trade(features: dict) -> bool:
     if model_bundle is None:
         # Fail-open: model unavailable → let the trade proceed.
         _meta_gate_approved += 1
+        logger.info("meta_gate_decision", decision="approved", reason="fail_open")
         return True
 
     try:
@@ -158,6 +161,12 @@ def should_trade(features: dict) -> bool:
             _meta_gate_approved += 1
         else:
             _meta_gate_rejected += 1
+        logger.info(
+            "meta_gate_decision",
+            decision="approved" if decision else "rejected",
+            proba=round(float(proba), 4),
+            threshold=round(threshold, 4),
+        )
         return decision
 
     except Exception as exc:
@@ -168,6 +177,7 @@ def should_trade(features: dict) -> bool:
             reason="fail_open",
         )
         _meta_gate_errors += 1
+        logger.info("meta_gate_decision", decision="approved", reason="error_fail_open")
         return True
 
 
@@ -191,13 +201,13 @@ def extract_features_from_opportunity(
     safe defaults so callers can pass only what they have.
 
     ``rolling_pnl_z`` should be computed from the DB's settled trade history
-    before the current trade settles — specifically:
+    before the current trade settles — specifically (DESC order from DB):
 
-        pnl_window = last N settled PnLs from order_tracking
-        rolling_pnl_z = (pnl_window[-1] - mean(pnl_window)) / (std(pnl_window) + 1e-9)
+        pnl_window = last N settled PnLs from order_tracking (newest first)
+        rolling_pnl_z = (pnl_window[0] - mean(pnl_window[1:])) / (std(pnl_window[1:]) + 1e-9)
 
-    This matches the training feature exactly.  Passing None (the default)
-    substitutes 0.0, which is the neutral/unknown prior.
+    This matches the training feature exactly (peers = all-but-most-recent).
+    Passing None (the default) substitutes 0.0, which is the neutral/unknown prior.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -322,8 +332,13 @@ def build_training_dataset(db_path: str = str(_DB_PATH)) -> Tuple[np.ndarray, np
         # arr[-1] is the most-recent PREVIOUS trade's PnL.
         if len(pnl_window) >= 2:
             arr = np.array(pnl_window[-WINDOW_PNL:])
-            mu, sigma = float(arr.mean()), float(arr.std()) + 1e-9
-            rolling_pnl_z = (arr[-1] - mu) / sigma  # previous pnl vs window; no leak
+            if len(arr) >= 2:
+                peers = arr[:-1]   # exclude most recent trade from its own mean
+                mu = float(peers.mean())
+                sigma = float(peers.std()) + 1e-9
+            else:
+                mu, sigma = 0.0, 1.0
+            rolling_pnl_z = (arr[-1] - mu) / sigma  # no self-contamination
         else:
             rolling_pnl_z = 0.0
 
@@ -529,11 +544,31 @@ def _get_model() -> Optional[dict]:
         _MODEL_LOAD_ATTEMPTED = True
 
         if not _MODEL_PATH.exists():
+            # Query DB for settled trade count so operator knows how close they
+            # are to the >=20 minimum needed to run --train.
+            _settled_count = 0
+            try:
+                import sqlite3 as _sqlite3
+                _conn = _sqlite3.connect(str(_DB_PATH))
+                (_settled_count,) = _conn.execute(
+                    "SELECT COUNT(*) FROM order_tracking "
+                    "WHERE order_state='SETTLED' AND pnl IS NOT NULL"
+                ).fetchone()
+                _conn.close()
+            except Exception:
+                pass
+            _training_ready = _settled_count >= 20
             logger.warning(
                 "meta_gate_model_not_found",
                 path=str(_MODEL_PATH),
                 action="fail_open",
-                hint="Run: python -m ml.meta_gate --train  to create the model.",
+                settled_trades=_settled_count,
+                training_ready=_training_ready,
+                hint=(
+                    "Run: python -m ml.meta_gate --train  to create the model."
+                    if _training_ready else
+                    f"Need {20 - _settled_count} more settled trades before training."
+                ),
             )
             _MODEL_CACHE = False
             return None

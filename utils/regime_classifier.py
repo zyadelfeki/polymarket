@@ -81,6 +81,7 @@ _regime_change_count: int = 0             # counts actual committed regime trans
 # ---------------------------------------------------------------------------
 _kmeans_bundle: object = None
 _kmeans_load_attempted: bool = False
+_kmeans_load_lock = threading.Lock()  # Double-checked locking for exactly-once load
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +355,7 @@ def _apply_rate_limit(prediction: str) -> str:
     """
     global _current_regime, _current_regime_ts
     global _candidate_regime, _candidate_count
+    global _regime_change_count
 
     now_ts = time.monotonic()
 
@@ -378,7 +380,6 @@ def _apply_rate_limit(prediction: str) -> str:
 
         if dwell_ok and count_ok:
             # Commit regime change
-            global _regime_change_count
             old_regime = _current_regime
             _regime_durations[old_regime] = (
                 _regime_durations.get(old_regime, 0.0) + dwell_elapsed
@@ -400,21 +401,26 @@ def _apply_rate_limit(prediction: str) -> str:
 
 def _get_kmeans_model():
     global _kmeans_bundle, _kmeans_load_attempted
+    # Fast path: load already attempted.
     if _kmeans_load_attempted:
         return _kmeans_bundle if _kmeans_bundle is not False else None
-    _kmeans_load_attempted = True
-    if not _MODEL_PATH.exists():
-        _kmeans_bundle = False
-        return None
-    try:
-        with open(_MODEL_PATH, "rb") as fh:
-            _kmeans_bundle = pickle.load(fh)
-        logger.info("regime_kmeans_model_loaded", path=str(_MODEL_PATH))
-        return _kmeans_bundle
-    except Exception as exc:
-        logger.warning("regime_kmeans_model_load_failed", error=str(exc))
-        _kmeans_bundle = False
-        return None
+    # Slow path: first call — acquire lock then re-check (double-checked locking).
+    with _kmeans_load_lock:
+        if _kmeans_load_attempted:
+            return _kmeans_bundle if _kmeans_bundle is not False else None
+        _kmeans_load_attempted = True
+        if not _MODEL_PATH.exists():
+            _kmeans_bundle = False
+            return None
+        try:
+            with open(_MODEL_PATH, "rb") as fh:
+                _kmeans_bundle = pickle.load(fh)
+            logger.info("regime_kmeans_model_loaded", path=str(_MODEL_PATH))
+            return _kmeans_bundle
+        except Exception as exc:
+            logger.warning("regime_kmeans_model_load_failed", error=str(exc))
+            _kmeans_bundle = False
+            return None
 
 
 def _f(d: dict, key: str, default: float) -> float:

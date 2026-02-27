@@ -55,8 +55,13 @@ _REPO_ROOT  = Path(__file__).resolve().parent.parent
 _MODEL_PATH = _REPO_ROOT / "models" / "ofi_policy.pkl"
 
 # ---------------------------------------------------------------------------
-# SAFETY GATE: set to True ONLY after offline validation proves action 1/2
-# outperform action 0 on realized slippage.
+# ---------------------------------------------------------------------------
+# LIVE_MODE graduation criteria (set to True when ALL are met):
+# 1. >= 500 ofi_execution_action log events accumulated across sessions.
+# 2. Offline analysis shows OFI-confirmed trades win_rate > OFI-conflict trades
+#    win_rate by >= 3 percentage points (run scripts/ofi_analysis.py).
+# 3. Manual review of analysis by operator.
+# Until then, all OFI decisions are LOG-ONLY (no order modification).
 # ---------------------------------------------------------------------------
 LIVE_MODE: bool = False
 

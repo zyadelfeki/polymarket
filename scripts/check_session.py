@@ -82,6 +82,17 @@ ofi_conflict             = count("ofi_conflict")
 # ---------- Session 1-4: ML feature gates ----------
 meta_gate_approved     = count("meta_gate_approved")
 meta_gate_rejected     = count("meta_gate_rejected")
+# meta_gate_decision events carry proba + threshold; emitted by should_trade()
+meta_gate_dec_approved = count_field("meta_gate_decision", "decision", "approved")
+meta_gate_dec_rejected = count_field("meta_gate_decision", "decision", "rejected")
+_meta_gate_probas = [
+    e.get("proba") for e in events
+    if e.get("event") == "meta_gate_decision" and e.get("proba") is not None
+]
+_meta_gate_avg_proba = (
+    round(sum(_meta_gate_probas) / len(_meta_gate_probas), 3)
+    if _meta_gate_probas else None
+)
 market_blocked_tag     = count("market_blocked_tag")        # Session 3: tag blocklist
 regime_size_adj        = count("regime_size_adjustment")    # Session 2: regime multiplier
 regime_changed         = count("regime_changed")            # Session 2: every regime transition
@@ -207,6 +218,13 @@ if meta_gate_approved + meta_gate_rejected > 0:
     _gate_pct = 100 * meta_gate_rejected / (meta_gate_approved + meta_gate_rejected)
     print(f"  ({_gate_pct:.1f}% rejected — target: <50%)", end="")
 print()
+if meta_gate_dec_approved + meta_gate_dec_rejected > 0:
+    _dec_total = meta_gate_dec_approved + meta_gate_dec_rejected
+    _dec_pct = 100 * meta_gate_dec_rejected / _dec_total
+    _proba_str = f"  avg_proba={_meta_gate_avg_proba}" if _meta_gate_avg_proba is not None else ""
+    print(f"  meta_gate_decision   : {_dec_total} decisions  "
+          f"({meta_gate_dec_approved} approved / {meta_gate_dec_rejected} rejected "
+          f"= {_dec_pct:.1f}% rejected){_proba_str}")
 print(f"  market_blocked_tag   : {market_blocked_tag}  (Session 3: tag-blocklist filter)")
 print(f"  regime_size_adj      : {regime_size_adj}  (Session 2: dynamic size adjustments)")
 print(f"  regime_changed       : {regime_changed}  (Session 2: regime transitions this session)")

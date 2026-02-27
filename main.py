@@ -177,6 +177,52 @@ def _build_model_feedback_callback():
 logger = structlog.get_logger(__name__)
 
 
+async def _get_rolling_features(
+    ledger,
+    n_win: int = 20,
+    n_pnl: int = 10,
+) -> tuple:
+    """
+    Query the last max(n_win, n_pnl) settled PnLs from order_tracking and
+    return (rolling_win_rate, rolling_pnl_z) for the meta-gate feature vector.
+
+    rolling_win_rate: fraction of the last n_win settled trades that were wins.
+    rolling_pnl_z: z-score of the most recent PnL vs the preceding n_pnl-1 PnLs
+                   (peers = all-but-most-recent so no self-contamination).
+
+    Returns (0.5, 0.0) if the DB call fails or there is insufficient history.
+    """
+    rows = await ledger.execute(
+        "SELECT pnl FROM order_tracking "
+        "WHERE order_state='SETTLED' AND pnl IS NOT NULL "
+        "ORDER BY closed_at DESC LIMIT ?",
+        (max(n_win, n_pnl),),
+        fetch_all=True,
+        as_dict=True,
+    )
+    if not rows:
+        return 0.5, 0.0
+
+    pnls = [float(r["pnl"]) for r in rows]
+
+    # rolling_win_rate using the most recent n_win trades
+    win_slice = pnls[:n_win]
+    rolling_win_rate = sum(1 for p in win_slice if p > 0) / len(win_slice)
+
+    # rolling_pnl_z: most recent PnL vs the preceding n_pnl-1 peers (no self-contamination)
+    pnl_slice = pnls[:n_pnl]
+    if len(pnl_slice) >= 2:
+        peers = pnl_slice[1:]  # exclude most recent (index 0 = newest in DESC order)
+        mu = sum(peers) / len(peers)
+        variance = sum((x - mu) ** 2 for x in peers) / len(peers)
+        sigma = variance ** 0.5 + 1e-9
+        rolling_pnl_z = (pnl_slice[0] - mu) / sigma
+    else:
+        rolling_pnl_z = 0.0
+
+    return rolling_win_rate, rolling_pnl_z
+
+
 class TradingSystem:
     """
     Main trading system orchestrator.
@@ -839,6 +885,18 @@ class TradingSystem:
             # charlie_booster), but BEFORE regime multiplier and Kelly sizing.
             # Fail-open: if the model is absent/corrupt, _meta_gate_should_trade
             # returns True so no trade is ever silently blocked by infra failure.
+            _rolling_win_rate, _rolling_pnl_z = 0.5, 0.0
+            if self.ledger is not None:
+                try:
+                    _rolling_win_rate, _rolling_pnl_z = await _get_rolling_features(
+                        self.ledger
+                    )
+                except Exception as _rgf_exc:
+                    logger.warning(
+                        "rolling_features_db_error",
+                        error=str(_rgf_exc),
+                        fallback="0.5/0.0",
+                    )
             _meta_features = _meta_gate_extract_features(
                 charlie_p_win_raw=charlie_rec.p_win,
                 net_edge=charlie_rec.edge,
@@ -846,11 +904,8 @@ class TradingSystem:
                 implied_prob=charlie_rec.implied_prob,
                 confidence=charlie_rec.confidence,
                 ofi_conflict=charlie_rec.ofi_conflict,
-                rolling_win_rate=(
-                    self.performance_tracker.get_rolling_win_rate(20)
-                    if self.performance_tracker is not None
-                    else None
-                ),
+                rolling_win_rate=_rolling_win_rate,
+                rolling_pnl_z=_rolling_pnl_z,
             )
             _meta_take = _meta_gate_should_trade(_meta_features)
             if _meta_take:
