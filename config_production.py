@@ -129,6 +129,72 @@ PERFORMANCE_TRACKER_CONFIG = {
 }
 
 # ---------------------------------------------------------------------------
+# Regime-based risk config for the Volatility/Regime Classifier (Session 2).
+#
+# Each regime maps to independent risk parameters that override KELLY_CONFIG
+# for the duration of that regime.  The regime is re-evaluated every 60 s by
+# the periodic regime-update task in main.py.
+#
+# Design rationale for defaults:
+#   calm       → moderate Kelly, standard min_edge.  Steady conditions.
+#   trend_up   → slightly aggressive; our latency-arb edge is strongest here.
+#   trend_down → same as trend_up but we are betting NO; same edge logic.
+#   event      → half Kelly, raised min_edge.  Volatility spikes kill edge.
+#
+# These override KELLY_CONFIG["fractional_kelly"] and
+# KELLY_CONFIG["min_edge_required"] IN MEMORY only; the config file is never
+# rewritten.  Default (fallback) is always KELLY_CONFIG values.
+# ---------------------------------------------------------------------------
+REGIME_RISK_CONFIG: dict = {
+    "calm": {
+        "fractional_kelly":  Decimal("0.25"),
+        "min_edge_required": Decimal("0.02"),
+        "max_bet_pct":       Decimal("5.0"),
+    },
+    "trend_up": {
+        "fractional_kelly":  Decimal("0.30"),
+        "min_edge_required": Decimal("0.02"),
+        "max_bet_pct":       Decimal("5.0"),
+    },
+    "trend_down": {
+        "fractional_kelly":  Decimal("0.30"),
+        "min_edge_required": Decimal("0.02"),
+        "max_bet_pct":       Decimal("5.0"),
+    },
+    "event": {
+        "fractional_kelly":  Decimal("0.10"),
+        "min_edge_required": Decimal("0.03"),
+        "max_bet_pct":       Decimal("3.0"),
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Market tag blocklist (Session 3 — LLM Question Tagger).
+#
+# Each entry is a dict of tag conditions that must ALL match for a market to
+# be blocked.  Any single entry that fully matches will block the market.
+#
+# Example: block politics / long-term markets and macro_data / multi-day
+# markets where our BTC-centric stack has historically no edge.
+#
+# Tags are produced by scripts/tag_market_questions.py and stored in
+# data/market_tags.db.  If tags are unavailable for a market, the
+# market is NOT blocked (fail-open).
+# ---------------------------------------------------------------------------
+MARKET_TAG_BLOCKLIST: list = [
+    # Politics + any horizon → no edge with our BTC stack
+    {"event_type": "election"},
+    {"event_type": "politics"},
+    # Long-term binary_misc markets (no directional signal)
+    {"horizon": "long-term", "outcome_type": "binary_misc"},
+    # High info_edge_needed + long-term → unfavourable
+    {"info_edge_needed": "high", "horizon": "long-term"},
+    # Non-BTC/ETH assets on long-term horizon
+    {"asset": "macro", "horizon": "long-term"},
+    {"asset": "other", "horizon": "long-term"},
+]
+
+# ---------------------------------------------------------------------------
 # Regime-based position-size multipliers
 # Applied to the raw Kelly size returned by CharliePredictionGate.
 # A multiplier of 1.0 = full Kelly; 0.5 = half Kelly; 0.0 = skip trade.

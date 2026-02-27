@@ -123,6 +123,9 @@ class TradeRecommendation:
     # model_votes is optional: {"random_forest": "BUY", "svm": "HOLD", ...}
     # Stored in order_tracking.model_votes for per-model feedback on settlement.
     model_votes:      Optional[Dict] = None
+    # True when OFI direction conflicted with Charlie and size was halved.
+    # Set by the OFI filter inside _evaluate_market_inner.
+    ofi_conflict:     bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +464,7 @@ class CharliePredictionGate:
                 _ofi_calc.add_snapshot(symbol, _ob_bids, _ob_asks)
             _ofi_signal = _ofi_calc.ofi_signal(symbol)
 
+        _ofi_conflict_flag: bool = False
         if _ofi_signal is not None:
             # BUY signal from Charlie but book pressure is SELL → conflict
             # SELL signal from Charlie but book pressure is BUY → conflict
@@ -468,6 +472,7 @@ class CharliePredictionGate:
             if _ofi_signal != _charlie_direction:
                 size = size * Decimal("0.5")
                 kelly_fraction = kelly_fraction * Decimal("0.5")
+                _ofi_conflict_flag = True
                 logger.warning(
                     "ofi_conflict",
                     market_id=market_id,
@@ -497,6 +502,7 @@ class CharliePredictionGate:
             technical_regime=technical_regime,
             reason=reason,
             model_votes=model_votes,
+            ofi_conflict=_ofi_conflict_flag,
         )
 
         logger.info(

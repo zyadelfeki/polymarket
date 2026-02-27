@@ -53,7 +53,10 @@ from config_production import (
     GLOBAL_RISK_BUDGET,
     STARTING_CAPITAL,
     BLOCKED_MARKETS,
+    MARKET_TAG_BLOCKLIST,
+    REGIME_RISK_CONFIG,
 )
+from ml.meta_gate import should_trade as _meta_gate_should_trade, extract_features_from_opportunity as _meta_gate_extract_features
 from utils.market_performance_guard import is_market_blocked_by_performance
 from services.portfolio_state import PortfolioState
 from services.do_not_trade import DoNotTradeRegistry
@@ -66,6 +69,24 @@ from data_feeds.arb_scanner import scan_yes_no_arb
 from execution.sniper import MarketSniper
 from execution.oracle_monitor import check_oracle_window
 from data_feeds.binance_feed import BinanceTradeFeed
+
+# Session 2: volatility / regime classifier
+from utils.regime_features import get_regime_features as _get_regime_features
+from utils.regime_classifier import (
+    classify_regime as _classify_regime,
+    get_current_regime as _get_current_regime,
+    get_session_regime_stats as _get_regime_stats,
+)
+
+# Session 3: LLM market-tag blocklist
+from utils.market_tags import is_market_blocked_by_tags as _is_market_blocked_by_tags
+
+# Session 4: OFI execution policy (logging-only mode until offline-validated)
+from execution.ofi_policy import (
+    build_ofi_features as _build_ofi_features,
+    log_ofi_action as _log_ofi_action,
+    choose_execution_action as _ofi_choose_action,
+)
 
 
 def _build_model_feedback_callback():
@@ -209,6 +230,12 @@ class TradingSystem:
         self.market_sniper = MarketSniper()
         self.binance_trade_feed: Optional[BinanceTradeFeed] = None
         startup_config = config.get('startup', {})
+
+        # Session 2: dynamic regime state — updated every ~60 s by
+        # _periodic_maintenance.  Used to scale Kelly size per-regime without
+        # rewriting config files or reinitialising the KellySizer.
+        self._dynamic_regime: str = "calm"
+        self._dynamic_regime_ts: float = 0.0   # monotonic; gate against rapid updates
         self.init_timeout_seconds = float(startup_config.get('component_timeout_seconds', 25.0))
         self.network_timeout_seconds = float(startup_config.get('network_timeout_seconds', 20.0))
         self.loop_tick_seconds = float(startup_config.get('loop_tick_seconds', 10.0))
@@ -554,6 +581,19 @@ class TradingSystem:
             )
             return
 
+        # --- Session 3: LLM tag-based blocklist ---
+        # Fail-open: _is_market_blocked_by_tags returns False on any error.
+        _mkt_question_for_tag = str(opportunity.get("question") or "")
+        if _is_market_blocked_by_tags(market_id, _mkt_question_for_tag, MARKET_TAG_BLOCKLIST):
+            logger.info(
+                "market_blocked_tag",
+                reason="tag_blocklist_match",
+                market_id=market_id,
+                question=_mkt_question_for_tag[:80],
+                trigger=trigger,
+            )
+            return
+
         # --- Paper-mode per-market cooldown ---
         # The idempotency key in execution_service_v2 includes price, so a
         # 1-tick price change generates a new key and bypasses dedup, causing
@@ -793,6 +833,48 @@ class TradingSystem:
                 )
                 return
 
+            # --- Meta-gate: ML classifier that decides TAKE vs SKIP ---------
+            # Runs AFTER Charlie approves and OFI is resolved (inside
+            # charlie_booster), but BEFORE regime multiplier and Kelly sizing.
+            # Fail-open: if the model is absent/corrupt, _meta_gate_should_trade
+            # returns True so no trade is ever silently blocked by infra failure.
+            _meta_features = _meta_gate_extract_features(
+                charlie_p_win_raw=charlie_rec.p_win,
+                net_edge=charlie_rec.edge,
+                fee=charlie_rec.edge - (charlie_rec.p_win - charlie_rec.implied_prob),
+                implied_prob=charlie_rec.implied_prob,
+                confidence=charlie_rec.confidence,
+                ofi_conflict=charlie_rec.ofi_conflict,
+                rolling_win_rate=(
+                    self.performance_tracker.get_rolling_win_rate(20)
+                    if self.performance_tracker is not None
+                    else None
+                ),
+            )
+            _meta_take = _meta_gate_should_trade(_meta_features)
+            if _meta_take:
+                logger.info(
+                    "meta_gate_approved",
+                    market_id=market_id,
+                    p_win=charlie_rec.p_win,
+                    edge=charlie_rec.edge,
+                    confidence=charlie_rec.confidence,
+                )
+            else:
+                logger.info(
+                    "meta_gate_rejected",
+                    market_id=market_id,
+                    p_win=charlie_rec.p_win,
+                    net_edge=charlie_rec.edge,
+                    fee=_meta_features.get("fee"),
+                    implied_prob=charlie_rec.implied_prob,
+                    confidence=charlie_rec.confidence,
+                    ofi_conflict=_meta_features.get("ofi_conflict"),
+                    rolling_win_rate=_meta_features.get("rolling_win_rate"),
+                    trigger=trigger,
+                )
+                return
+
             # Stamp the cooldown as soon as Charlie approves.  Without this,
             # budget-blocked markets re-trigger Charlie on every price tick since
             # the cooldown was previously only stamped after order_submitted.
@@ -918,6 +1000,38 @@ class TradingSystem:
                     order_value = _approved_size
                     quantity = quantize_quantity(order_value / price) if price > Decimal("0") else quantity
 
+            # --- Session 2: dynamic regime size multiplier -------------------------
+            # Scales the Kelly bet by the per-regime fractional_kelly relative to
+            # the baseline KELLY_CONFIG value so trade size shrinks in event/high-vol
+            # regimes and expands modestly in confirmed trend regimes.
+            #
+            # NOTE: this multiplier applies AFTER the Charlie technical-regime
+            # multiplier (REGIME_RISK_OVERRIDES, line ~907) so the effects compound.
+            # For example: Charlie HIGH_VOL (×0.5) + dynamic 'event' (×0.4) = ×0.2.
+            # This is intentional — both sources independently signal high risk.
+            _dyn_regime = self._dynamic_regime or "calm"
+            _regime_cfg = REGIME_RISK_CONFIG.get(_dyn_regime, REGIME_RISK_CONFIG["calm"])
+            _default_kelly_frac = Decimal(str(KELLY_CONFIG.get("fractional_kelly", "0.25")))
+            _regime_kelly_frac = Decimal(str(_regime_cfg.get("fractional_kelly", "0.25")))
+            if _default_kelly_frac > Decimal("0"):
+                _regime_mult = _regime_kelly_frac / _default_kelly_frac
+            else:
+                _regime_mult = Decimal("1.0")
+            _regime_mult = min(_regime_mult, Decimal("1.5"))   # cap upside at 1.5×
+            _regime_mult = max(_regime_mult, Decimal("0.10"))  # floor downside at 0.1×
+            if _regime_mult != Decimal("1.0"):
+                order_value = quantize_quantity(order_value * _regime_mult)
+                quantity = quantize_quantity(order_value / price) if price > Decimal("0") else quantity
+                logger.info(
+                    "regime_size_adjustment",
+                    event="regime_size_adjustment",
+                    market_id=market_id,
+                    regime=_dyn_regime,
+                    regime_kelly_frac=str(_regime_kelly_frac),
+                    multiplier=str(round(float(_regime_mult), 4)),
+                    adjusted_order_value=str(order_value),
+                )
+
             if order_value < min_position_size - Decimal("0.01"):
                 logger.info(
                     "order_blocked_kelly_size_too_small",
@@ -980,6 +1094,19 @@ class TradingSystem:
                     notes=charlie_rec.reason if charlie_rec else None,
                 ),
             )
+
+        # --- Session 4: OFI execution policy (log-only until offline-validated) ---
+        # build_ofi_features + choose_execution_action are both fail-open.
+        try:
+            _ofi_exec_feats = _build_ofi_features(
+                extra_features=_extra_features,
+                volatility=float(charlie_rec.edge) if charlie_rec is not None else 0.0,
+                time_to_expiry=float(opportunity.get("time_to_expiry") or 0),
+            )
+            _ofi_action, _ofi_exec_feats = _ofi_choose_action(_ofi_exec_feats)
+            _log_ofi_action(logger, market_id, _ofi_action, _ofi_exec_feats)
+        except Exception as _ofi_err:
+            logger.warning("ofi_policy_log_failed", error=str(_ofi_err))
 
         logger.info(
             "order_submission_attempt",
@@ -1958,6 +2085,29 @@ class TradingSystem:
     async def _periodic_maintenance(self):
         """Periodic maintenance tasks."""
         try:
+            # --- Session 2: volatility / regime update -------------------------
+            # Runs off the hot path (~every 60 s).  All I/O (Binance REST 1-min
+            # candles + SQLite PnL stats) is done in a thread pool so the event
+            # loop is never blocked.  Regime transitions logged as regime_changed.
+            try:
+                _regime_feats = await asyncio.get_running_loop().run_in_executor(
+                    None, _get_regime_features, None
+                )
+                _new_regime = _classify_regime(_regime_feats)
+                if _new_regime != self._dynamic_regime:
+                    logger.info(
+                        "regime_changed",
+                        event="regime_changed",
+                        old_regime=self._dynamic_regime,
+                        new_regime=_new_regime,
+                        vol_5min=round(_regime_feats.get("vol_5min", 0) or 0, 5),
+                        vol_60min=round(_regime_feats.get("vol_60min", 0) or 0, 5),
+                        rsi_14=round(_regime_feats.get("rsi_14", 50) or 50, 1),
+                    )
+                self._dynamic_regime = _new_regime
+            except Exception as _re:
+                logger.warning("regime_update_failed", error=str(_re))
+
             # Validate ledger
             if self.ledger:
                 is_balanced = await self._safe_await(

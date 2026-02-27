@@ -79,6 +79,19 @@ order_error_transitions  = count("order_state_set_to_error")
 ofi_signal_confirmed     = count("ofi_signal_confirmed")
 ofi_conflict             = count("ofi_conflict")
 
+# ---------- Session 1-4: ML feature gates ----------
+meta_gate_approved     = count("meta_gate_approved")
+meta_gate_rejected     = count("meta_gate_rejected")
+market_blocked_tag     = count("market_blocked_tag")        # Session 3: tag blocklist
+regime_size_adj        = count("regime_size_adjustment")    # Session 2: regime multiplier
+regime_changed         = count("regime_changed")            # Session 2: every regime transition
+regime_update_failed   = count("regime_update_failed")      # Session 2: background update error
+ofi_execution_actions  = Counter(
+    e.get("action_label", "standard")
+    for e in events
+    if e.get("event") == "ofi_execution_action"
+)                                                           # Session 4: execution policy
+
 # Previously-fixed events (should stay at 0)
 periodic_failed   = count("periodic_check_failed")
 cb_attr_err       = count("circuit_breaker_attribute_error")
@@ -186,6 +199,26 @@ print(f"  market_auto_blocked_performance              : {market_auto_blocked}  
 print(f"\n--- OFI SIGNAL (this session) ---")
 print(f"  ofi_signal_confirmed : {ofi_signal_confirmed}")
 print(f"  ofi_conflict         : {ofi_conflict}  (signals where OFI disagrees with Charlie; size halved)")
+
+print(f"\n--- ML FEATURE GATES (Sessions 1-4) ---")
+print(f"  meta_gate_approved   : {meta_gate_approved}")
+print(f"  meta_gate_rejected   : {meta_gate_rejected}", end="")
+if meta_gate_approved + meta_gate_rejected > 0:
+    _gate_pct = 100 * meta_gate_rejected / (meta_gate_approved + meta_gate_rejected)
+    print(f"  ({_gate_pct:.1f}% rejected — target: <50%)", end="")
+print()
+print(f"  market_blocked_tag   : {market_blocked_tag}  (Session 3: tag-blocklist filter)")
+print(f"  regime_size_adj      : {regime_size_adj}  (Session 2: dynamic size adjustments)")
+print(f"  regime_changed       : {regime_changed}  (Session 2: regime transitions this session)")
+if regime_update_failed > 0:
+    print(f"  WARN regime_update_failed: {regime_update_failed}  (check Binance connectivity)")
+if ofi_execution_actions:
+    _ofi_total = sum(ofi_execution_actions.values())
+    print(f"  ofi_execution_action : {_ofi_total} total (Session 4: log-only policy)")
+    for _action, _cnt in sorted(ofi_execution_actions.items()):
+        print(f"    +-- {_action}: {_cnt}")
+else:
+    print(f"  ofi_execution_action : 0  (Session 4 log-only — no orders reached policy yet)")
 
 print(f"\n--- DEGRADED MODE RATIO (target: <3x) ---")
 print(f"  charlie_degraded_mode     : {degraded_mode}")
