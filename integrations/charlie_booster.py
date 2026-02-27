@@ -405,11 +405,22 @@ class CharliePredictionGate:
             return None
 
         if self._kelly_sizer is not None and bankroll > Decimal("0"):
+            # Guard: override_win_rate is the rolling global win rate across ALL markets.
+            # If it is below implied_prob for THIS market, applying it as p_win in the
+            # Kelly formula produces a negative fraction → size=0, even though Charlie
+            # has genuine market-specific edge.  Drop the override in that case so the
+            # sizing is based on Charlie's p_win, which IS market-specific.
+            # Example failure mode: rolling_win_rate_20=0.45, implied_prob=0.50 →
+            # (0.45-0.50)/(1-0.50) = -0.10 → size=0 with capped_reason=None (silent).
+            effective_override = override_win_rate
+            if override_win_rate is not None and override_win_rate < implied_prob:
+                effective_override = None  # fall back to Charlie's p_win
+
             kelly_result = self._kelly_sizer.compute_size(
                 p_win=effective_p_win,
                 implied_prob=implied_prob,
                 bankroll=bankroll,
-                override_win_rate=override_win_rate,
+                override_win_rate=effective_override,
             )
             # Scale raw Kelly size by smooth multiplier before applying caps.
             raw_size = kelly_result.size * Decimal(str(round(smooth_mult, 6)))

@@ -71,6 +71,8 @@ except Exception as _dbe:
 # market_blocked events from this session
 market_blocked_static    = count_field("market_blocked", "reason", "static_blocked_markets")
 market_blocked_perf      = count_field("market_blocked", "reason", "performance_guard_auto_block")
+perf_guard_checked       = count("performance_guard_checked")       # fired by fix: guard now re-evaluates each call
+market_auto_blocked      = count("market_auto_blocked_performance")  # guard decided to block (logged as warning)
 order_error_transitions  = count("order_state_set_to_error")
 
 # OFI signal events
@@ -178,6 +180,8 @@ print(f"  order_state_set_to_error   : {order_error_transitions}  (this session 
 print(f"\n--- MARKET BLOCKING (this session) ---")
 print(f"  market_blocked[static_blocked_markets]       : {market_blocked_static}")
 print(f"  market_blocked[performance_guard_auto_block] : {market_blocked_perf}")
+print(f"  performance_guard_checked                    : {perf_guard_checked}  (re-evaluates each call — must be > 0 after restart)")
+print(f"  market_auto_blocked_performance              : {market_auto_blocked}  (guard fired and will block on next restart)")
 
 print(f"\n--- OFI SIGNAL (this session) ---")
 print(f"  ofi_signal_confirmed : {ofi_signal_confirmed}")

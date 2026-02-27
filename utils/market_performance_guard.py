@@ -48,8 +48,16 @@ def is_market_blocked_by_performance(market_id: str) -> bool:
     Checks SETTLED orders only.  Returns False if there are fewer than
     MIN_TRADES_TO_EVALUATE settled trades, so new markets always get a chance.
 
-    The result is cached per process — resets on restart (intentional: a
-    market that was bad last session may have changed character).
+    Cache behaviour: ONLY True (blocked) results are cached.  False results
+    are NOT cached so that markets accumulating trades within a session get
+    re-evaluated on every call and will be blocked as soon as they cross the
+    thresholds — even if the first call returned False (< 5 settled trades).
+
+    Motivation for not caching False:
+      Within a session a market starts with 0 SETTLED trades → returns False.
+      After 5+ trades settle the market may qualify for blocking, but a cached
+      False would hide it indefinitely.  Caching only True is safe because a
+      blocked market never un-blocks within the same process lifetime.
 
     Args:
         market_id: Numeric or hex condition_id string.
@@ -57,11 +65,13 @@ def is_market_blocked_by_performance(market_id: str) -> bool:
     Returns:
         True if the market should be skipped, False otherwise.
     """
-    if market_id in _decision_cache:
-        return _decision_cache[market_id]
+    # Fast path: once blocked, stays blocked for this process lifetime.
+    if _decision_cache.get(market_id):
+        return True
 
     should_block = _evaluate_market_performance(market_id)
-    _decision_cache[market_id] = should_block
+    if should_block:
+        _decision_cache[market_id] = True
     return should_block
 
 
@@ -84,6 +94,17 @@ def _evaluate_market_performance(market_id: str) -> bool:
         conn.close()
 
         if not row or row[0] is None or row[0] < MIN_TRADES_TO_EVALUATE:
+            log.debug(
+                "performance_guard_checked",
+                extra={
+                    "market_id": market_id,
+                    "result": False,
+                    "trades": int(row[0]) if row and row[0] is not None else 0,
+                    "loss_rate": None,
+                    "total_pnl": None,
+                    "reason": "insufficient_trades",
+                },
+            )
             return False
 
         trades, wins, total_pnl = row
@@ -92,8 +113,22 @@ def _evaluate_market_performance(market_id: str) -> bool:
         total_pnl = float(total_pnl or 0.0)
 
         loss_rate = 1.0 - (wins / trades) if trades > 0 else 1.0
+        should_block = loss_rate > MAX_LOSS_RATE or total_pnl < MIN_PNL_THRESHOLD
 
-        if loss_rate > MAX_LOSS_RATE or total_pnl < MIN_PNL_THRESHOLD:
+        log.info(
+            "performance_guard_checked",
+            extra={
+                "market_id": market_id,
+                "result": should_block,
+                "trades": trades,
+                "loss_rate": round(loss_rate, 3),
+                "total_pnl": round(total_pnl, 2),
+                "threshold_loss_rate": MAX_LOSS_RATE,
+                "threshold_pnl": MIN_PNL_THRESHOLD,
+            },
+        )
+
+        if should_block:
             log.warning(
                 "market_auto_blocked_performance",
                 extra={
@@ -106,9 +141,8 @@ def _evaluate_market_performance(market_id: str) -> bool:
                     "threshold_pnl": MIN_PNL_THRESHOLD,
                 },
             )
-            return True
 
-        return False
+        return should_block
 
     except Exception as exc:
         log.warning(
