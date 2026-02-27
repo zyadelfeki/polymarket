@@ -42,8 +42,10 @@ class TestShouldTradeFailOpen:
         features = mg.extract_features_from_opportunity(charlie_p_win_raw=0.6, net_edge=0.05)
         result = mg.should_trade(features)
 
-        # Must be True — fail-open, never silently block on missing model
-        assert result is True, "should_trade must fail-open (return True) when model is absent"
+        # Must be (True, 1.0) — fail-open, never silently block on missing model
+        decision, proba = result
+        assert decision is True, "should_trade must fail-open (return True) when model is absent"
+        assert proba == 1.0, "fail-open proba must be 1.0"
 
     def test_fail_open_corrupt_model(self, tmp_path, monkeypatch):
         """
@@ -59,7 +61,9 @@ class TestShouldTradeFailOpen:
 
         features = mg.extract_features_from_opportunity()
         result = mg.should_trade(features)
-        assert result is True, "should_trade must fail-open on corrupt pickle"
+        decision, proba = result
+        assert decision is True, "should_trade must fail-open on corrupt pickle"
+        assert proba == 1.0, "fail-open proba must be 1.0"
 
     def test_fail_open_returns_bool(self, tmp_path, monkeypatch):
         """Return type must always be bool, never None or exception."""
@@ -69,7 +73,10 @@ class TestShouldTradeFailOpen:
         monkeypatch.setattr(mg, "_MODEL_CACHE", None)
 
         result = mg.should_trade({})
-        assert isinstance(result, bool)
+        assert isinstance(result, tuple), "should_trade must return a (bool, float) tuple"
+        decision, proba = result
+        assert isinstance(decision, bool)
+        assert isinstance(proba, float)
 
 
 # ---------------------------------------------------------------------------

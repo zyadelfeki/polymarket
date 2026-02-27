@@ -32,7 +32,7 @@ and calibration curve stats to stdout.
 Inference
 ---------
 from ml.meta_gate import should_trade
-take_it: bool = should_trade(features)
+take_it, proba = should_trade(features)
 
 Fail-open contract: if the model file is absent or corrupt, ``should_trade``
 returns True and logs a WARNING.  Never raises.
@@ -120,9 +120,10 @@ _meta_gate_errors: int = 0
 # ---------------------------------------------------------------------------
 
 
-def should_trade(features: dict) -> bool:
+def should_trade(features: dict) -> tuple[bool, float]:
     """
-    Return True if the meta-gate recommends taking the trade.
+    Return (decision, proba) where decision is True if the meta-gate recommends
+    taking the trade and proba is the model's probability estimate.
 
     Parameters
     ----------
@@ -131,8 +132,8 @@ def should_trade(features: dict) -> bool:
         Unknown keys are ignored; missing keys are filled with 0.0.
 
     Fail-open:
-        Returns True if the model is unavailable, so trades are never silently
-        blocked by an infrastructure failure.
+        Returns (True, 1.0) if the model is unavailable, so trades are never
+        silently blocked by an infrastructure failure.
     """
     global _meta_gate_approved, _meta_gate_rejected, _meta_gate_errors
 
@@ -141,7 +142,7 @@ def should_trade(features: dict) -> bool:
         # Fail-open: model unavailable → let the trade proceed.
         _meta_gate_approved += 1
         logger.info("meta_gate_decision", decision="approved", reason="fail_open")
-        return True
+        return True, 1.0
 
     try:
         model = model_bundle["model"]
@@ -167,7 +168,7 @@ def should_trade(features: dict) -> bool:
             proba=round(float(proba), 4),
             threshold=round(threshold, 4),
         )
-        return decision
+        return decision, float(proba)
 
     except Exception as exc:
         logger.warning(
@@ -178,7 +179,7 @@ def should_trade(features: dict) -> bool:
         )
         _meta_gate_errors += 1
         logger.info("meta_gate_decision", decision="approved", reason="error_fail_open")
-        return True
+        return True, 1.0
 
 
 def extract_features_from_opportunity(
@@ -326,7 +327,12 @@ def build_training_dataset(db_path: str = str(_DB_PATH)) -> Tuple[np.ndarray, np
         dow  = ts.weekday()
 
         # Rolling stats
-        rolling_win_rate = (sum(win_window[-WINDOW_WIN:]) / len(win_window)) if win_window else 0.5
+        # Use a fixed-window slice for the denominator so training matches
+        # inference exactly.  Using len(win_window) here would cause the
+        # denominator to grow unboundedly while the numerator sums at most
+        # WINDOW_WIN entries — a systematic train/inference distribution mismatch.
+        _recent = win_window[-WINDOW_WIN:]
+        rolling_win_rate = sum(_recent) / len(_recent) if _recent else 0.5
         # Compute z-score using only PREVIOUS window (before appending current
         # pnl) so the current trade's PnL (== label) is never used as a feature.
         # arr[-1] is the most-recent PREVIOUS trade's PnL.
@@ -533,6 +539,10 @@ def _get_model() -> Optional[dict]:
 
     # Fast path: load already attempted (bool read is effectively atomic in CPython).
     if _MODEL_LOAD_ATTEMPTED:
+        # NOTE: _MODEL_CACHE can never be _NOT_LOADED here — _MODEL_LOAD_ATTEMPTED
+        # is only set True after _MODEL_CACHE is assigned to False or a valid
+        # bundle.  The `is _NOT_LOADED` check is kept for defensive correctness
+        # only; it is unreachable in practice.
         return None if (_MODEL_CACHE is False or _MODEL_CACHE is _NOT_LOADED) else _MODEL_CACHE
 
     # Slow path: first call — acquire lock then re-check (double-checked locking).

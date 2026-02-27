@@ -171,3 +171,6 @@ CREATE TABLE IF NOT EXISTS order_tracking (
 CREATE INDEX IF NOT EXISTS idx_order_tracking_state    ON order_tracking(order_state);
 CREATE INDEX IF NOT EXISTS idx_order_tracking_market   ON order_tracking(market_id);
 CREATE INDEX IF NOT EXISTS idx_order_tracking_opened   ON order_tracking(opened_at);
+-- Composite index for _get_rolling_features() hot-path query:
+-- WHERE order_state='SETTLED' AND pnl IS NOT NULL AND closed_at IS NOT NULL ORDER BY closed_at DESC
+CREATE INDEX IF NOT EXISTS idx_ot_settled_closed ON order_tracking(order_state, closed_at DESC);

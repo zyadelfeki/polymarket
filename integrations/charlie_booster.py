@@ -447,6 +447,7 @@ class CharliePredictionGate:
         reason = (
             f"charlie_signal side={side} p_win={effective_p_win:.3f} "
             f"implied={implied_prob:.3f} edge={edge:.3f} "
+            f"fee={_fee:.4f} "
             f"conf={confidence:.3f} regime={regime}"
         )
 

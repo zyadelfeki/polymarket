@@ -192,14 +192,25 @@ async def _get_rolling_features(
 
     Returns (0.5, 0.0) if the DB call fails or there is insufficient history.
     """
-    rows = await ledger.execute(
-        "SELECT pnl FROM order_tracking "
-        "WHERE order_state='SETTLED' AND pnl IS NOT NULL "
-        "ORDER BY closed_at DESC LIMIT ?",
-        (max(n_win, n_pnl),),
-        fetch_all=True,
-        as_dict=True,
-    )
+    try:
+        rows = await ledger.execute(
+            "SELECT pnl FROM order_tracking "
+            "WHERE order_state='SETTLED' AND pnl IS NOT NULL AND closed_at IS NOT NULL "
+            "ORDER BY closed_at DESC LIMIT ?",
+            (max(n_win, n_pnl),),
+            fetch_all=True,
+            as_dict=True,
+        )
+    except TypeError as _e:
+        # ledger.execute() doesn't support as_dict= on this version; feature
+        # will be neutral-defaulted until the ledger is updated.
+        logger.warning(
+            "rolling_features_as_dict_unsupported",
+            error=str(_e),
+            fallback="0.5/0.0",
+            hint="AsyncLedger.execute must accept as_dict=True for rolling meta-gate features",
+        )
+        return 0.5, 0.0
     if not rows:
         return 0.5, 0.0
 
@@ -821,6 +832,9 @@ class TradingSystem:
         charlie_p_win: Optional[Decimal] = None
         charlie_conf_dec: Optional[Decimal] = None
         charlie_regime: Optional[str] = None
+        # Initialized here so the OFI block below is safe even when charlie_gate
+        # is None (degraded startup / unit-test path).
+        _extra_features: Optional[dict] = None
 
         if self.charlie_gate is not None:
             # Map opportunity asset to Charlie vocab (default BTC).
@@ -900,18 +914,20 @@ class TradingSystem:
             _meta_features = _meta_gate_extract_features(
                 charlie_p_win_raw=charlie_rec.p_win,
                 net_edge=charlie_rec.edge,
-                fee=charlie_rec.edge - (charlie_rec.p_win - charlie_rec.implied_prob),
+                # fee = gross_edge - net_edge  (identity: net = p_win - implied - fee)
+                fee=charlie_rec.p_win - charlie_rec.implied_prob - charlie_rec.edge,
                 implied_prob=charlie_rec.implied_prob,
                 confidence=charlie_rec.confidence,
                 ofi_conflict=charlie_rec.ofi_conflict,
                 rolling_win_rate=_rolling_win_rate,
                 rolling_pnl_z=_rolling_pnl_z,
             )
-            _meta_take = _meta_gate_should_trade(_meta_features)
+            _meta_take, _meta_proba = _meta_gate_should_trade(_meta_features)
             if _meta_take:
                 logger.info(
                     "meta_gate_approved",
                     market_id=market_id,
+                    proba=round(float(_meta_proba), 4),
                     p_win=charlie_rec.p_win,
                     edge=charlie_rec.edge,
                     confidence=charlie_rec.confidence,
@@ -920,6 +936,7 @@ class TradingSystem:
                 logger.info(
                     "meta_gate_rejected",
                     market_id=market_id,
+                    proba=round(float(_meta_proba), 4),
                     p_win=charlie_rec.p_win,
                     net_edge=charlie_rec.edge,
                     fee=_meta_features.get("fee"),
@@ -927,6 +944,7 @@ class TradingSystem:
                     confidence=charlie_rec.confidence,
                     ofi_conflict=_meta_features.get("ofi_conflict"),
                     rolling_win_rate=_meta_features.get("rolling_win_rate"),
+                    rolling_pnl_z=_meta_features.get("rolling_pnl_z"),
                     trigger=trigger,
                 )
                 return
@@ -1308,9 +1326,11 @@ class TradingSystem:
             token_id=token_id,
             trigger=trigger,
         )
-        # Record cooldown so rapid subsequent scans skip this market+token.
-        if is_paper:
-            self._paper_order_cooldowns[f"{market_id}:{token_id}"] = asyncio.get_running_loop().time()
+        # Cooldown already stamped earlier (after Charlie+meta-gate approval).
+        # Stamping again here was a leftover from before that fix and would
+        # overwrite the key with a later timestamp — no semantic harm, but
+        # it obscures intent.  The earlier stamp (inside the charlie_gate block)
+        # is the authoritative one and guards all downstream budget checks.
 
         if result.filled_quantity and result.filled_quantity > Decimal("0"):
             logger.info(
