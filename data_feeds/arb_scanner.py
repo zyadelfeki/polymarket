@@ -60,10 +60,26 @@ def scan_yes_no_arb(markets: list[dict], clob_client) -> list[dict]:
             if not yes_token or not no_token:
                 continue
 
-            # Fetch last trade price for each leg
+            # Extract price from the embedded token data (already fetched during
+            # market discovery).  Fallback to clob_client.get_last_trade_price()
+            # only if the method exists — PolymarketClientV2 does NOT expose it,
+            # so relying on it exclusively caused a silent always-skip bug where
+            # every market raised AttributeError caught by the inner try/except.
             try:
-                yes_ask = Decimal(str(clob_client.get_last_trade_price(yes_token)))
-                no_ask = Decimal(str(clob_client.get_last_trade_price(no_token)))
+                def _get_token_price(token_dict: dict) -> Decimal:
+                    raw = (
+                        token_dict.get("price")
+                        or token_dict.get("outcome_price")
+                        or token_dict.get("mid_price")
+                    )
+                    if raw is not None:
+                        return Decimal(str(raw))
+                    if clob_client is not None and hasattr(clob_client, "get_last_trade_price"):
+                        return Decimal(str(clob_client.get_last_trade_price(token_dict["token_id"])))
+                    raise ValueError(f"no price field in token dict: {list(token_dict)}")
+
+                yes_ask = _get_token_price(tokens[0])
+                no_ask = _get_token_price(tokens[1])
             except Exception:
                 continue
 

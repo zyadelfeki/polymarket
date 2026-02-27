@@ -6,6 +6,7 @@ Usage: python scripts/check_session.py [path/to/production.log]
 """
 import sys
 import json
+import sqlite3
 from pathlib import Path
 from collections import Counter
 
@@ -45,6 +46,32 @@ charlie_approved  = count("charlie_gate_approved")
 opp_detected      = count("arbitrage_opportunity_detected")
 order_submitted   = count("order_submitted")
 order_settled     = count("order_settled")
+
+# ERROR order diagnostics — direct DB read so this captures all sessions.
+_error_orders_total = 0
+_error_orders_by_market: dict = {}
+try:
+    _db = sqlite3.connect("data/trading.db")
+    _total_row = _db.execute(
+        "SELECT COUNT(*) FROM order_tracking WHERE order_state = 'ERROR'"
+    ).fetchone()
+    _error_orders_total = _total_row[0] if _total_row else 0
+    _by_market = _db.execute(
+        "SELECT market_id, notes, COUNT(*) AS n "
+        "FROM order_tracking WHERE order_state = 'ERROR' "
+        "GROUP BY market_id, notes ORDER BY n DESC LIMIT 10"
+    ).fetchall()
+    for mid, note, n in _by_market:
+        key = f"{mid} [{note}]"
+        _error_orders_by_market[key] = n
+    _db.close()
+except Exception as _dbe:
+    _error_orders_by_market[f"db_error: {_dbe}"] = 0
+
+# market_blocked events from this session
+market_blocked_static    = count_field("market_blocked", "reason", "static_blocked_markets")
+market_blocked_perf      = count_field("market_blocked", "reason", "performance_guard_auto_block")
+order_error_transitions  = count("order_state_set_to_error")
 
 # Previously-fixed events (should stay at 0)
 periodic_failed   = count("periodic_check_failed")
@@ -136,6 +163,17 @@ if perf_halt_win_rate_paper > 0:
 if perf_halt_drawdown_paper > 0:
     print(f"  INFO          performance_halt_drawdown [paper log_only]: {perf_halt_drawdown_paper}"
           f"  (cross-session historical drawdown \u2014 CB not tripped, safe to ignore)")
+
+print(f"\n--- ERROR ORDERS (DB total, all sessions) ---")
+print(f"  order_state='ERROR' in DB  : {_error_orders_total}")
+if _error_orders_by_market:
+    for key, n in list(_error_orders_by_market.items())[:5]:
+        print(f"    [{n}x] {key}")
+print(f"  order_state_set_to_error   : {order_error_transitions}  (this session log)")
+
+print(f"\n--- MARKET BLOCKING (this session) ---")
+print(f"  market_blocked[static_blocked_markets]       : {market_blocked_static}")
+print(f"  market_blocked[performance_guard_auto_block] : {market_blocked_perf}")
 
 print(f"\n--- DEGRADED MODE RATIO (target: <3x) ---")
 print(f"  charlie_degraded_mode     : {degraded_mode}")

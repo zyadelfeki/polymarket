@@ -52,7 +52,9 @@ from config_production import (
     REGIME_RISK_OVERRIDES,
     GLOBAL_RISK_BUDGET,
     STARTING_CAPITAL,
+    BLOCKED_MARKETS,
 )
+from utils.market_performance_guard import is_market_blocked_by_performance
 from services.portfolio_state import PortfolioState
 from services.do_not_trade import DoNotTradeRegistry
 from data_feeds.binance_features import get_all_features as _get_binance_features
@@ -516,6 +518,26 @@ class TradingSystem:
                 "opportunity_skipped",
                 reason="invalid_opportunity_side",
                 side=side,
+                market_id=market_id,
+                trigger=trigger,
+            )
+            return
+
+        # --- Static blocked-market filter (chronic losers, hand-curated) ---
+        if market_id in BLOCKED_MARKETS:
+            logger.info(
+                "market_blocked",
+                reason="static_blocked_markets",
+                market_id=market_id,
+                trigger=trigger,
+            )
+            return
+
+        # --- Dynamic performance guard (auto-blocks bad markets after 5+ trades) ---
+        if is_market_blocked_by_performance(market_id):
+            logger.info(
+                "market_blocked",
+                reason="performance_guard_auto_block",
                 market_id=market_id,
                 trigger=trigger,
             )
@@ -1060,12 +1082,23 @@ class TradingSystem:
                     except Exception as _se:
                         logger.warning("slippage_record_failed", error=str(_se))
             elif not result.success and pre_order_id:
+                _err_msg = str(getattr(result, "error", "unknown"))
+                _err_code = str(getattr(result, "error_code", "unknown"))
+                logger.error(
+                    "order_state_set_to_error",
+                    pre_order_id=pre_order_id,
+                    market_id=market_id,
+                    token_id=token_id,
+                    error=_err_msg,
+                    error_code=_err_code,
+                    trigger=trigger,
+                )
                 if self.ledger is not None:
                     await self._safe_await(
                         "ledger.transition_order_state_error",
                         self.ledger.transition_order_state(
                             pre_order_id, "ERROR",
-                            notes=str(getattr(result, "error", "unknown")),
+                            notes=_err_msg,
                         ),
                     )
 
