@@ -43,6 +43,7 @@ import argparse
 import asyncio
 import csv
 import copy
+import math
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -199,6 +200,91 @@ def _print_table(
 
 
 # ---------------------------------------------------------------------------
+# Mark-to-market Sharpe helper (used when no order_settled events exist)
+# ---------------------------------------------------------------------------
+
+
+def _compute_mtm_sharpe(
+    log_file: str,
+    from_ts: Optional[datetime],
+    to_ts: Optional[datetime],
+) -> float:
+    """
+    Compute a mark-to-market Sharpe for open positions when no settlements exist.
+
+    For each market in the log window:
+      - entry = market_price from the FIRST arbitrage_opportunity_detected event
+      - mark  = market_price from the LAST  arbitrage_opportunity_detected event
+      - unrealized_return = (mark - entry) / entry
+
+    When mark == entry (no observed price movement), return = 0.
+    Returns 0.0 when variance of returns is zero (flat positions — honest).
+    Returns 0.0 when fewer than 2 distinct markets are observed.
+
+    Why: Sharpe = None means "undefined" and corrupts sort/display in the table.
+    Sharpe = 0.0 means "flat open position, no data yet" — honest and sortable.
+    Once markets resolve and order_settled events appear, real returns take over.
+    """
+    import json as _json  # avoid shadowing module-level name in caller scope
+
+    try:
+        raw_lines = Path(log_file).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return 0.0
+
+    first_price: Dict[str, float] = {}
+    last_price: Dict[str, float] = {}
+
+    for raw_line in raw_lines:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            ev = _json.loads(raw_line)
+        except ValueError:
+            continue
+        if ev.get("event") != "arbitrage_opportunity_detected":
+            continue
+        # Time-window filter — matches the engine's own filtering
+        ts_raw = ev.get("timestamp")
+        if ts_raw and (from_ts or to_ts):
+            try:
+                ts = datetime.fromisoformat(ts_raw.rstrip("Z")).replace(tzinfo=timezone.utc)
+                if from_ts and ts < from_ts:
+                    continue
+                if to_ts and ts > to_ts:
+                    continue
+            except ValueError:
+                pass
+        mid = ev.get("market_id", "")
+        price_raw = ev.get("market_price")
+        if not mid or price_raw is None:
+            continue
+        try:
+            price_f = float(price_raw)
+        except (TypeError, ValueError):
+            continue
+        if mid not in first_price:
+            first_price[mid] = price_f
+        last_price[mid] = price_f
+
+    if len(first_price) < 2:
+        # Only 0 or 1 market observed — not enough for a meaningful Sharpe.
+        return 0.0
+
+    returns = [
+        (last_price[mid] - entry) / entry if entry > 0 else 0.0
+        for mid, entry in first_price.items()
+    ]
+    mean_r = sum(returns) / len(returns)
+    variance = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+    std_r = math.sqrt(variance) if variance > 0 else 0.0
+    # If std = 0, all returns are equal (likely all 0 — flat, no movement).
+    # Return 0.0 rather than None so the table is sortable and honest.
+    return round(mean_r / std_r, 4) if std_r > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
 # Core sweep
 # ---------------------------------------------------------------------------
 
@@ -267,6 +353,23 @@ async def _run_sweep(
                 error_msg = f"{type(exc).__name__}: {exc}"
                 print(f" ERROR — {error_msg}")
             else:
+                # Mark-to-market: if sharpe is None but open trades exist, compute
+                # unrealized returns from last observed prices in the log.
+                # When mark == entry (no price movement), returns = 0 → Sharpe = 0.0.
+                # This is honest and prevents None from corrupting the final table.
+                if metrics.get("sharpe") is None:
+                    open_count = (
+                        metrics.get("total_trades", 0)
+                        - metrics.get("settled_trades", 0)
+                    )
+                    if open_count > 0:
+                        metrics["sharpe"] = _compute_mtm_sharpe(
+                            log_file, from_ts, to_ts
+                        )
+                    else:
+                        # No open trades, no settled trades — genuinely no data.
+                        metrics["sharpe"] = 0.0
+
                 sharpe = metrics.get("sharpe", 0.0) or 0.0
                 dd = metrics.get("max_drawdown_pct", 0.0) or 0.0
                 trades = metrics.get("total_trades", 0)

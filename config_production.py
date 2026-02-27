@@ -142,4 +142,11 @@ GLOBAL_RISK_BUDGET: dict = {
     # Maximum fraction of equity allowed in a *single* market.
     # Prevents concentration risk when one opportunity looks outstanding.
     "max_per_market_pct": Decimal("0.10"),
+
+    # Absolute minimum USDC size that is worth placing on Polymarket.
+    # Below this, a position is too small to be meaningful even if Kelly and
+    # all risk gates approve it.  Polymarket practical minimum is ~$1.
+    # $0.50 gives some room while never vetoing a legitimately-sized bet
+    # at this capital level ($13.98 → 5% cap = $0.70, which passes $0.50).
+    "min_tradeable_usdc": Decimal("0.50"),
 }

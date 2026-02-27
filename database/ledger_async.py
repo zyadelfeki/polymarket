@@ -1406,6 +1406,43 @@ class AsyncLedger:
         logger.info("stale_positions_cleared", count=count)
         return count
 
+    async def cancel_stale_paper_orders(self) -> int:
+        """
+        Expire stale paper-mode order_tracking rows left from prior sessions.
+
+        Called once at paper-mode startup.  Rows in CREATED / SUBMITTED /
+        PARTIALLY_FILLED state from previous runs are phantom exposure — they
+        inflate get_open_orders() and cause portfolio_risk_engine to reject
+        every new trade as over-exposed.  Transitioning them to EXPIRED removes
+        them from the active-order window without deleting audit history.
+
+        SAFETY: Only touches rows where mode='paper' (or mode IS NULL for
+        legacy rows).  Live-mode rows are never modified by this method.
+
+        Returns:
+            Number of rows transitioned to EXPIRED.
+        """
+        conn = await self.pool.acquire()
+        try:
+            cursor = await conn.execute(
+                """
+                UPDATE order_tracking
+                SET order_state  = 'EXPIRED',
+                    closed_at    = CURRENT_TIMESTAMP,
+                    notes        = COALESCE(notes || ' | ', '') ||
+                                   'expired_on_startup_stale_session'
+                WHERE order_state IN ('CREATED', 'SUBMITTED', 'PARTIALLY_FILLED')
+                  AND (mode IS NULL OR mode = 'paper')
+                """
+            )
+            count = cursor.rowcount if cursor.rowcount is not None else 0
+            await conn.commit()
+        finally:
+            await self.pool.release(conn)
+
+        logger.info("stale_paper_orders_expired", count=count)
+        return count
+
     async def get_open_positions(self) -> List[PositionData]:
         """
         Get all open positions.
@@ -1529,7 +1566,7 @@ class AsyncLedger:
         "CREATED", "SUBMITTED", "PARTIALLY_FILLED", "FILLED",
     })
     _TERMINAL_ORDER_STATES = frozenset({
-        "CANCELLED", "EXPIRED", "SETTLED", "ERROR",
+        "CANCELLED", "EXPIRED", "SETTLED", "ERROR", "SUPERSEDED",
     })
 
     async def record_order_created(
@@ -1801,21 +1838,28 @@ class AsyncLedger:
         total_exposure = Decimal("0")
         mark_pnl = Decimal("0")
 
+        # Build per-market price cache first (one API call per unique market)
+        market_price_cache: dict = {}
+        if price_feed is not None:
+            unique_market_ids = list({row["market_id"] for row in open_orders if row.get("market_id")})
+            for mid_id in unique_market_ids:
+                try:
+                    _mid = await asyncio.wait_for(
+                        price_feed.get_price(mid_id), timeout=3.0
+                    )
+                    if _mid is not None:
+                        market_price_cache[mid_id] = Decimal(str(_mid))
+                except Exception:
+                    pass
+
         for row in open_orders:
             size = Decimal(str(row.get("size", "0")))
             total_exposure += size
-            if price_feed is not None:
-                try:
-                    mid = await asyncio.wait_for(
-                        price_feed.get_price(row["market_id"]), timeout=3.0
-                    )
-                    if mid is not None:
-                        mark_price = Decimal(str(mid))
-                        entry_price = Decimal(str(row.get("price", "0")))
-                        quantity = size / entry_price if entry_price > Decimal("0") else Decimal("0")
-                        mark_pnl += (mark_price - entry_price) * quantity
-                except Exception:
-                    pass
+            mid_price = market_price_cache.get(row.get("market_id", ""))
+            if mid_price is not None:
+                entry_price = Decimal(str(row.get("price", "0")))
+                quantity = size / entry_price if entry_price > Decimal("0") else Decimal("0")
+                mark_pnl += (mid_price - entry_price) * quantity
 
         # Realized PnL from settled orders
         realized_pnl_row = await self.execute_scalar(
@@ -1892,6 +1936,61 @@ class AsyncLedger:
                     "total_quantity":   Decimal(str(row[3])) if row[3] is not None else Decimal("0"),
                     "avg_entry_price":  Decimal(str(row[4])) if row[4] is not None else Decimal("0"),
                     "strategy":         row[5] or "",
+                }
+            )
+        return result
+
+    async def get_pnl_by_market(self) -> List[Dict]:
+        """
+        Return PnL attribution grouped by market for all SETTLED orders.
+
+        This is the primary tool for understanding which markets are profitable
+        vs noise.  Only closed/settled rows are included — open orders have no
+        realized PnL.
+
+        Returns a list of dicts, each with:
+          market_id   – Polymarket condition_id
+          trade_count – total number of settled trades for this market
+          win_count   – trades where pnl > 0
+          total_pnl   – sum of realized PnL (Decimal, may be negative)
+          avg_edge    – mean charlie_p_win - price at entry (proxy for edge; None if unavailable)
+          avg_p_win   – mean charlie_p_win across settled trades (None if unavailable)
+        """
+        rows = await self._execute_query(
+            """
+            SELECT
+                market_id,
+                COUNT(*)                                           AS trade_count,
+                SUM(CASE WHEN CAST(pnl AS REAL) > 0 THEN 1 ELSE 0 END) AS win_count,
+                SUM(CAST(pnl AS REAL))                            AS total_pnl,
+                AVG(
+                    CASE WHEN charlie_p_win IS NOT NULL AND price IS NOT NULL
+                         THEN CAST(charlie_p_win AS REAL) - CAST(price AS REAL)
+                         ELSE NULL END
+                )                                                 AS avg_edge,
+                AVG(
+                    CASE WHEN charlie_p_win IS NOT NULL
+                         THEN CAST(charlie_p_win AS REAL)
+                         ELSE NULL END
+                )                                                 AS avg_p_win
+            FROM order_tracking
+            WHERE order_state = 'SETTLED'
+              AND pnl IS NOT NULL
+            GROUP BY market_id
+            ORDER BY total_pnl DESC
+            """,
+            fetch_all=True,
+        )
+        result = []
+        for row in (rows or []):
+            result.append(
+                {
+                    "market_id":   row[0],
+                    "trade_count": int(row[1]) if row[1] is not None else 0,
+                    "win_count":   int(row[2]) if row[2] is not None else 0,
+                    "total_pnl":   Decimal(str(round(row[3], 6))) if row[3] is not None else Decimal("0"),
+                    "avg_edge":    round(float(row[4]), 4) if row[4] is not None else None,
+                    "avg_p_win":   round(float(row[5]), 4) if row[5] is not None else None,
                 }
             )
         return result

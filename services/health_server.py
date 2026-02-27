@@ -142,7 +142,7 @@ class HealthServer:
             pass
 
         # Service circuit breakers
-        from services.circuit_breaker import cb_gamma, cb_clob, cb_binance, cb_charlie
+        from services.api_circuit_breaker import cb_gamma, cb_clob, cb_binance, cb_charlie
         svc_cbs = {
             "gamma":   cb_gamma.status,
             "clob":    cb_clob.status,

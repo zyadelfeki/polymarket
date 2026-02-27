@@ -20,11 +20,14 @@ import signal
 import sys
 import argparse
 import logging
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from decimal import Decimal
 import yaml
 import structlog
+
+from scripts.ensure_single_instance import acquire_instance_lock
 
 # Import core components
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
@@ -193,6 +196,7 @@ class TradingSystem:
         # multiple scans before the idempotency cache would dedup them (the
         # cache key includes price, so a 1-tick price change defeats it).
         self._paper_order_cooldowns: Dict[str, float] = {}
+        self._paper_session_start: Optional[str] = None
         self.last_discovered_markets = []
         startup_config = config.get('startup', {})
         self.init_timeout_seconds = float(startup_config.get('component_timeout_seconds', 25.0))
@@ -204,7 +208,7 @@ class TradingSystem:
         self.strategy_scan_timeout_seconds = float(startup_config.get('strategy_scan_timeout_seconds', 30.0))
         self.last_market_probe_at = 0.0
         self.last_heartbeat_at = 0.0
-        self.start_time = asyncio.get_event_loop().time()
+        self.start_time = time.monotonic()  # monotonic wall clock; asyncio loop.time() is the same source
         
         logger.info(
             "trading_system_initialized",
@@ -330,7 +334,7 @@ class TradingSystem:
         if not self.strategy_engine:
             return
 
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         if (now - self.last_strategy_scan_at) < self.strategy_scan_min_interval_seconds:
             return
 
@@ -379,6 +383,8 @@ class TradingSystem:
                 "arbitrage_opportunity_detected",
                 trigger=trigger,
                 market_id=opportunity.get("market_id"),
+                asset=opportunity.get("asset"),
+                question=(opportunity.get("question") or "")[:80],
                 side=opportunity.get("side"),
                 timeframe=opportunity.get("timeframe"),
                 btc_price=str(opportunity.get("btc_price")),
@@ -527,7 +533,7 @@ class TradingSystem:
         if is_paper:
             _cooldown_key = f"{market_id}:{token_id}"
             _cooldown_secs = 60.0
-            _now_mono = asyncio.get_event_loop().time()
+            _now_mono = asyncio.get_running_loop().time()
             _last_submitted = self._paper_order_cooldowns.get(_cooldown_key, 0.0)
             if _now_mono - _last_submitted < _cooldown_secs:
                 logger.debug(
@@ -663,6 +669,15 @@ class TradingSystem:
 
         position_size_pct = float((order_value / equity) * Decimal("100"))
         if self.circuit_breaker:
+            logger.debug(
+                "circuit_breaker_check",
+                equity=str(equity),
+                position_size_pct=round(position_size_pct, 2),
+                cb_state=self.circuit_breaker.state.value,
+                half_open_max_pct=self.circuit_breaker.half_open_max_position_pct,
+                peak_equity=float(self.circuit_breaker.peak_equity),
+                consecutive_losses=self.circuit_breaker.consecutive_losses,
+            )
             can_trade = await self._safe_await(
                 "circuit_breaker.can_trade.execute_opportunity",
                 self.circuit_breaker.can_trade(equity, position_size_pct=position_size_pct),
@@ -674,7 +689,10 @@ class TradingSystem:
                     reason="circuit_breaker_blocked",
                     market_id=market_id,
                     token_id=token_id,
-                    position_size_pct=position_size_pct,
+                    position_size_pct=round(position_size_pct, 2),
+                    cb_state=self.circuit_breaker.state.value,
+                    half_open_max_pct=self.circuit_breaker.half_open_max_position_pct,
+                    peak_equity=float(self.circuit_breaker.peak_equity),
                     trigger=trigger,
                 )
                 return
@@ -688,13 +706,20 @@ class TradingSystem:
         charlie_regime: Optional[str] = None
 
         if self.charlie_gate is not None:
-            # Map opportunity symbol to Charlie vocab (default BTC)
-            opp_symbol = str(opportunity.get("symbol") or opportunity.get("btc_symbol") or "BTC")
+            # Map opportunity asset to Charlie vocab (default BTC).
+            # The opportunity dict uses "asset" (e.g. "SOL", "BTC") not "symbol".
+            # Falling back to "symbol" / "btc_symbol" for legacy compatibility.
+            opp_symbol = str(
+                opportunity.get("asset")
+                or opportunity.get("symbol")
+                or opportunity.get("btc_symbol")
+                or "BTC"
+            )
 
             # Fetch real Binance technical features (cached 60s; returns None on failure)
             # This is what actually gives Charlie's ML models live market context.
             # Without it every model returns HOLD → p_win=0.5 → coin-flip trades.
-            _extra_features = await asyncio.get_event_loop().run_in_executor(
+            _extra_features = await asyncio.get_running_loop().run_in_executor(
                 None, _get_binance_features, opp_symbol
             )
             if _extra_features is not None:
@@ -719,6 +744,7 @@ class TradingSystem:
                     timeframe="15m",
                     bankroll=equity,
                     extra_features=_extra_features,
+                    market_question=str(opportunity.get("question") or "")[:80],
                     override_win_rate=(
                         self.performance_tracker.get_rolling_win_rate(20)
                         if self.performance_tracker is not None
@@ -743,7 +769,7 @@ class TradingSystem:
             # Stamping here ensures the 60 s guard fires regardless of whether
             # the order ultimately clears the portfolio budget checks.
             if is_paper:
-                self._paper_order_cooldowns[f"{market_id}:{token_id}"] = asyncio.get_event_loop().time()
+                self._paper_order_cooldowns[f"{market_id}:{token_id}"] = asyncio.get_running_loop().time()
 
             # Adopt Charlie's recommended side and Kelly size
             side = charlie_rec.side
@@ -904,7 +930,7 @@ class TradingSystem:
 
         # Write CREATED row to unified order ledger before sending to exchange.
         # Stores model_votes so per-model feedback works on settlement.
-        pre_order_id = f"pre_{market_id}_{token_id}_{int(asyncio.get_event_loop().time()*1000)}"
+        pre_order_id = f"pre_{market_id}_{token_id}_{int(asyncio.get_running_loop().time()*1000)}"
         if self.ledger is not None:
             await self._safe_await(
                 "ledger.record_order_created",
@@ -978,6 +1004,17 @@ class TradingSystem:
                             notes=charlie_rec.reason if charlie_rec else None,
                         ),
                     )
+                    # pre_ row is superseded by the confirmed exchange order ID.
+                    # Mark it terminal so get_open_orders() never returns it and
+                    # the settlement loop cannot double-count PnL.
+                    if pre_order_id:
+                        await self._safe_await(
+                            "ledger.transition_order_state_superseded",
+                            self.ledger.transition_order_state(
+                                pre_order_id, "SUPERSEDED",
+                                notes=f"superseded_by={exchange_order_id}",
+                            ),
+                        )
                 if self.ledger is not None:
                     await self._safe_await(
                         "ledger.transition_order_state_submitted",
@@ -1045,7 +1082,7 @@ class TradingSystem:
         )
         # Record cooldown so rapid subsequent scans skip this market+token.
         if is_paper:
-            self._paper_order_cooldowns[f"{market_id}:{token_id}"] = asyncio.get_event_loop().time()
+            self._paper_order_cooldowns[f"{market_id}:{token_id}"] = asyncio.get_running_loop().time()
 
         if result.filled_quantity and result.filled_quantity > Decimal("0"):
             logger.info(
@@ -1165,6 +1202,21 @@ class TradingSystem:
                 )
                 logger.info("paper_positions_reset",
                             msg="stale OPEN paper positions force-closed at paper startup (live positions preserved)")
+
+                # Expire stale order_tracking rows from prior paper sessions.
+                # CREATED/SUBMITTED rows left by crashes are counted as active
+                # exposure by portfolio_risk_engine (via get_open_orders()), which
+                # can silently reject every new trade as over-exposed.  This must
+                # run BEFORE the CB is initialized so the equity view is clean.
+                _expired = await self._await_step(
+                    "ledger.cancel_stale_paper_orders",
+                    self.ledger.cancel_stale_paper_orders(),
+                )
+                logger.info(
+                    "stale_paper_orders_cleaned",
+                    expired_count=_expired,
+                    msg="stale paper CREATED/SUBMITTED rows expired before CB init",
+                )
 
             # 3. API Client
             api_config = self.config.get('api', {}).get('polymarket', {})
@@ -1368,6 +1420,9 @@ class TradingSystem:
                 "max_category_exposure_pct": risk_cfg.get("max_category_exposure_pct", 0.10),
                 "max_single_market_pct":     risk_cfg.get("max_single_market_pct",     0.05),
                 "max_same_asset_positions":  risk_cfg.get("max_same_asset_positions",  2),
+                # Source from GLOBAL_RISK_BUDGET so it is explicit and reviewable.
+                # Default falls back to portfolio_risk.py's own default (0.25).
+                "min_tradeable_usdc":        float(GLOBAL_RISK_BUDGET.get("min_tradeable_usdc", 0.25)),
             })
             self.drawdown_monitor = DrawdownMonitor(
                 max_drawdown_pct=float(risk_cfg.get("max_drawdown_pct", 15.0)) / 100.0
@@ -1413,21 +1468,57 @@ class TradingSystem:
                 try:
                     _live_cfg = _json.loads(_kelly_live_path.read_text())
                     if "min_edge_required" in _live_cfg:
-                        KELLY_CONFIG["min_edge"] = Decimal(str(_live_cfg["min_edge_required"]))
+                        KELLY_CONFIG["min_edge_required"] = Decimal(str(_live_cfg["min_edge_required"]))
                     if "fractional_kelly" in _live_cfg:
                         KELLY_CONFIG["fractional_kelly"] = Decimal(str(_live_cfg["fractional_kelly"]))
                     if "max_bet_pct" in _live_cfg:
-                        KELLY_CONFIG["max_bet_fraction"] = Decimal(str(_live_cfg["max_bet_pct"]))
+                        KELLY_CONFIG["max_bet_pct"] = Decimal(str(_live_cfg["max_bet_pct"]))
                     logger.info(
                         "kelly_config_loaded_from_optimizer",
                         sharpe=_live_cfg.get("sharpe"),
                         trade_count=_live_cfg.get("trade_count"),
                         optimized_at=_live_cfg.get("optimized_at"),
-                        min_edge=str(KELLY_CONFIG.get("min_edge")),
+                        min_edge=str(KELLY_CONFIG.get("min_edge_required")),
                         fractional_kelly=str(KELLY_CONFIG.get("fractional_kelly")),
                     )
                 except Exception as _e:
                     logger.warning("kelly_live_config_load_failed", error=str(_e))
+
+            # --- Load rolling Kelly snapshot (YAML) if present --------------
+            # rolling_kelly_optimizer.py writes config/kelly_config_snapshot_{date}.yaml
+            # and correctly uses KELLY_CONFIG's canonical keys (min_edge_required,
+            # fractional_kelly, max_bet_pct).  The JSON loader above also now uses
+            # the same canonical keys after the fix in commit 69f463a.
+            import glob as _glob
+            import yaml as _yaml
+            _snap_files = sorted(
+                _glob.glob(str(Path("config") / "kelly_config_snapshot_*.yaml"))
+            )
+            if _snap_files:
+                _snap_path = _snap_files[-1]  # lexicographic = latest date
+                try:
+                    with open(_snap_path) as _f:
+                        _snap = _yaml.safe_load(_f)
+                    _best = _snap.get("best_combo", {})
+                    if "min_edge_required" in _best:
+                        KELLY_CONFIG["min_edge_required"] = Decimal(str(_best["min_edge_required"]))
+                    if "fractional_kelly" in _best:
+                        KELLY_CONFIG["fractional_kelly"] = Decimal(str(_best["fractional_kelly"]))
+                    if "max_bet_pct" in _best:
+                        KELLY_CONFIG["max_bet_pct"] = Decimal(str(_best["max_bet_pct"]))
+                    _snap_meta = _snap.get("metrics", {})
+                    logger.info(
+                        "kelly_config_loaded_from_snapshot",
+                        snapshot=str(_snap_path),
+                        sharpe=_snap_meta.get("sharpe"),
+                        trade_count=_snap_meta.get("trade_count"),
+                        generated_at=_snap.get("generated_at"),
+                        min_edge_required=str(KELLY_CONFIG.get("min_edge_required")),
+                        fractional_kelly=str(KELLY_CONFIG.get("fractional_kelly")),
+                        max_bet_pct=str(KELLY_CONFIG.get("max_bet_pct")),
+                    )
+                except Exception as _e:
+                    logger.warning("kelly_snapshot_load_failed", path=_snap_path, error=str(_e))
 
             # Initialize all components
             await self._await_step("initialize_components", self.initialize_components(), timeout_seconds=120.0)
@@ -1463,6 +1554,66 @@ class TradingSystem:
                     "performance_tracker.refresh_post_reconcile",
                     self.performance_tracker.refresh(),
                 )
+
+            # --- Paper-mode peak_equity guard -----------------------------------
+            # Each paper session starts fresh equity at STARTING_CAPITAL.  If the
+            # performance tracker's equity-curve peak is from a prior session (and
+            # is therefore higher than today's starting equity), the drawdown
+            # calculation would immediately fire a halt.  In paper mode only we
+            # reset peak_equity to the current equity so the session starts with a
+            # clean baseline.  In live mode the peak is NEVER auto-reset.
+            _is_paper = self.config.get("trading", {}).get("paper_trading", True)
+            if _is_paper and self.performance_tracker is not None:
+                _current_eq = self.performance_tracker._current_equity
+                _peak_eq = self.performance_tracker._peak_equity
+                if _peak_eq > _current_eq and _current_eq > Decimal("0"):
+                    self.performance_tracker._peak_equity = _current_eq
+                    logger.info(
+                        "paper_peak_equity_reset",
+                        previous_peak=str(_peak_eq),
+                        reset_to=str(_current_eq),
+                        reason="paper_session_fresh_start",
+                    )
+            if _is_paper and self.drawdown_monitor is not None:
+                # DrawdownMonitor is constructed fresh each session with peak=0;
+                # seed it with the real current equity so drawdown math is valid.
+                if hasattr(self.drawdown_monitor, "peak_equity"):
+                    _current_eq = (
+                        self.performance_tracker._current_equity
+                        if self.performance_tracker is not None
+                        else Decimal("0")
+                    )
+                    if _current_eq > Decimal("0"):
+                        self.drawdown_monitor.peak_equity = _current_eq
+                        logger.info(
+                            "paper_drawdown_monitor_seeded",
+                            peak_equity=str(_current_eq),
+                        )
+            # -------------------------------------------------------------------
+
+            # Paper mode: force circuit breaker to CLOSED so a stale OPEN state
+            # from a prior session (e.g. old drawdown or win-rate trip) never
+            # silently blocks a fresh paper session.  In live mode the circuit
+            # breaker state is NEVER auto-reset — the operator must reset it.
+            if _is_paper and self.circuit_breaker is not None:
+                from risk.circuit_breaker_v2 import CircuitState as _CS
+                if self.circuit_breaker.state != _CS.CLOSED:
+                    await self._safe_await(
+                        "circuit_breaker.paper_startup_reset",
+                        self.circuit_breaker.manual_reset(),
+                        default=None,
+                    )
+                    logger.info(
+                        "paper_circuit_breaker_reset",
+                        reason="fresh_paper_session_startup",
+                    )
+            # Mark paper session start so performance checks are session-scoped
+            if _is_paper:
+                from datetime import datetime as _dt, timezone as _tz
+                self._paper_session_start = _dt.now(_tz.utc).isoformat()
+                logger.info("paper_session_start_marked",
+                            session_start=self._paper_session_start)
+            # -------------------------------------------------------------------
 
             self.running = True
 
@@ -1506,7 +1657,7 @@ class TradingSystem:
                 except asyncio.TimeoutError:
                     pass  # Continue normal operation
 
-                now = asyncio.get_event_loop().time()
+                now = asyncio.get_running_loop().time()
                 if (now - self.last_heartbeat_at) >= self.loop_tick_seconds:
                     self.last_heartbeat_at = now
                     logger.info(
@@ -1564,6 +1715,7 @@ class TradingSystem:
     async def _periodic_check(self):
         """Periodic health and status check."""
         try:
+            equity = Decimal("0")   # Safe default — prevents UnboundLocalError if circuit_breaker is None
             # Check circuit breaker
             if self.circuit_breaker:
                 equity = await self._safe_await("ledger.get_equity.periodic", self.ledger.get_equity(), default=Decimal('0'))
@@ -1630,39 +1782,75 @@ class TradingSystem:
 
                 current_dd = self.performance_tracker.get_current_drawdown()
                 if current_dd >= Decimal(str(max_dd_halt)):
-                    logger.critical(
-                        "performance_halt_drawdown",
-                        current_drawdown_pct=str(current_dd * 100),
-                        threshold_pct=str(Decimal(str(max_dd_halt)) * 100),
-                    )
-                    if self.circuit_breaker:
-                        from risk.circuit_breaker_v2 import TripReason
-                        await self._safe_await(
-                            "circuit_breaker.trip_drawdown",
-                            self.circuit_breaker.trip(TripReason.MAX_DRAWDOWN),
-                            default=None,
+                    _is_paper_mode = self.config.get("trading", {}).get("paper_trading", True)
+                    if _is_paper_mode:
+                        # Paper mode: warn only — the performance tracker's peak_equity
+                        # is built from the cumulative all-session equity curve, so a prior
+                        # session peak of e.g. $36k against today's $10k starting capital
+                        # produces a 73% "drawdown" that is purely historical artefact.
+                        # The CB already enforces session-scoped drawdown from initial_equity;
+                        # firing a cross-session halt here would trip it on every paper start.
+                        logger.warning(
+                            "performance_halt_drawdown",
+                            current_drawdown_pct=str(current_dd * 100),
+                            threshold_pct=str(Decimal(str(max_dd_halt)) * 100),
+                            paper_mode=True,
+                            action="log_only",
                         )
+                    else:
+                        logger.critical(
+                            "performance_halt_drawdown",
+                            current_drawdown_pct=str(current_dd * 100),
+                            threshold_pct=str(Decimal(str(max_dd_halt)) * 100),
+                            paper_mode=False,
+                            action="circuit_breaker_trip",
+                        )
+                        if self.circuit_breaker:
+                            from risk.circuit_breaker_v2 import TripReason
+                            await self._safe_await(
+                                "circuit_breaker.trip_drawdown",
+                                self.circuit_breaker.trip(TripReason.MAX_DRAWDOWN),
+                                default=None,
+                            )
 
                 rolling_wr = self.performance_tracker.get_rolling_win_rate(win_rate_sample)
                 if rolling_wr is not None and Decimal(str(rolling_wr)) < Decimal(str(min_wr)):
-                    logger.critical(
-                        "performance_halt_win_rate",
-                        rolling_win_rate=f"{rolling_wr:.2%}",
-                        threshold=str(min_wr),
-                        sample_size=win_rate_sample,
-                    )
-                    if self.circuit_breaker:
-                        from risk.circuit_breaker_v2 import TripReason
-                        await self._safe_await(
-                            "circuit_breaker.trip_loss_streak",
-                            self.circuit_breaker.trip(TripReason.LOSS_STREAK),
-                            default=None,
+                    _is_paper_mode = self.config.get("trading", {}).get("paper_trading", True)
+                    if _is_paper_mode:
+                        # Paper mode: warn only — stale historical orders from prior
+                        # sessions would otherwise immediately kill every fresh session.
+                        logger.warning(
+                            "performance_halt_win_rate",
+                            rolling_win_rate=f"{rolling_wr:.2%}",
+                            threshold=str(min_wr),
+                            sample_size=win_rate_sample,
+                            paper_mode=True,
+                            action="log_only",
                         )
+                    else:
+                        # Live mode: enforce the halt.
+                        logger.critical(
+                            "performance_halt_win_rate",
+                            rolling_win_rate=f"{rolling_wr:.2%}",
+                            threshold=str(min_wr),
+                            sample_size=win_rate_sample,
+                            paper_mode=False,
+                            action="circuit_breaker_trip",
+                        )
+                        if self.circuit_breaker:
+                            from risk.circuit_breaker_v2 import TripReason
+                            await self._safe_await(
+                                "circuit_breaker.trip_loss_streak",
+                                self.circuit_breaker.trip(TripReason.LOSS_STREAK),
+                                default=None,
+                            )
 
         except Exception as e:
             logger.error(
                 "periodic_check_failed",
-                error=str(e)
+                error=str(e),
+                error_type=type(e).__name__,
+                exc_info=True,
             )
     
     async def _periodic_maintenance(self):
@@ -1743,17 +1931,18 @@ class TradingSystem:
         if self.ledger is None:
             return
 
+        from datetime import datetime, timezone, timedelta
         cutoff_iso = (
-            __import__("datetime").datetime.utcnow()
-            - __import__("datetime").timedelta(seconds=stale_after_seconds)
-        ).isoformat(sep=" ")
+            datetime.now(timezone.utc)
+            - timedelta(seconds=stale_after_seconds)
+        ).isoformat()
 
         stale_rows = await self._safe_await(
             "ledger.get_stale_submitted_orders",
             self.ledger.execute(
                 "SELECT order_id, market_id FROM order_tracking"
                 " WHERE order_state='SUBMITTED'"
-                " AND created_at < ?",
+                " AND opened_at < ?",
                 (cutoff_iso,),
                 fetch_all=True,
                 as_dict=True,
@@ -1996,7 +2185,7 @@ class TradingSystem:
                 snapshot = await self._safe_await(
                     "ledger.shutdown_snapshot",
                     self.ledger.shutdown_snapshot(price_feed=price_feed),
-                    timeout_seconds=15.0,
+                    timeout_seconds=45.0,
                     default={},
                 )
                 print(
@@ -2046,6 +2235,11 @@ class TradingSystem:
 
 async def main():
     """Main entry point."""
+    # Prevent two bot instances from running simultaneously.
+    # Two instances sharing separate in-memory cooldown dicts would double-fire
+    # the same orders within the same second, bypassing per-market rate limits.
+    acquire_instance_lock()
+
     # Parse arguments
     parser = argparse.ArgumentParser(description='Polymarket Trading Bot')
     parser.add_argument(
