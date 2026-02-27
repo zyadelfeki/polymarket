@@ -89,7 +89,7 @@ HEARTBEAT_FILE = "runtime/heartbeat.txt"
 # Any market whose condition_id OR numeric id appears here is skipped at
 # scan time and logged as 'market_blocked'.  Add future losers here.
 #
-# Combined loss on the 6 markets below: -$3,174 over 98 trades @ <20% win rate.
+# Combined loss on the 8 markets below: -$4,964 over 110 trades @ <20% win rate.
 # Root cause: signal model has NO edge on these specific question types.
 # ---------------------------------------------------------------------------
 BLOCKED_MARKETS: set = {
@@ -101,6 +101,8 @@ BLOCKED_MARKETS: set = {
     '1403143',  #  6 trades, 17% win, -$873
     '1445001',  #  6 trades, 0% win,  -$942.95
     '1447205',  #  7 trades, 14% win, -$958.75
+    '1448902',  #  6 trades, 17% win, -$873   (added 2026-02-27)
+    '1448693',  #  6 trades, 17% win, -$917   (added 2026-02-27)
 }
 
 # ---------------------------------------------------------------------------
