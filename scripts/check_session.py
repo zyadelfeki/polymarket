@@ -6,6 +6,7 @@ Usage: python scripts/check_session.py [path/to/production.log]
 """
 import sys
 import json
+import sqlite3
 from pathlib import Path
 from collections import Counter
 
@@ -45,6 +46,36 @@ charlie_approved  = count("charlie_gate_approved")
 opp_detected      = count("arbitrage_opportunity_detected")
 order_submitted   = count("order_submitted")
 order_settled     = count("order_settled")
+
+# ERROR order diagnostics — direct DB read so this captures all sessions.
+_error_orders_total = 0
+_error_orders_by_market: dict = {}
+try:
+    _db = sqlite3.connect("data/trading.db")
+    _total_row = _db.execute(
+        "SELECT COUNT(*) FROM order_tracking WHERE order_state = 'ERROR'"
+    ).fetchone()
+    _error_orders_total = _total_row[0] if _total_row else 0
+    _by_market = _db.execute(
+        "SELECT market_id, notes, COUNT(*) AS n "
+        "FROM order_tracking WHERE order_state = 'ERROR' "
+        "GROUP BY market_id, notes ORDER BY n DESC LIMIT 10"
+    ).fetchall()
+    for mid, note, n in _by_market:
+        key = f"{mid} [{note}]"
+        _error_orders_by_market[key] = n
+    _db.close()
+except Exception as _dbe:
+    _error_orders_by_market[f"db_error: {_dbe}"] = 0
+
+# market_blocked events from this session
+market_blocked_static    = count_field("market_blocked", "reason", "static_blocked_markets")
+market_blocked_perf      = count_field("market_blocked", "reason", "performance_guard_auto_block")
+order_error_transitions  = count("order_state_set_to_error")
+
+# OFI signal events
+ofi_signal_confirmed     = count("ofi_signal_confirmed")
+ofi_conflict             = count("ofi_conflict")
 
 # Previously-fixed events (should stay at 0)
 periodic_failed   = count("periodic_check_failed")
@@ -137,6 +168,21 @@ if perf_halt_drawdown_paper > 0:
     print(f"  INFO          performance_halt_drawdown [paper log_only]: {perf_halt_drawdown_paper}"
           f"  (cross-session historical drawdown \u2014 CB not tripped, safe to ignore)")
 
+print(f"\n--- ERROR ORDERS (DB total, all sessions) ---")
+print(f"  order_state='ERROR' in DB  : {_error_orders_total}")
+if _error_orders_by_market:
+    for key, n in list(_error_orders_by_market.items())[:5]:
+        print(f"    [{n}x] {key}")
+print(f"  order_state_set_to_error   : {order_error_transitions}  (this session log)")
+
+print(f"\n--- MARKET BLOCKING (this session) ---")
+print(f"  market_blocked[static_blocked_markets]       : {market_blocked_static}")
+print(f"  market_blocked[performance_guard_auto_block] : {market_blocked_perf}")
+
+print(f"\n--- OFI SIGNAL (this session) ---")
+print(f"  ofi_signal_confirmed : {ofi_signal_confirmed}")
+print(f"  ofi_conflict         : {ofi_conflict}  (signals where OFI disagrees with Charlie; size halved)")
+
 print(f"\n--- DEGRADED MODE RATIO (target: <3x) ---")
 print(f"  charlie_degraded_mode     : {degraded_mode}")
 print(f"  binance_features_computed : {features}")
@@ -194,7 +240,7 @@ if total_rr > 0:
     found_any_rejection = True
     print(f"  risk_rejected (circuit_breaker): {total_rr}  <-- fires BEFORE Charlie")
     for reason, c in risk_rejected_reasons.most_common():
-        print(f"    └─ {reason}: {c}")
+        print(f"    +-- {reason}: {c}")
 
 # 2. Per-event rejection items (Charlie, global/per-market budget, etc.)
 for ev in rejection_events:
@@ -214,10 +260,10 @@ for ev in rejection_events:
             ]
             p_win_summary = ""
             if p_wins:
-                p_win_summary = f"  (p_win range: {min(p_wins):.3f}–{max(p_wins):.3f})"
+                p_win_summary = f"  (p_win range: {min(p_wins):.3f}-{max(p_wins):.3f})"
             print(f"  {ev}: {c}{p_win_summary}")
             for reason, rc in reasons.most_common():
-                print(f"    └─ reason={reason}: {rc}")
+                print(f"    +-- reason={reason}: {rc}")
         else:
             print(f"  {ev}: {c}")
 
@@ -227,7 +273,7 @@ if portfolio_blocked_reasons:
     total_pb = sum(portfolio_blocked_reasons.values())
     print(f"  order_blocked_portfolio_risk: {total_pb}")
     for reason, c in portfolio_blocked_reasons.most_common():
-        print(f"    └─ {reason}: {c}")
+        print(f"    +-- {reason}: {c}")
 
 if opportunity_skip_reasons:
     found_any_rejection = True
@@ -235,16 +281,27 @@ if opportunity_skip_reasons:
         print(f"  opportunity_skipped[{reason}]: {c}")
 
 if not found_any_rejection:
-    print("  (none — if charlie_gate_approved=0 check for charlie_gate_rejected events)")
+    print("  (none -- if charlie_gate_approved=0 check for charlie_gate_rejected events)")
+
+# ---------- Phase 3-6 features ----------
+print(f"\n--- ADVANCED FEATURES ---")
+_arb_found = count("yes_no_arb_found")
+_snipe_would = count("snipe_would_fire")
+_snipe_attempt = count("snipe_attempt")
+_oracle_window = count("oracle_window_detected")
+print(f"  yes_no_arb_found: {_arb_found}")
+print(f"  snipe_would_fire: {_snipe_would}")
+print(f"  snipe_attempt: {_snipe_attempt}")
+print(f"  oracle_window_detected: {_oracle_window}")
 
 # ---------- final verdict ----------
 all_ok = ok_fixed and signals_ok
 print()
 if all_ok:
-    print("=== ALL CHECKS PASSED — run the Kelly sweep next ===")
+    print("=== ALL CHECKS PASSED -- run the Kelly sweep next ===")
     print("  python experiments/sweep_kelly_and_edge.py --log logs/production.log")
 else:
-    print("=== CHECKS FAILED — DO NOT RUN SWEEP YET ===")
+    print("=== CHECKS FAILED -- DO NOT RUN SWEEP YET ===")
     if not ok_fixed:
         print("  Previously-fixed errors have returned.")
     if not signals_ok:
@@ -254,7 +311,7 @@ else:
         elif total_circuit_blocked > 0 and charlie_approved == 0:
             print("  Circuit breaker blocked all opportunities BEFORE Charlie was called.")
             for reason, c in risk_rejected_reasons.most_common():
-                print(f"    \u2514\u2500 {reason}: {c}")
+                print(f"    +-- {reason}: {c}")
             print("  Check: risk/system_circuit_breaker.py and daily_loss / drawdown state in DB.")
             print("  If circuit_breaker_blocked: the CB may have tripped from prior paper losses.")
         elif charlie_approved == 0:
@@ -275,6 +332,48 @@ else:
                 print("  Check the p_win range and reason breakdown above.")
         elif order_submitted == 0:
             print("  Charlie approved but orders not submitted. Check execution service.")
+
+# ---------- calibration progress ----------
+print(f"\n--- CALIBRATION PROGRESS ---")
+_cal_csv = Path("data/calibration_dataset.csv")
+if _cal_csv.exists():
+    import csv as _csv
+    _cal_p, _cal_a = [], []
+    with open(_cal_csv, "r", newline="") as _cf:
+        for _row in _csv.DictReader(_cf):
+            try:
+                _cal_p.append(float(_row["p_win_raw"]))
+                _cal_a.append(int(_row["actual_outcome"]))
+            except (KeyError, ValueError):
+                pass
+    _cal_n = len(_cal_p)
+    print(f"  Calibration samples: {_cal_n}")
+    if _cal_n > 0:
+        # ECE (10-bin)
+        _n_bins = 10
+        _bins = [[] for _ in range(_n_bins)]
+        for _p, _a in zip(_cal_p, _cal_a):
+            _idx = min(int(_p * _n_bins), _n_bins - 1)
+            _bins[_idx].append((_p, _a))
+        _ece = 0.0
+        for _b in _bins:
+            if not _b:
+                continue
+            _mc = sum(x[0] for x in _b) / len(_b)
+            _ma = sum(x[1] for x in _b) / len(_b)
+            _ece += (len(_b) / _cal_n) * abs(_mc - _ma)
+        _avg_p = sum(_cal_p) / _cal_n
+        _win_rate = sum(_cal_a) / _cal_n
+        print(f"  Uncalibrated ECE: {_ece:.4f}")
+        print(f"  Avg p_win_raw: {_avg_p:.4f}  |  Actual win rate: {_win_rate:.4f}")
+    if _cal_n >= 100:
+        print(f"  ✓ CALIBRATION READY — run: python scripts/fit_calibration.py")
+    else:
+        _remaining = 100 - _cal_n
+        print(f"  ⏳ Need {_remaining} more samples before fitting (target: 100)")
+        print(f"     At ~20-30 settlements/day → ~{max(1, _remaining // 25)} more days")
+else:
+    print("  (no calibration data yet — run: python scripts/build_calibration_dataset.py)")
 
 # ---------- PnL attribution by market ----------
 print(f"\n--- PnL ATTRIBUTION BY MARKET ---")

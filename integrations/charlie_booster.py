@@ -43,10 +43,20 @@ from decimal import Decimal
 from typing import Dict, Optional
 import structlog
 
+from models.calibration import calibrate_p_win
+from utils.fee_calculator import taker_fee_rate, net_edge as _net_edge_calc
+from data_feeds.ofi_calculator import OFICalculator
+
 # structlog is used throughout the polymarket codebase — stdlib logging does
 # NOT accept keyword arguments (reason=, market_id=, …) so all structured
 # log calls here must go through structlog.
 logger = structlog.get_logger(__name__)
+
+# Module-level OFI calculator.  One instance per process; its rolling window
+# is seeded from Binance orderbook snapshots injected via extra_features.
+# Resets on restart — intentional (stale history from a dead session is
+# worse than no history).
+_ofi_calc = OFICalculator(window_seconds=180)
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +279,8 @@ class CharliePredictionGate:
             )
             return None
 
-        p_win: float = float(signal["p_win"])
+        p_win_raw: float = float(signal["p_win"])
+        p_win: float = calibrate_p_win(p_win_raw)  # Platt-calibrated (passthrough if no scaler)
         confidence: float = float(signal["confidence"])
         regime: str = signal["regime"]
         technical_regime: str = signal.get("technical_regime", "UNKNOWN")
@@ -287,12 +298,17 @@ class CharliePredictionGate:
             side = "YES"
             effective_p_win = p_win
             implied_prob = yes_implied
-            edge = yes_edge
+            gross_edge = yes_edge
         else:
             side = "NO"
             effective_p_win = no_p_win
             implied_prob = no_implied
-            edge = no_edge
+            gross_edge = no_edge
+
+        # --- 2c. Fee-aware edge: subtract dynamic Polymarket taker fee ------
+        # Pass market_question so crypto direction markets pay the correct 3.15% rate
+        _fee = float(taker_fee_rate(Decimal(str(implied_prob)), question=market_question))
+        edge = gross_edge - _fee  # net edge after fees
 
         # --- 2b. Coin-flip rejection: p_win within 3% of 0.5 = no signal ----
         # Charlie is operating in degraded/neutral mode when it cannot
@@ -309,16 +325,19 @@ class CharliePredictionGate:
             )
             return None
 
-        # --- 3. Edge filter -------------------------------------------------
+        # --- 3. Edge filter (fee-aware) --------------------------------------
         if Decimal(str(edge)) < self._min_edge:
             logger.info(
                 "charlie_gate_rejected",
                 reason="edge_below_threshold",
                 market_id=market_id,
                 market_question=market_question[:80],
-                edge=f"{edge:.4f}",
+                gross_edge=f"{gross_edge:.4f}",
+                net_edge=f"{edge:.4f}",
+                fee=f"{_fee:.4f}",
                 min_edge=str(self._min_edge),
                 p_win=float(p_win),
+                p_win_raw=float(p_win_raw),
                 min_win_probability=None,
                 implied_prob=yes_implied,
                 confidence=float(confidence),
@@ -417,6 +436,44 @@ class CharliePredictionGate:
             f"conf={confidence:.3f} regime={regime}"
         )
 
+        # --- 7. OFI confirmation / conflict filter --------------------------
+        # Feed the latest Binance orderbook snapshot (injected by get_all_features
+        # in binance_features.py) into the rolling OFI calculator, then check
+        # whether the book pressure direction confirms or conflicts Charlie's
+        # directional call.  Conflict → halve size (not block — Charlie signal
+        # retains primacy; OFI is secondary confirmation).
+        _ofi_signal: Optional[str] = None
+        if extra_features:
+            _ob_bids = extra_features.get("ofi_bids")
+            _ob_asks = extra_features.get("ofi_asks")
+            if _ob_bids and _ob_asks:
+                _ofi_calc.add_snapshot(symbol, _ob_bids, _ob_asks)
+            _ofi_signal = _ofi_calc.ofi_signal(symbol)
+
+        if _ofi_signal is not None:
+            # BUY signal from Charlie but book pressure is SELL → conflict
+            # SELL signal from Charlie but book pressure is BUY → conflict
+            _charlie_direction = "BUY" if side == "YES" else "SELL"
+            if _ofi_signal != _charlie_direction:
+                size = size * Decimal("0.5")
+                kelly_fraction = kelly_fraction * Decimal("0.5")
+                logger.warning(
+                    "ofi_conflict",
+                    market_id=market_id,
+                    symbol=symbol,
+                    charlie_side=side,
+                    ofi_signal=_ofi_signal,
+                    size_after_halving=str(size),
+                )
+            else:
+                logger.info(
+                    "ofi_signal_confirmed",
+                    market_id=market_id,
+                    symbol=symbol,
+                    side=side,
+                    ofi_signal=_ofi_signal,
+                )
+
         recommendation = TradeRecommendation(
             side=side,
             size=size,
@@ -439,8 +496,11 @@ class CharliePredictionGate:
             size=str(size),
             kelly_fraction=str(kelly_fraction),
             p_win=effective_p_win,
+            p_win_raw=float(p_win_raw),
             implied_prob=implied_prob,
-            edge=edge,
+            gross_edge=gross_edge,
+            net_edge=edge,
+            fee=_fee,
             confidence=confidence,
             regime=regime,
             symbol=symbol,

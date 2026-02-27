@@ -52,12 +52,20 @@ from config_production import (
     REGIME_RISK_OVERRIDES,
     GLOBAL_RISK_BUDGET,
     STARTING_CAPITAL,
+    BLOCKED_MARKETS,
 )
+from utils.market_performance_guard import is_market_blocked_by_performance
 from services.portfolio_state import PortfolioState
 from services.do_not_trade import DoNotTradeRegistry
 from data_feeds.binance_features import get_all_features as _get_binance_features
 from risk.portfolio_risk import PortfolioRiskEngine, DrawdownMonitor
 from services.health_server import HealthServer
+
+# Phase 3-6 features (log-only)
+from data_feeds.arb_scanner import scan_yes_no_arb
+from execution.sniper import MarketSniper
+from execution.oracle_monitor import check_oracle_window
+from data_feeds.binance_feed import BinanceTradeFeed
 
 
 def _build_model_feedback_callback():
@@ -198,6 +206,8 @@ class TradingSystem:
         self._paper_order_cooldowns: Dict[str, float] = {}
         self._paper_session_start: Optional[str] = None
         self.last_discovered_markets = []
+        self.market_sniper = MarketSniper()
+        self.binance_trade_feed: Optional[BinanceTradeFeed] = None
         startup_config = config.get('startup', {})
         self.init_timeout_seconds = float(startup_config.get('component_timeout_seconds', 25.0))
         self.network_timeout_seconds = float(startup_config.get('network_timeout_seconds', 20.0))
@@ -508,6 +518,26 @@ class TradingSystem:
                 "opportunity_skipped",
                 reason="invalid_opportunity_side",
                 side=side,
+                market_id=market_id,
+                trigger=trigger,
+            )
+            return
+
+        # --- Static blocked-market filter (chronic losers, hand-curated) ---
+        if market_id in BLOCKED_MARKETS:
+            logger.info(
+                "market_blocked",
+                reason="static_blocked_markets",
+                market_id=market_id,
+                trigger=trigger,
+            )
+            return
+
+        # --- Dynamic performance guard (auto-blocks bad markets after 5+ trades) ---
+        if is_market_blocked_by_performance(market_id):
+            logger.info(
+                "market_blocked",
+                reason="performance_guard_auto_block",
                 market_id=market_id,
                 trigger=trigger,
             )
@@ -1052,12 +1082,23 @@ class TradingSystem:
                     except Exception as _se:
                         logger.warning("slippage_record_failed", error=str(_se))
             elif not result.success and pre_order_id:
+                _err_msg = str(getattr(result, "error", "unknown"))
+                _err_code = str(getattr(result, "error_code", "unknown"))
+                logger.error(
+                    "order_state_set_to_error",
+                    pre_order_id=pre_order_id,
+                    market_id=market_id,
+                    token_id=token_id,
+                    error=_err_msg,
+                    error_code=_err_code,
+                    trigger=trigger,
+                )
                 if self.ledger is not None:
                     await self._safe_await(
                         "ledger.transition_order_state_error",
                         self.ledger.transition_order_state(
                             pre_order_id, "ERROR",
-                            notes=str(getattr(result, "error", "unknown")),
+                            notes=_err_msg,
                         ),
                     )
 
@@ -1434,6 +1475,17 @@ class TradingSystem:
             self.health_server = HealthServer(state_ref=self)
             logger.info("component_construct_success", component="health_server")
 
+            # 16. Binance @trade feed (per-fill granularity for sniper)
+            _trade_feed_symbols = self.config.get('markets', {}).get('crypto_symbols', ['BTC', 'ETH'])
+            logger.info("component_construct_begin", component="binance_trade_feed")
+            self.binance_trade_feed = BinanceTradeFeed(symbols=_trade_feed_symbols)
+            asyncio.get_running_loop().create_task(self.binance_trade_feed.run())
+            logger.info(
+                "component_construct_success",
+                component="binance_trade_feed",
+                symbols=_trade_feed_symbols,
+            )
+
             logger.info("all_components_initialized")
             
         except Exception as e:
@@ -1693,6 +1745,56 @@ class TradingSystem:
                         continue
 
                 await self._run_strategy_scan(trigger="main_loop")
+
+                # --- Phase 3-6: arb scanner + oracle monitor on discovered markets ---
+                if self.last_discovered_markets:
+                    # Yes/No sum arb (risk-free) — log only
+                    try:
+                        _arb_opps = scan_yes_no_arb(
+                            self.last_discovered_markets, self.api_client
+                        )
+                        if _arb_opps:
+                            logger.info(
+                                "arb_scan_complete",
+                                opportunities_found=len(_arb_opps),
+                                best_net_arb_pct=_arb_opps[0]["net_arb_pct"],
+                            )
+                    except Exception as _arb_exc:
+                        logger.warning("arb_scan_failed", error=str(_arb_exc))
+
+                    # Oracle window monitor — log only
+                    try:
+                        for _mkt in self.last_discovered_markets:
+                            check_oracle_window(_mkt)
+                    except Exception as _oracle_exc:
+                        logger.warning("oracle_scan_failed", error=str(_oracle_exc))
+
+                    # Last-second sniper check — log only
+                    if self.market_sniper:
+                        for _mkt in self.last_discovered_markets:
+                            try:
+                                _secs = self.market_sniper.seconds_to_close(_mkt)
+                                if 0 < _secs <= 30:  # within 30s of close
+                                    _btc_price = (
+                                        self.binance_trade_feed.get_price("BTC")
+                                        if self.binance_trade_feed
+                                        else None
+                                    )
+                                    if _btc_price is not None:
+                                        _mkt_price = Decimal(
+                                            str(_mkt.get("market_price") or "0.50")
+                                        )
+                                        _p_win = Decimal("0.5")  # placeholder until Charlie signal
+                                        if self.market_sniper.should_snipe(
+                                            _mkt, _p_win, _mkt_price
+                                        ):
+                                            self.market_sniper.evaluate_snipe(
+                                                _mkt, "YES", _p_win, _mkt_price
+                                            )
+                            except Exception as _snipe_exc:
+                                logger.debug(
+                                    "snipe_check_error", error=str(_snipe_exc)
+                                )
                 
             except Exception as e:
                 logger.error(
@@ -2162,6 +2264,39 @@ class TradingSystem:
                 winning_side=winning_side,
                 payout_per_share=str(payout_per_share),
             )
+
+            # --- Calibration data collection: append (p_win, actual) to CSV --
+            _cal_p_win = row.get("charlie_p_win")
+            if _cal_p_win is not None:
+                try:
+                    import csv as _csv
+                    from pathlib import Path as _Path
+                    _cal_csv = _Path("data/calibration_dataset.csv")
+                    _write_header = not _cal_csv.exists()
+                    _actual = 1 if pnl > Decimal("0") else 0
+                    with open(_cal_csv, "a", newline="") as _cf:
+                        _w = _csv.DictWriter(
+                            _cf,
+                            fieldnames=["market_id", "p_win_raw", "actual_outcome"],
+                        )
+                        if _write_header:
+                            _w.writeheader()
+                        _w.writerow({
+                            "market_id": market_id,
+                            "p_win_raw": round(float(_cal_p_win), 6),
+                            "actual_outcome": _actual,
+                        })
+                    logger.debug(
+                        "calibration_data_appended",
+                        market_id=market_id,
+                        p_win_raw=float(_cal_p_win),
+                        actual=_actual,
+                    )
+                except Exception as _cal_exc:
+                    logger.warning(
+                        "calibration_data_append_failed",
+                        error=str(_cal_exc),
+                    )
 
         logger.info(
             "settlement_scan_complete",

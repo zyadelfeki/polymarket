@@ -457,8 +457,15 @@ class HealthMonitorV2:
             message: Alert message
             metadata: Additional metadata
         """
-        logger.log(
-            severity.value,
+        # Use explicit structlog methods — logger.log(str_level, ...) is not
+        # supported by structlog's BoundLoggerLazy and raises KeyError on the
+        # internal level map.  Map AlertSeverity → named structlog method instead.
+        _log_fn = {
+            AlertSeverity.CRITICAL: logger.error,
+            AlertSeverity.WARNING: logger.warning,
+            AlertSeverity.INFO: logger.info,
+        }.get(severity, logger.warning)
+        _log_fn(
             "health_alert",
             component=component,
             severity=severity.value,

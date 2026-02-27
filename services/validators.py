@@ -57,10 +57,13 @@ class BoundaryValidator:
     @classmethod
     def validate_market_id(cls, market_id: Any) -> str:
         if not isinstance(market_id, str):
-            raise ValueError("Invalid market_id")
+            raise ValueError(f"Invalid market_id: expected str, got {type(market_id).__name__!r} value={market_id!r}")
         market_id = market_id.strip()
         if not cls.MARKET_ID_PATTERN.match(market_id):
-            raise ValueError("Invalid market_id")
+            raise ValueError(
+                f"Invalid market_id: {market_id!r} does not match expected formats "
+                f"(0x<64hex> or decimal integer)"
+            )
         return market_id
 
     @classmethod

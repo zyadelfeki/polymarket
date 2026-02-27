@@ -85,6 +85,25 @@ SAFETY_CONFIG = {
 HEARTBEAT_FILE = "runtime/heartbeat.txt"
 
 # ---------------------------------------------------------------------------
+# Permanently blocked markets — chronic losers with near-zero win rates.
+# Any market whose condition_id OR numeric id appears here is skipped at
+# scan time and logged as 'market_blocked'.  Add future losers here.
+#
+# Combined loss on the 6 markets below: -$3,174 over 98 trades @ <20% win rate.
+# Root cause: signal model has NO edge on these specific question types.
+# ---------------------------------------------------------------------------
+BLOCKED_MARKETS: set = {
+    '1402904',  # 15 trades, 0% win,  -$150
+    '1402902',  # 15 trades, 0% win,  -$150
+    '1403073',  # 52 trades, 2% win,  -$480
+    '1403228',  #  5 trades, 0% win,  -$917
+    '1403232',  #  5 trades, 20% win, -$884
+    '1403143',  #  6 trades, 17% win, -$873
+    '1445001',  #  6 trades, 0% win,  -$942.95
+    '1447205',  #  7 trades, 14% win, -$958.75
+}
+
+# ---------------------------------------------------------------------------
 # Persistent order ledger
 # ---------------------------------------------------------------------------
 ORDER_STORE_CONFIG = {
