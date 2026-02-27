@@ -63,3 +63,6 @@ backtest_results/
 credentials.json
 keys.json
 secrets.json
+run/
+*.pid
+

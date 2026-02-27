@@ -67,7 +67,8 @@ class MarketSniper:
         secs = self.seconds_to_close(market)
         if not (0 < secs <= SNIPE_WINDOW_SECONDS):
             return False
-        edge = _net_edge_calc(p_win, market_price)
+        # Pass market dict so crypto direction markets use the 3.15% fee
+        edge = _net_edge_calc(p_win, market_price, market=market)
         return edge >= MIN_SNIPE_EDGE
 
     def evaluate_snipe(

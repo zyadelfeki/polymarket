@@ -88,9 +88,9 @@ def scan_yes_no_arb(markets: list[dict], clob_client) -> list[dict]:
 
             total_cost = yes_ask + no_ask
 
-            # Dynamic fees on each leg
-            fee_yes = taker_fee_rate(yes_ask)
-            fee_no = taker_fee_rate(no_ask)
+            # Dynamic fees on each leg — pass market dict for crypto direction detection
+            fee_yes = taker_fee_rate(yes_ask, market=market)
+            fee_no = taker_fee_rate(no_ask, market=market)
             total_fees = fee_yes + fee_no
 
             gross_arb = Decimal("1.0") - total_cost

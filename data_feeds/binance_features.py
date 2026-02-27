@@ -123,8 +123,15 @@ def _fetch_candles(symbol: str, interval: str = "15m", limit: int = 60) -> Optio
         return None
 
 
-def _fetch_depth_imbalance(symbol: str, limit: int = 5) -> Optional[float]:
-    """Fetch order book top-N and compute imbalance [-1, 1]."""
+def _fetch_depth_imbalance(symbol: str, limit: int = 5) -> tuple:
+    """Fetch order book top-N and compute imbalance plus raw book levels.
+
+    Returns
+    -------
+    tuple: (imbalance: float | None, bids: list, asks: list)
+        imbalance is in [-1, 1]; bids/asks are [(price_str, qty_str), ...].
+        On failure, returns (None, [], []).
+    """
     try:
         url = f"{_BINANCE_BASE}/api/v3/depth"
         params = {"symbol": symbol, "limit": limit}
@@ -132,15 +139,19 @@ def _fetch_depth_imbalance(symbol: str, limit: int = 5) -> Optional[float]:
             resp = client.get(url, params=params)
             resp.raise_for_status()
         book = resp.json()
-        bid_qty = sum(float(b[1]) for b in book.get("bids", [])[:limit])
-        ask_qty = sum(float(a[1]) for a in book.get("asks", [])[:limit])
+        raw_bids = book.get("bids", [])[:limit]
+        raw_asks = book.get("asks", [])[:limit]
+        bid_qty = sum(float(b[1]) for b in raw_bids)
+        ask_qty = sum(float(a[1]) for a in raw_asks)
         total = bid_qty + ask_qty
-        if total == 0.0:
-            return 0.0
-        return (bid_qty - ask_qty) / total
+        imbalance = (bid_qty - ask_qty) / total if total != 0.0 else 0.0
+        # Convert to (float, float) tuples for OFI calculator compatibility
+        bids = [(float(b[0]), float(b[1])) for b in raw_bids]
+        asks = [(float(a[0]), float(a[1])) for a in raw_asks]
+        return imbalance, bids, asks
     except Exception as exc:
         logger.warning("binance_depth_fetch_failed", symbol=symbol, error=str(exc))
-        return None
+        return None, [], []
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +279,7 @@ def get_book_imbalance(asset: str) -> Optional[float]:
         if now - ts < _BOOK_TTL:
             return imbalance
 
-    imbalance = _fetch_depth_imbalance(symbol, limit=5)
+    imbalance, bids, asks = _fetch_depth_imbalance(symbol, limit=5)
     if imbalance is not None:
         _BOOK_CACHE[symbol] = (now, imbalance)
         logger.debug("binance_book_imbalance",
@@ -278,15 +289,27 @@ def get_book_imbalance(asset: str) -> Optional[float]:
 
 def get_all_features(asset: str) -> Optional[Dict]:
     """
-    Fetch and merge candle features + book imbalance.
+    Fetch and merge candle features + book imbalance + raw book levels.
+
     Returns combined dict or None if candle features unavailable.
+
+    Extra keys (when book fetch succeeds):
+      book_imbalance : float  — (bid_qty - ask_qty) / total, in [-1, 1]
+      ofi_bids       : list   — [(price, size), ...] top-5 bid levels
+      ofi_asks       : list   — [(price, size), ...] top-5 ask levels
+    These are consumed by OFICalculator in charlie_booster.py.
     """
     features = get_candle_features(asset)
     if features is None:
         return None
-    imbalance = get_book_imbalance(asset)
+    symbol = symbol_for_asset(asset)
+    imbalance, bids, asks = _fetch_depth_imbalance(symbol, limit=5)
     if imbalance is not None:
         features = {**features, "book_imbalance": round(imbalance, 6)}
+    if bids:
+        features["ofi_bids"] = bids
+    if asks:
+        features["ofi_asks"] = asks
     return features
 
 

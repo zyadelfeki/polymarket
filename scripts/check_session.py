@@ -73,6 +73,10 @@ market_blocked_static    = count_field("market_blocked", "reason", "static_block
 market_blocked_perf      = count_field("market_blocked", "reason", "performance_guard_auto_block")
 order_error_transitions  = count("order_state_set_to_error")
 
+# OFI signal events
+ofi_signal_confirmed     = count("ofi_signal_confirmed")
+ofi_conflict             = count("ofi_conflict")
+
 # Previously-fixed events (should stay at 0)
 periodic_failed   = count("periodic_check_failed")
 cb_attr_err       = count("circuit_breaker_attribute_error")
@@ -174,6 +178,10 @@ print(f"  order_state_set_to_error   : {order_error_transitions}  (this session 
 print(f"\n--- MARKET BLOCKING (this session) ---")
 print(f"  market_blocked[static_blocked_markets]       : {market_blocked_static}")
 print(f"  market_blocked[performance_guard_auto_block] : {market_blocked_perf}")
+
+print(f"\n--- OFI SIGNAL (this session) ---")
+print(f"  ofi_signal_confirmed : {ofi_signal_confirmed}")
+print(f"  ofi_conflict         : {ofi_conflict}  (signals where OFI disagrees with Charlie; size halved)")
 
 print(f"\n--- DEGRADED MODE RATIO (target: <3x) ---")
 print(f"  charlie_degraded_mode     : {degraded_mode}")
