@@ -41,6 +41,8 @@ import os
 import sqlite3
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -52,6 +54,10 @@ try:
     _OPENAI_AVAILABLE = True
 except ImportError:
     _OPENAI_AVAILABLE = False
+
+# Default Ollama model — override via OLLAMA_MODEL env var
+_OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "mistral")
+_OLLAMA_BASE_URL: str = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # ---------------------------------------------------------------------------
 # Path setup (run from repo root or scripts/ directory)
@@ -210,9 +216,82 @@ def _tag_question_with_llm(
     return None
 
 
+def _tag_question_with_ollama(
+    question: str,
+    model: str = _OLLAMA_MODEL,
+    max_retries: int = 2,
+) -> Optional[dict]:
+    """
+    Calls a local Ollama instance and returns parsed tag dict, or None on failure.
+    Uses urllib (stdlib) — no additional dependencies required.
+    """
+    url = f"{_OLLAMA_BASE_URL}/api/chat"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user",   "content": f"Question: {question}"},
+        ],
+        "stream": False,
+    }
+    body = json.dumps(payload).encode()
+
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode()
+            data = json.loads(raw)
+            content = data.get("message", {}).get("content", "")
+            if not content:
+                print(f"  [WARN] Ollama returned empty content on attempt {attempt + 1}")
+                continue
+            parsed = json.loads(content)
+            required = {"asset", "event_type", "horizon", "outcome_type", "asymmetry_flag", "info_edge_needed"}
+            if not required.issubset(parsed.keys()):
+                missing = required - parsed.keys()
+                print(f"  [WARN] Ollama response missing keys: {missing}")
+                return None
+            return parsed
+        except json.JSONDecodeError as e:
+            print(f"  [WARN] Ollama JSON parse error on attempt {attempt + 1}: {e}")
+        except urllib.error.URLError as e:
+            print(f"  [WARN] Ollama connection error on attempt {attempt + 1}: {e}")
+            break  # Ollama unreachable — no point retrying
+        except Exception as e:
+            print(f"  [WARN] Ollama error on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+    return None
+
+
 # ---------------------------------------------------------------------------
-# DB upsert
+# Unified tagger — OpenAI first, Ollama fallback
 # ---------------------------------------------------------------------------
+def _tag_question(
+    question: str,
+    openai_client: Optional["OpenAI"],
+    openai_model: str,
+    ollama_model: str,
+) -> Optional[dict]:
+    """
+    Try OpenAI first; fall back to local Ollama if OpenAI is unavailable or
+    returns None.  If both fail, return None and let caller skip the market.
+    """
+    if openai_client is not None:
+        result = _tag_question_with_llm(openai_client, question, model=openai_model)
+        if result is not None:
+            return result
+        print("  [WARN] OpenAI failed; trying Ollama fallback.")
+
+    return _tag_question_with_ollama(question, model=ollama_model)
+
+
 def _upsert_tag(
     conn: sqlite3.Connection,
     market_id: str,
@@ -270,21 +349,28 @@ def main() -> None:
                         help="Print tags but do not write to DB")
     parser.add_argument("--model", default="gpt-4o-mini",
                         help="OpenAI model to use (default: gpt-4o-mini)")
+    parser.add_argument("--ollama-model", default=_OLLAMA_MODEL,
+                        help=f"Ollama model to use as fallback (default: {_OLLAMA_MODEL})")
     parser.add_argument("--db", default=str(_TAGS_DB_PATH),
                         help=f"Path to market_tags.db (default: {_TAGS_DB_PATH})")
     args = parser.parse_args()
 
     if not _OPENAI_AVAILABLE:
-        print("ERROR: openai package is not installed.")
-        print("  Install with: pip install 'openai>=1.12.0,<2.0.0'")
-        sys.exit(1)
+        print("[INFO] openai package not installed — will use Ollama fallback only.")
+        print("  Install OpenAI with: pip install 'openai>=1.12.0,<2.0.0'")
 
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        print("ERROR: OPENAI_API_KEY environment variable is not set.")
-        sys.exit(1)
+        print("[INFO] OPENAI_API_KEY not set — will use Ollama fallback only.")
 
-    client = OpenAI(api_key=api_key)
+    openai_client: Optional["OpenAI"] = None
+    if _OPENAI_AVAILABLE and api_key:
+        openai_client = OpenAI(api_key=api_key)
+
+    ollama_model: str = args.ollama_model
+    if openai_client is None:
+        print(f"[INFO] Using Ollama model '{ollama_model}' at {_OLLAMA_BASE_URL}")
+
     db_path = Path(args.db)
 
     markets = _fetch_untagged_market_ids(args.limit, args.force)
@@ -304,7 +390,7 @@ def main() -> None:
             question = rec["question"] or market_id
             print(f"  [{i:3d}/{len(markets)}] {market_id[:20]:<20}  {question[:60]}")
 
-            tags = _tag_question_with_llm(client, question, model=args.model)
+            tags = _tag_question(question, openai_client, args.model, ollama_model)
             if tags is None:
                 print(f"            => FAILED — skipping")
                 failed_count += 1

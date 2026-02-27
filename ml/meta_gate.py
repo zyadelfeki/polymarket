@@ -4,7 +4,7 @@ Meta-Labeling Gate for Charlie trade signals.
 Architecture
 -----------
 A lightweight binary classifier (Logistic Regression by default, LightGBM when
-lgbm_available and >=500 labelled rows) trained on historical settled trades.
+lgbm_available and >=200 labelled rows) trained on historical settled trades.
 
 Label:  1 = final PnL > 0 after settlement   (TAKE the trade)
         0 = final PnL <= 0                    (SKIP the trade)
@@ -50,13 +50,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import logging
 import structlog
 import math
 import os
 import pickle
 import sqlite3
 import sys
+import threading
 import time
 import warnings
 from datetime import datetime, timezone
@@ -77,20 +77,40 @@ _DB_PATH    = _REPO_ROOT / "data" / "trading.db"
 
 # ---------------------------------------------------------------------------
 # Threshold: meta-gate rejects when P(take) < threshold.
-# 0.45 is intentionally conservative — only reject when the model is
-# meaningfully confident the trade is bad.  Reduces false-negatives on
-# small training sets.
+# Default 0.50; configurable via config_production.META_GATE_THRESHOLD.
+# Loaded at import time via a lazy import to avoid circular dependency.
 # ---------------------------------------------------------------------------
-_DEFAULT_THRESHOLD: float = 0.45
+def _load_threshold() -> float:
+    """Read META_GATE_THRESHOLD from config_production, falling back to 0.50."""
+    try:
+        import importlib
+        cfg = importlib.import_module("config_production")
+        return float(getattr(cfg, "META_GATE_THRESHOLD", 0.50))
+    except Exception:
+        return 0.50
+
+_DEFAULT_THRESHOLD: float = _load_threshold()
 
 # ---------------------------------------------------------------------------
 # Lazy model cache — loaded once on first call to should_trade().
-# None  → not yet attempted.
-# False → load was attempted but failed (fail-open mode).
-# Model object → loaded successfully.
+# Thread-safe: double-checked locking guards the disk-read on first access.
+#
+# _MODEL_CACHE states:
+#   _NOT_LOADED  → load not yet attempted (initial value).
+#   False        → load attempted but failed (fail-open mode).
+#   dict object  → loaded successfully.
 # ---------------------------------------------------------------------------
-_MODEL_CACHE: object = None          # Set by _load_model()
+_NOT_LOADED: object = object()       # Sentinel: distinguishes "never tried" from None
+_MODEL_CACHE: object = _NOT_LOADED   # Set by _get_model()
 _MODEL_LOAD_ATTEMPTED: bool = False  # Guard against repeated load attempts
+_model_load_lock = threading.Lock()  # Ensures exactly-once load under concurrency
+
+# ---------------------------------------------------------------------------
+# Session-level counters for get_session_meta_gate_stats()
+# ---------------------------------------------------------------------------
+_meta_gate_approved: int = 0
+_meta_gate_rejected: int = 0
+_meta_gate_errors: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +132,12 @@ def should_trade(features: dict) -> bool:
         Returns True if the model is unavailable, so trades are never silently
         blocked by an infrastructure failure.
     """
+    global _meta_gate_approved, _meta_gate_rejected, _meta_gate_errors
+
     model_bundle = _get_model()
     if model_bundle is None:
         # Fail-open: model unavailable → let the trade proceed.
+        _meta_gate_approved += 1
         return True
 
     try:
@@ -130,7 +153,12 @@ def should_trade(features: dict) -> bool:
 
         # predict_proba returns [[p_skip, p_take]]
         proba = model.predict_proba(X)[0, 1]
-        return float(proba) >= threshold
+        decision = float(proba) >= threshold
+        if decision:
+            _meta_gate_approved += 1
+        else:
+            _meta_gate_rejected += 1
+        return decision
 
     except Exception as exc:
         logger.warning(
@@ -139,6 +167,7 @@ def should_trade(features: dict) -> bool:
             error_type=type(exc).__name__,
             reason="fail_open",
         )
+        _meta_gate_errors += 1
         return True
 
 
@@ -160,6 +189,15 @@ def extract_features_from_opportunity(
     Designed to be called from the execution path (main.py) right after
     Charlie approves and OFI is resolved.  All parameters are optional with
     safe defaults so callers can pass only what they have.
+
+    ``rolling_pnl_z`` should be computed from the DB's settled trade history
+    before the current trade settles — specifically:
+
+        pnl_window = last N settled PnLs from order_tracking
+        rolling_pnl_z = (pnl_window[-1] - mean(pnl_window)) / (std(pnl_window) + 1e-9)
+
+    This matches the training feature exactly.  Passing None (the default)
+    substitutes 0.0, which is the neutral/unknown prior.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -279,14 +317,17 @@ def build_training_dataset(db_path: str = str(_DB_PATH)) -> Tuple[np.ndarray, np
 
         # Rolling stats
         rolling_win_rate = (sum(win_window[-WINDOW_WIN:]) / len(win_window)) if win_window else 0.5
+        # Compute z-score using only PREVIOUS window (before appending current
+        # pnl) so the current trade's PnL (== label) is never used as a feature.
+        # arr[-1] is the most-recent PREVIOUS trade's PnL.
         if len(pnl_window) >= 2:
             arr = np.array(pnl_window[-WINDOW_PNL:])
             mu, sigma = float(arr.mean()), float(arr.std()) + 1e-9
-            rolling_pnl_z = (pnl - mu) / sigma
+            rolling_pnl_z = (arr[-1] - mu) / sigma  # previous pnl vs window; no leak
         else:
             rolling_pnl_z = 0.0
 
-        # Update rolling windows AFTER computing features (no look-ahead)
+        # Append AFTER feature computation — no look-ahead
         pnl_window.append(pnl)
         win_window.append(label)
 
@@ -467,50 +508,81 @@ def train_and_persist(
 
 
 def _get_model() -> Optional[dict]:
-    """Load model from disk (once) and return the bundle, or None on failure."""
+    """
+    Load model from disk (once) and return the bundle, or None on failure.
+
+    Thread-safe via double-checked locking.  On the hot path (model already
+    loaded) there is no lock acquisition — only a single bool read.
+    """
     global _MODEL_CACHE, _MODEL_LOAD_ATTEMPTED
 
+    # Fast path: load already attempted (bool read is effectively atomic in CPython).
     if _MODEL_LOAD_ATTEMPTED:
-        return _MODEL_CACHE if _MODEL_CACHE is not False else None
+        return None if (_MODEL_CACHE is False or _MODEL_CACHE is _NOT_LOADED) else _MODEL_CACHE
 
-    _MODEL_LOAD_ATTEMPTED = True
+    # Slow path: first call — acquire lock then re-check (double-checked locking).
+    with _model_load_lock:
+        if _MODEL_LOAD_ATTEMPTED:
+            return None if (_MODEL_CACHE is False or _MODEL_CACHE is _NOT_LOADED) else _MODEL_CACHE
 
-    if not _MODEL_PATH.exists():
-        logger.warning(
-            "meta_gate_model_not_found",
-            path=str(_MODEL_PATH),
-            action="fail_open",
-            hint="Run: python -m ml.meta_gate --train  to create the model.",
-        )
-        _MODEL_CACHE = False
-        return None
+        # Mark attempted before any I/O so a failed load is never retried.
+        _MODEL_LOAD_ATTEMPTED = True
 
-    try:
-        with open(_MODEL_PATH, "rb") as fh:
-            bundle = pickle.load(fh)
-        # Basic schema check
-        required = {"model", "feature_names", "threshold"}
-        missing = required - set(bundle.keys())
-        if missing:
-            raise ValueError(f"model bundle missing keys: {missing}")
-        _MODEL_CACHE = bundle
-        logger.info(
-            "meta_gate_model_loaded",
-            path=str(_MODEL_PATH),
-            trained_at=bundle.get("trained_at", "unknown"),
-            auc=bundle.get("metrics", {}).get("auc", "unknown"),
-            threshold=bundle.get("threshold"),
-        )
-        return bundle
-    except Exception as exc:
-        logger.warning(
-            "meta_gate_model_load_failed",
-            path=str(_MODEL_PATH),
-            error=str(exc),
-            action="fail_open",
-        )
-        _MODEL_CACHE = False
-        return None
+        if not _MODEL_PATH.exists():
+            logger.warning(
+                "meta_gate_model_not_found",
+                path=str(_MODEL_PATH),
+                action="fail_open",
+                hint="Run: python -m ml.meta_gate --train  to create the model.",
+            )
+            _MODEL_CACHE = False
+            return None
+
+        try:
+            with open(_MODEL_PATH, "rb") as fh:
+                bundle = pickle.load(fh)
+            # Basic schema check
+            required = {"model", "feature_names", "threshold"}
+            missing = required - set(bundle.keys())
+            if missing:
+                raise ValueError(f"model bundle missing keys: {missing}")
+            _MODEL_CACHE = bundle
+            logger.info(
+                "meta_gate_model_loaded",
+                path=str(_MODEL_PATH),
+                trained_at=bundle.get("trained_at", "unknown"),
+                auc=bundle.get("metrics", {}).get("auc", "unknown"),
+                threshold=bundle.get("threshold"),
+            )
+            return bundle
+        except Exception as exc:
+            logger.warning(
+                "meta_gate_model_load_failed",
+                path=str(_MODEL_PATH),
+                error=str(exc),
+                action="fail_open",
+            )
+            _MODEL_CACHE = False
+            return None
+
+
+def get_session_meta_gate_stats() -> Dict:
+    """
+    Return a snapshot of meta-gate approve/reject/error counts for the current
+    session, suitable for check_session.py output.
+
+    Counters are module-level ints incremented by should_trade().  They are
+    never reset during a session; restart resets them via module re-import.
+    """
+    total = _meta_gate_approved + _meta_gate_rejected
+    approve_rate = round(_meta_gate_approved / total, 4) if total > 0 else None
+    return {
+        "approved":    _meta_gate_approved,
+        "rejected":    _meta_gate_rejected,
+        "errors":      _meta_gate_errors,
+        "total":       total,
+        "approve_rate": approve_rate,
+    }
 
 
 def _dict_to_array(features: dict, feature_names: List[str]) -> np.ndarray:
@@ -572,17 +644,13 @@ def _compute_ece(proba: np.ndarray, labels: np.ndarray, n_bins: int = 10) -> flo
 
 
 def _main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-
+    # structlog auto-configures on first use; no basicConfig needed.
     parser = argparse.ArgumentParser(description="Train the meta-gate classifier.")
     parser.add_argument("--train",  action="store_true", help="Train and persist model.")
     parser.add_argument("--db",     default=str(_DB_PATH), help="Path to trading.db.")
     parser.add_argument("--model",  default=str(_MODEL_PATH), help="Output model path.")
     parser.add_argument("--threshold", type=float, default=_DEFAULT_THRESHOLD,
-                        help="Classification threshold (default=0.45).")
+                        help="Classification threshold (default=0.50).")
     parser.add_argument("--lgbm",   action="store_true",
                         help="Use LightGBM instead of Logistic Regression.")
     parser.add_argument("--dry-run", action="store_true",

@@ -40,16 +40,16 @@ Public API
 
 from __future__ import annotations
 
-import logging
 import math
 import os
 import pickle
+import structlog
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 _REPO_ROOT  = Path(__file__).resolve().parent.parent
 _MODEL_PATH = _REPO_ROOT / "models" / "ofi_policy.pkl"
@@ -136,7 +136,7 @@ def choose_execution_action(features: dict) -> Tuple[int, dict]:
 
 
 def log_ofi_action(
-    log: logging.Logger,
+    log: Any,
     market_id: str,
     action: int,
     features: dict,

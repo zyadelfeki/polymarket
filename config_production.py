@@ -237,3 +237,12 @@ GLOBAL_RISK_BUDGET: dict = {
     # at this capital level ($13.98 → 5% cap = $0.70, which passes $0.50).
     "min_tradeable_usdc": Decimal("0.50"),
 }
+
+# ---------------------------------------------------------------------------
+# ML / meta-gate configuration
+# ---------------------------------------------------------------------------
+# Minimum predicted P(take) required for the meta-gate to approve a trade.
+# 0.50 is the calibrated default for cold-start (< 200 settled trades).
+# Raise towards 0.55-0.60 once the model accumulates >500 labelled samples
+# and calibration ECE improves.
+META_GATE_THRESHOLD: float = 0.50

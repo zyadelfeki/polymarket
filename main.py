@@ -234,7 +234,8 @@ class TradingSystem:
         # Session 2: dynamic regime state — updated every ~60 s by
         # _periodic_maintenance.  Used to scale Kelly size per-regime without
         # rewriting config files or reinitialising the KellySizer.
-        self._dynamic_regime: str = "calm"
+        # None = classifier not yet initialised; first maintenance tick sets it.
+        self._dynamic_regime: Optional[str] = None
         self._dynamic_regime_ts: float = 0.0   # monotonic; gate against rapid updates
         self.init_timeout_seconds = float(startup_config.get('component_timeout_seconds', 25.0))
         self.network_timeout_seconds = float(startup_config.get('network_timeout_seconds', 20.0))
@@ -891,25 +892,29 @@ class TradingSystem:
             charlie_conf_dec = Decimal(str(charlie_rec.confidence))
             charlie_regime = charlie_rec.regime
 
-            # --- Regime-based position-size multiplier ----------------------
-            # Scale down (or up) Kelly size according to the detected technical
-            # regime.  HIGH_VOL → 50% of Kelly; etc.  UNKNOWN means we didn't
-            # have enough features to classify — pass-through at 1.0× rather
-            # than penalising the trade.  Never allows the multiplier to INCREASE
-            # size beyond the hard Kelly cap.
-            technical_regime = getattr(charlie_rec, "technical_regime", "UNKNOWN")
-            regime_mult = REGIME_RISK_OVERRIDES.get(technical_regime, Decimal("1.0"))
-            regime_mult = min(regime_mult, Decimal("1.0"))  # cap at 1× regardless of config
-            if regime_mult < Decimal("1.0"):
-                quantity = quantize_quantity(quantity * regime_mult)
-                order_value = quantize_quantity(quantity * price)
-                logger.info(
-                    "regime_size_adjustment",
-                    market_id=market_id,
-                    technical_regime=technical_regime,
-                    multiplier=str(regime_mult),
-                    adjusted_order_value=str(order_value),
-                )
+            # --- Regime-based position-size multiplier (fallback only) -----
+            # The new dynamic regime classifier (utils.regime_classifier) runs
+            # every ~60 s and produces its own Kelly multiplier below.
+            # This old REGIME_RISK_OVERRIDES path is kept ONLY as a fallback for
+            # the window before the dynamic classifier has produced its first
+            # result (self._dynamic_regime is None).
+            # When the dynamic classifier is active, do NOT apply BOTH multipliers
+            # — they would compound and could breach the portfolio risk cap.
+            if self._dynamic_regime is None:
+                technical_regime = getattr(charlie_rec, "technical_regime", "UNKNOWN")
+                regime_mult = REGIME_RISK_OVERRIDES.get(technical_regime, Decimal("1.0"))
+                regime_mult = min(regime_mult, Decimal("1.0"))  # cap at 1× regardless of config
+                if regime_mult < Decimal("1.0"):
+                    quantity = quantize_quantity(quantity * regime_mult)
+                    order_value = quantize_quantity(quantity * price)
+                    logger.info(
+                        "regime_size_adjustment",
+                        market_id=market_id,
+                        technical_regime=technical_regime,
+                        multiplier=str(regime_mult),
+                        adjusted_order_value=str(order_value),
+                        source="REGIME_RISK_OVERRIDES_fallback",
+                    )
 
             # --- Global + per-market risk budget check ----------------------
             # Refresh the portfolio snapshot so we have an up-to-date view
@@ -1005,10 +1010,10 @@ class TradingSystem:
             # the baseline KELLY_CONFIG value so trade size shrinks in event/high-vol
             # regimes and expands modestly in confirmed trend regimes.
             #
-            # NOTE: this multiplier applies AFTER the Charlie technical-regime
-            # multiplier (REGIME_RISK_OVERRIDES, line ~907) so the effects compound.
-            # For example: Charlie HIGH_VOL (×0.5) + dynamic 'event' (×0.4) = ×0.2.
-            # This is intentional — both sources independently signal high risk.
+            # This multiplier REPLACES the old REGIME_RISK_OVERRIDES multiplier once
+            # the dynamic classifier has produced its first result (_dynamic_regime is
+            # not None).  The old override acts as a pre-init fallback only (above).
+            # The two multipliers therefore NEVER compound.
             _dyn_regime = self._dynamic_regime or "calm"
             _regime_cfg = REGIME_RISK_CONFIG.get(_dyn_regime, REGIME_RISK_CONFIG["calm"])
             _default_kelly_frac = Decimal(str(KELLY_CONFIG.get("fractional_kelly", "0.25")))

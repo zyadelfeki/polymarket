@@ -31,6 +31,7 @@ def _reset_regime_state(mod):
         mod._candidate_regime    = "calm"
         mod._candidate_count     = 0
         mod._regime_durations    = {r: 0.0 for r in mod.REGIMES}
+        mod._regime_change_count = 0      # added FIX-6: reset explicit transition counter
 
 
 # ---------------------------------------------------------------------------
@@ -311,3 +312,26 @@ class TestRateLimit:
         rc._apply_rate_limit("trend_down")  # commits
 
         assert rc.get_current_regime() == "trend_down"
+
+    def test_regime_changes_counter_increments_on_commit(self):
+        """
+        get_session_regime_stats()["regime_changes"] must count the number of
+        actual committed transitions, not the number of regimes that have
+        nonzero duration (the pre-FIX-6 bug).
+        """
+        import utils.regime_classifier as rc
+        _reset_regime_state(rc)
+
+        stats_before = rc.get_session_regime_stats()
+        assert stats_before["regime_changes"] == 0, "should start at 0 after reset"
+
+        # Commit first transition: calm → event
+        rc._apply_rate_limit("event")
+        rc._apply_rate_limit("event")   # count=2, dwell_ok → commits
+        stats_after_1 = rc.get_session_regime_stats()
+        assert stats_after_1["regime_changes"] == 1
+        assert stats_after_1["current_regime"] == "event"
+
+        # Stay in event (no change) — counter must not move
+        rc._apply_rate_limit("event")
+        assert rc.get_session_regime_stats()["regime_changes"] == 1

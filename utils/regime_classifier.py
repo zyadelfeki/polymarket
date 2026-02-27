@@ -39,10 +39,10 @@ Public API
 
 from __future__ import annotations
 
-import logging
 import math
 import os
 import pickle
+import structlog
 import threading
 import time
 from pathlib import Path
@@ -50,7 +50,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 _REPO_ROOT  = Path(__file__).resolve().parent.parent
 _MODEL_PATH = _REPO_ROOT / "models" / "regime_kmeans.pkl"
@@ -74,6 +74,7 @@ _candidate_regime: str = _DEFAULT_REGIME # pending regime (must repeat before co
 _candidate_count: int = 0
 _regime_durations: Dict[str, float] = {r: 0.0 for r in REGIMES}  # cumulative seconds
 _session_start_ts: float = time.monotonic()
+_regime_change_count: int = 0             # counts actual committed regime transitions
 
 # ---------------------------------------------------------------------------
 # KMeans model cache
@@ -146,7 +147,7 @@ def get_session_regime_stats() -> Dict:
         return {
             "current_regime": _current_regime,
             "time_in_regime_pct": pcts,
-            "regime_changes": sum(1 for s in _regime_durations.values() if s > 0),
+            "regime_changes": _regime_change_count,
         }
 
 
@@ -377,6 +378,7 @@ def _apply_rate_limit(prediction: str) -> str:
 
         if dwell_ok and count_ok:
             # Commit regime change
+            global _regime_change_count
             old_regime = _current_regime
             _regime_durations[old_regime] = (
                 _regime_durations.get(old_regime, 0.0) + dwell_elapsed
@@ -384,12 +386,12 @@ def _apply_rate_limit(prediction: str) -> str:
             _current_regime    = prediction
             _current_regime_ts = now_ts
             _candidate_count   = 0
+            _regime_change_count += 1
             logger.info(
                 "regime_changed",
                 old_regime=old_regime,
                 new_regime=prediction,
                 dwell_elapsed_s=round(dwell_elapsed, 1),
-                event="regime_changed",
             )
             return prediction
 

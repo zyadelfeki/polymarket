@@ -1,0 +1,287 @@
+....FF...............F...............E................FFss.............. [ 34%]
+...........................................F............................ [ 69%]
+................F.F.FF.............................FF.F.......           [100%]
+=================================== ERRORS ====================================
+_________ ERROR at setup of test_idempotency_persists_across_restart __________
+.venv\Lib\site-packages\pytest_asyncio\plugin.py:458: in setup
+    return super().setup()
+           ^^^^^^^^^^^^^^^
+.venv\Lib\site-packages\pytest_asyncio\plugin.py:728: in pytest_fixture_setup
+    return (yield)
+            ^^^^^
+E   pytest.PytestRemovedIn9Warning: 'test_idempotency_persists_across_restart' requested an async fixture 'cleanup_after_test' with autouse=True, with no plugin or hook that handled it. This is usually an error, as pytest does not natively support it. This will turn into an error in pytest 9.
+E   See: https://docs.pytest.org/en/stable/deprecations.html#sync-test-depending-on-async-fixture
+================================== FAILURES ===================================
+__________________ test_arbitrage_scanner_finds_opportunity ___________________
+tests\test_arb_engine.py:62: in test_arbitrage_scanner_finds_opportunity
+    assert len(opportunities) >= 1
+E   assert 0 >= 1
+E    +  where 0 = len([])
+____________________ test_execute_arbitrage_returns_result ____________________
+tests\test_arb_engine.py:82: in test_execute_arbitrage_returns_result
+    result = await engine.execute_arbitrage(opportunities[0])
+                                            ^^^^^^^^^^^^^^^^
+E   IndexError: list index out of range
+_____________ test_decimal_precision_in_sizing_max_cap_respected ______________
+tests\test_critical_paths_only.py:43: in test_decimal_precision_in_sizing_max_cap_respected
+    assert result.size <= max_allowed
+E   AssertionError: assert Decimal('2.79') <= Decimal('0.6990')
+E    +  where Decimal('2.79') = BetSizeResult(size=Decimal('2.79'), kelly_fraction=Decimal('0.80'), effective_fraction=Decimal('0.800'), capped_reason=None, warnings=['Capped at max bet: 20.0%'], mode='aggressive', adjusted=False, risk_warning=None).size
+_________________________ test_end_to_end_trade_flow __________________________
+tests\test_integration_v2.py:516: in test_end_to_end_trade_flow
+    assert result.success is True
+E   AssertionError: assert False is True
+E    +  where False = {'success': False, 'order_id': 'order_12345', 'status': <OrderStatus.FAILED: 'failed'>, 'filled_quantity': 0, 'filled_... '77ce9715-de2d-54c6-be84-f0608fc15df0', 'is_duplicate': False, 'slippage_bps': Decimal('0'), 'execution_time_ms': 0.0}.success
+---------------------------- Captured stdout setup ----------------------------
+2026-02-28 00:18:44 [info     ] async_ledger_initialized       cache_ttl=5 db_path=C:\Users\zyade\AppData\Local\Temp\tmpe0sntjr_.db pool_size=3
+2026-02-28 00:18:44 [info     ] schema_loaded_from_file        schema_path=C:\Users\zyade\polymarket\database\schema.sql schema_size=6285
+2026-02-28 00:18:44 [info     ] initializing_database_schema   db_path=C:\Users\zyade\AppData\Local\Temp\tmpe0sntjr_.db schema_source=file
+2026-02-28 00:18:45 [info     ] database_schema_initialized    db_path=C:\Users\zyade\AppData\Local\Temp\tmpe0sntjr_.db schema_source=file tables=['accounts', 'audit_log', 'idempotency_log', 'order_tracking', 'positions', 'schema_version', 'sqlite_sequence', 'transaction_lines', 'transactions']
+2026-02-28 00:18:45 [info     ] creating_connection_pool       pool_size=3
+2026-02-28 00:18:45 [debug    ] connection_0_added             table_count=9
+2026-02-28 00:18:45 [debug    ] connection_1_added             table_count=9
+2026-02-28 00:18:45 [debug    ] connection_2_added             table_count=9
+2026-02-28 00:18:45 [info     ] connection_pool_initialized    db_path=C:\Users\zyade\AppData\Local\Temp\tmpe0sntjr_.db pool_size=3
+---------------------------- Captured stdout call -----------------------------
+2026-02-28 00:18:45 [info     ] execution_service_initialized  max_retries=3 paper_trading=False timeout_seconds=Decimal('30')
+2026-02-28 00:18:45 [info     ] execution_service_started
+2026-02-28 00:18:45 [info     ] fill_monitor_started
+2026-02-28 00:18:45 [info     ] cleanup_loop_started
+2026-02-28 00:18:45 [error    ] slippage_violation             correlation_id=05890ac6-03be-4082-8863-9259aa7bcb15 fill_price=0.55 max_slippage_bps=50 order_id=order_12345 target_price=0.6000
+2026-02-28 00:18:45 [info     ] execution_service_stopped
+2026-02-28 00:18:45 [info     ] fill_monitor_stopped
+2026-02-28 00:18:45 [info     ] cleanup_loop_stopped
+-------------------------- Captured stdout teardown ---------------------------
+2026-02-28 00:18:45 [info     ] connection_pool_closed
+2026-02-28 00:18:45 [info     ] async_ledger_closed            cache_hit_rate=0.0 queries_executed=5
+_______________________ test_concurrent_order_placement _______________________
+tests\test_integration_v2.py:565: in test_concurrent_order_placement
+    assert all(r.success for r in results)
+E   assert False
+E    +  where False = all(<generator object test_concurrent_order_placement.<locals>.<genexpr> at 0x00000200C795E2C0>)
+---------------------------- Captured stdout setup ----------------------------
+2026-02-28 00:18:45 [info     ] async_ledger_initialized       cache_ttl=5 db_path=C:\Users\zyade\AppData\Local\Temp\tmpz5hkttoz.db pool_size=3
+2026-02-28 00:18:45 [info     ] schema_loaded_from_file        schema_path=C:\Users\zyade\polymarket\database\schema.sql schema_size=6285
+2026-02-28 00:18:45 [info     ] initializing_database_schema   db_path=C:\Users\zyade\AppData\Local\Temp\tmpz5hkttoz.db schema_source=file
+2026-02-28 00:18:45 [info     ] database_schema_initialized    db_path=C:\Users\zyade\AppData\Local\Temp\tmpz5hkttoz.db schema_source=file tables=['accounts', 'audit_log', 'idempotency_log', 'order_tracking', 'positions', 'schema_version', 'sqlite_sequence', 'transaction_lines', 'transactions']
+2026-02-28 00:18:45 [info     ] creating_connection_pool       pool_size=3
+2026-02-28 00:18:45 [debug    ] connection_0_added             table_count=9
+2026-02-28 00:18:45 [debug    ] connection_1_added             table_count=9
+2026-02-28 00:18:45 [debug    ] connection_2_added             table_count=9
+2026-02-28 00:18:45 [info     ] connection_pool_initialized    db_path=C:\Users\zyade\AppData\Local\Temp\tmpz5hkttoz.db pool_size=3
+---------------------------- Captured stdout call -----------------------------
+2026-02-28 00:18:45 [info     ] execution_service_initialized  max_retries=3 paper_trading=False timeout_seconds=Decimal('30')
+2026-02-28 00:18:45 [info     ] execution_service_started
+2026-02-28 00:18:45 [info     ] fill_monitor_started
+2026-02-28 00:18:45 [info     ] cleanup_loop_started
+2026-02-28 00:18:45 [error    ] slippage_violation             correlation_id=2cf2f7c9-ec1c-4502-bcfd-5d0ca55c3b43 fill_price=0.55 max_slippage_bps=50 order_id=order_12345 target_price=0.5000
+2026-02-28 00:18:45 [error    ] slippage_violation             correlation_id=cba49b2b-3968-495e-9401-302036ff95f5 fill_price=0.55 max_slippage_bps=50 order_id=order_12345 target_price=0.5000
+2026-02-28 00:18:45 [error    ] slippage_violation             correlation_id=fb576e5c-84b0-4c58-b650-5533da67fe72 fill_price=0.55 max_slippage_bps=50 order_id=order_12345 target_price=0.5000
+2026-02-28 00:18:45 [error    ] slippage_violation             correlation_id=ba362369-c4ba-445f-9f06-551c06f78fa8 fill_price=0.55 max_slippage_bps=50 order_id=order_12345 target_price=0.5000
+2026-02-28 00:18:45 [warning  ] slow_query                     query=
+            INSERT OR IGNORE INTO idempotency_log (
+                idempotency_key, order_id, corr time_ms=102.46777534484863
+2026-02-28 00:18:45 [error    ] slippage_violation             correlation_id=69b3eafc-0855-40cb-be1a-de73e21b7c2a fill_price=0.55 max_slippage_bps=50 order_id=order_12345 target_price=0.5000
+2026-02-28 00:18:45 [info     ] execution_service_stopped
+2026-02-28 00:18:45 [info     ] fill_monitor_stopped
+2026-02-28 00:18:45 [info     ] cleanup_loop_stopped
+-------------------------- Captured stdout teardown ---------------------------
+2026-02-28 00:18:45 [info     ] connection_pool_closed
+2026-02-28 00:18:45 [info     ] async_ledger_closed            cache_hit_rate=0.0 queries_executed=25
+_______________ TestLedger.test_trade_exit_transaction_balances _______________
+tests\test_ledger.py:124: in test_trade_exit_transaction_balances
+    self.assertEqual(total, Decimal('0.00'), "Trade exit transaction must balance")
+E   AssertionError: Decimal('-2.886579864025407E-15') != Decimal('0.00') : Trade exit transaction must balance
+_____________ TestRateLimit.test_first_call_commits_from_startup ______________
+tests\test_regime_classifier.py:229: in test_first_call_commits_from_startup
+    r2 = rc._apply_rate_limit("event")
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+utils\regime_classifier.py:390: in _apply_rate_limit
+    logger.info(
+E   TypeError: _make_filtering_bound_logger.<locals>.make_method.<locals>.meth() got multiple values for argument 'event'
+_____________ TestRateLimit.test_same_as_current_resets_candidate _____________
+tests\test_regime_classifier.py:262: in test_same_as_current_resets_candidate
+    r2 = rc._apply_rate_limit("trend_up")  # count = 2
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+utils\regime_classifier.py:390: in _apply_rate_limit
+    logger.info(
+E   TypeError: _make_filtering_bound_logger.<locals>.make_method.<locals>.meth() got multiple values for argument 'event'
+__________ TestRateLimit.test_dwell_blocks_transition_if_too_recent ___________
+tests\test_regime_classifier.py:296: in test_dwell_blocks_transition_if_too_recent
+    rc._apply_rate_limit("event")  # committed
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+utils\regime_classifier.py:390: in _apply_rate_limit
+    logger.info(
+E   TypeError: _make_filtering_bound_logger.<locals>.make_method.<locals>.meth() got multiple values for argument 'event'
+______________ TestRateLimit.test_get_current_regime_consistent _______________
+tests\test_regime_classifier.py:311: in test_get_current_regime_consistent
+    rc._apply_rate_limit("trend_down")  # commits
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+utils\regime_classifier.py:390: in _apply_rate_limit
+    logger.info(
+E   TypeError: _make_filtering_bound_logger.<locals>.make_method.<locals>.meth() got multiple values for argument 'event'
+_____________________ test_scan_opportunities_early_exits _____________________
+tests\test_strategy_signal_generation.py:101: in test_scan_opportunities_early_exits
+    assert await strategy.scan_opportunities() is None
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+strategies\latency_arbitrage_btc.py:403: in scan_opportunities
+    asset_prices[_sym] = await self._get_asset_price(_sym)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+strategies\latency_arbitrage_btc.py:1734: in _get_asset_price
+    return Decimal(str(price))
+           ^^^^^^^^^^^^^^^^^^^
+E   decimal.InvalidOperation: [<class 'decimal.ConversionSyntax'>]
+_________________ test_scan_opportunities_returns_first_found _________________
+tests\test_strategy_signal_generation.py:124: in test_scan_opportunities_returns_first_found
+    result = await strategy.scan_opportunities()
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+strategies\latency_arbitrage_btc.py:403: in scan_opportunities
+    asset_prices[_sym] = await self._get_asset_price(_sym)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+strategies\latency_arbitrage_btc.py:1734: in _get_asset_price
+    return Decimal(str(price))
+           ^^^^^^^^^^^^^^^^^^^
+E   decimal.InvalidOperation: [<class 'decimal.ConversionSyntax'>]
+_____________________ test_bullish_signal_buys_yes_token ______________________
+tests\test_token_direction.py:37: in test_bullish_signal_buys_yes_token
+    assert signal is not None, "Should detect bullish opportunity"
+E   AssertionError: Should detect bullish opportunity
+E   assert None is not None
+============================== warnings summary ===============================
+.venv\Lib\site-packages\websockets\legacy\__init__.py:6
+  C:\Users\zyade\polymarket\.venv\Lib\site-packages\websockets\legacy\__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+validation\models.py:321
+  C:\Users\zyade\polymarket\validation\models.py:321: PydanticDeprecatedSince20: `min_items` is deprecated and will be removed, use `min_length` instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.12/migration/
+    lines: List[Dict[str, Any]] = Field(..., min_items=2)
+
+validation\models.py:347
+  C:\Users\zyade\polymarket\validation\models.py:347: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.12/migration/
+    class TradingConfig(BaseSettings):
+
+validation\models.py:402
+  C:\Users\zyade\polymarket\validation\models.py:402: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.12/migration/
+    class APICredentials(BaseSettings):
+
+tests/manual_idempotency_test.py: 2 warnings
+tests/test_balance_fetch.py: 2 warnings
+tests/test_decimal_precision.py: 2 warnings
+tests/test_integration_v2.py: 9 warnings
+tests/test_order_execution.py: 4 warnings
+  C:\Users\zyade\polymarket\services\network_health.py:75: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    last_successful_api_call=datetime.utcnow(),
+
+tests/manual_idempotency_test.py: 1 warning
+tests/test_decimal_precision.py: 1 warning
+tests/test_integration_v2.py: 16 warnings
+  C:\Users\zyade\polymarket\services\network_health.py:80: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    self.state.last_successful_api_call = datetime.utcnow()
+
+tests/test_arb_engine.py::test_arbitrage_scanner_finds_opportunity
+  C:\Users\zyade\polymarket\.venv\Lib\site-packages\_pytest\threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-5 (_connection_worker_thread)
+  
+  Traceback (most recent call last):
+    File "C:\Users\zyade\polymarket\.venv\Lib\site-packages\aiosqlite\core.py", line 66, in _connection_worker_thread
+      future.get_loop().call_soon_threadsafe(set_result, future, result)
+      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "C:\Users\zyade\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 878, in call_soon_threadsafe
+      self._check_closed()
+      ~~~~~~~~~~~~~~~~~~^^
+    File "C:\Users\zyade\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 556, in _check_closed
+      raise RuntimeError('Event loop is closed')
+  RuntimeError: Event loop is closed
+  
+  During handling of the above exception, another exception occurred:
+  
+  Traceback (most recent call last):
+    File "C:\Users\zyade\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1043, in _bootstrap_inner
+      self.run()
+      ~~~~~~~~^^
+    File "C:\Users\zyade\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 994, in run
+      self._target(*self._args, **self._kwargs)
+      ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "C:\Users\zyade\polymarket\.venv\Lib\site-packages\aiosqlite\core.py", line 75, in _connection_worker_thread
+      future.get_loop().call_soon_threadsafe(set_exception, future, e)
+      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "C:\Users\zyade\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 878, in call_soon_threadsafe
+      self._check_closed()
+      ~~~~~~~~~~~~~~~~~~^^
+    File "C:\Users\zyade\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 556, in _check_closed
+      raise RuntimeError('Event loop is closed')
+  RuntimeError: Event loop is closed
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+tests/test_bankroll_tracker.py::test_record_trade_profit_and_loss_updates
+tests/test_bankroll_tracker.py::test_record_trade_profit_and_loss_updates
+tests/test_bankroll_tracker.py::test_available_capital_total_return_and_win_rate
+tests/test_bankroll_tracker.py::test_available_capital_total_return_and_win_rate
+tests/test_bankroll_tracker.py::test_available_capital_total_return_and_win_rate
+tests/test_bankroll_tracker.py::test_sharpe_ratio_and_stats_bundle
+tests/test_bankroll_tracker.py::test_sharpe_ratio_and_stats_bundle
+tests/test_bankroll_tracker.py::test_sharpe_ratio_and_stats_bundle
+tests/test_bankroll_tracker.py::test_print_summary_smoke
+  C:\Users\zyade\polymarket\risk\bankroll_tracker.py:43: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    "timestamp": datetime.utcnow(),
+
+tests/test_integration_v2.py::test_execution_service_place_order
+tests/test_integration_v2.py::test_execution_service_invalid_order
+tests/test_integration_v2.py::test_execution_service_metrics
+tests/test_integration_v2.py::test_end_to_end_trade_flow
+tests/test_integration_v2.py::test_concurrent_order_placement
+tests/test_integration_v2.py::test_concurrent_order_placement
+tests/test_integration_v2.py::test_concurrent_order_placement
+tests/test_integration_v2.py::test_concurrent_order_placement
+tests/test_integration_v2.py::test_concurrent_order_placement
+  C:\Users\zyade\polymarket\services\network_health.py:90: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    elapsed = (datetime.utcnow() - self.state.last_successful_api_call).total_seconds()
+
+tests/test_kelly_sizing.py: 4 warnings
+tests/test_latency_arbitrage_btc.py: 3 warnings
+tests/test_main_signal_execution.py: 3 warnings
+  C:\Users\zyade\polymarket\utils\decimal_helpers.py:43: UserWarning: float_to_decimal_conversion_detected
+    return safe_decimal(value)
+
+tests/test_ledger.py: 14 warnings
+  C:\Users\zyade\polymarket\database\ledger.py:298: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    datetime.utcnow().isoformat(),
+
+tests/test_ledger.py: 14 warnings
+  C:\Users\zyade\polymarket\database\ledger.py:299: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    datetime.utcnow().isoformat(),
+
+tests/test_ledger.py::TestLedger::test_transaction_timestamp_recorded
+  C:\Users\zyade\polymarket\tests\test_ledger.py:440: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    time_diff = (datetime.utcnow() - txn_time).total_seconds()
+
+tests/test_news_monitor.py::test_parse_rss_tweets
+tests/test_news_monitor.py::test_parse_rss_tweets
+tests/test_news_monitor.py::test_analyze_tweet_generates_alert
+tests/test_news_monitor.py::test_analyze_tweet_generates_alert
+  C:\Users\zyade\polymarket\data_feeds\news_monitor_v1.py:328: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    self.last_update = datetime.utcnow()
+
+tests/test_news_monitor.py::test_analyze_tweet_generates_alert
+  C:\Users\zyade\polymarket\tests\test_news_monitor.py:32: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    timestamp=datetime.utcnow(),
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_arb_engine.py::test_arbitrage_scanner_finds_opportunity - a...
+FAILED tests/test_arb_engine.py::test_execute_arbitrage_returns_result - Inde...
+FAILED tests/test_critical_paths_only.py::test_decimal_precision_in_sizing_max_cap_respected
+FAILED tests/test_integration_v2.py::test_end_to_end_trade_flow - AssertionEr...
+FAILED tests/test_integration_v2.py::test_concurrent_order_placement - assert...
+FAILED tests/test_ledger.py::TestLedger::test_trade_exit_transaction_balances
+FAILED tests/test_regime_classifier.py::TestRateLimit::test_first_call_commits_from_startup
+FAILED tests/test_regime_classifier.py::TestRateLimit::test_same_as_current_resets_candidate
+FAILED tests/test_regime_classifier.py::TestRateLimit::test_dwell_blocks_transition_if_too_recent
+FAILED tests/test_regime_classifier.py::TestRateLimit::test_get_current_regime_consistent
+FAILED tests/test_strategy_signal_generation.py::test_scan_opportunities_early_exits
+FAILED tests/test_strategy_signal_generation.py::test_scan_opportunities_returns_first_found
+FAILED tests/test_token_direction.py::test_bullish_signal_buys_yes_token - As...
+ERROR tests/test_idempotency.py::test_idempotency_persists_across_restart - p...
+13 failed, 190 passed, 2 skipped, 104 warnings, 1 error in 50.25s
