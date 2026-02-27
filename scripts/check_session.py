@@ -367,11 +367,11 @@ if _cal_csv.exists():
         print(f"  Uncalibrated ECE: {_ece:.4f}")
         print(f"  Avg p_win_raw: {_avg_p:.4f}  |  Actual win rate: {_win_rate:.4f}")
     if _cal_n >= 100:
-        print(f"  ✓ CALIBRATION READY — run: python scripts/fit_calibration.py")
+        print(f"  [READY] CALIBRATION READY -- run: python scripts/fit_calibration.py")
     else:
         _remaining = 100 - _cal_n
-        print(f"  ⏳ Need {_remaining} more samples before fitting (target: 100)")
-        print(f"     At ~20-30 settlements/day → ~{max(1, _remaining // 25)} more days")
+        print(f"  [..] Need {_remaining} more samples before fitting (target: 100)")
+        print(f"     At ~20-30 settlements/day -> ~{max(1, _remaining // 25)} more days")
 else:
     print("  (no calibration data yet — run: python scripts/build_calibration_dataset.py)")
 
