@@ -93,6 +93,40 @@ def _load_threshold() -> float:
 
 _DEFAULT_THRESHOLD: float = _load_threshold()
 
+
+def reload_model() -> None:
+    """
+    Reset the model cache so the next ``should_trade()`` call re-reads the
+    model from disk.  Use this after retraining (``python -m ml.meta_gate
+    --train``) without restarting the bot process.
+
+    Thread-safe: acquires ``_model_load_lock`` before mutating cache globals.
+    """
+    global _MODEL_CACHE, _MODEL_LOAD_ATTEMPTED
+    with _model_load_lock:
+        _MODEL_CACHE = _NOT_LOADED
+        _MODEL_LOAD_ATTEMPTED = False
+    logger.info("meta_gate_model_cache_reset")
+
+
+def set_threshold(value: float) -> None:
+    """
+    Update the global default classification threshold at runtime.
+
+    Useful for tightening the gate in a bad regime without restarting the bot.
+    The new threshold only applies to trades evaluated *after* this call;
+    ongoing inference in-flight is not affected.
+
+    Parameters
+    ----------
+    value:
+        New threshold in [0.0, 1.0].  Values outside the range are clamped.
+    """
+    global _DEFAULT_THRESHOLD
+    _DEFAULT_THRESHOLD = max(0.0, min(1.0, float(value)))
+    logger.info("meta_gate_threshold_updated", new_threshold=_DEFAULT_THRESHOLD)
+
+
 # ---------------------------------------------------------------------------
 # Lazy model cache — loaded once on first call to should_trade().
 # Thread-safe: double-checked locking guards the disk-read on first access.
@@ -653,9 +687,10 @@ def _parse_notes_field(notes: str, field: str, default: float) -> float:
     """
     # Map display name → aliases used in notes
     aliases = {
-        "edge":    ["edge=", "net_edge="],
-        "implied": ["implied=", "implied_prob="],
-        "fee":     ["fee="],
+        "edge":         ["edge=", "net_edge="],
+        "implied":      ["implied=", "implied_prob="],
+        "fee":          ["fee="],
+        "tech_regime":  ["tech_regime=", "technical_regime="],
     }
     for alias in aliases.get(field, [f"{field}="]):
         idx = notes.find(alias)

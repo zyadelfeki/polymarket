@@ -448,7 +448,7 @@ class CharliePredictionGate:
             f"charlie_signal side={side} p_win={effective_p_win:.3f} "
             f"implied={implied_prob:.3f} edge={edge:.3f} "
             f"fee={_fee:.4f} "
-            f"conf={confidence:.3f} regime={regime}"
+            f"conf={confidence:.3f} regime={regime} tech_regime={technical_regime}"
         )
 
         # --- 7. OFI confirmation / conflict filter --------------------------

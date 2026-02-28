@@ -214,11 +214,18 @@ async def _get_rolling_features(
     if not rows:
         return 0.5, 0.0
 
-    pnls = [float(r["pnl"]) for r in rows]
+    pnls = [float(r["pnl"] if isinstance(r, dict) else r[0]) for r in rows]
 
-    # rolling_win_rate using the most recent n_win trades
+    # rolling_win_rate: require a minimum sample count before trusting the rate.
+    # Below WIN_MIN_SAMPLE trades the estimate is too noisy — hold at 0.5 neutral
+    # so it doesn't bias the meta-gate with an extreme 0.0 or 1.0 prior.
+    WIN_MIN_SAMPLE = 5
     win_slice = pnls[:n_win]
-    rolling_win_rate = sum(1 for p in win_slice if p > 0) / len(win_slice)
+    rolling_win_rate = (
+        sum(1 for p in win_slice if p > 0) / len(win_slice)
+        if len(win_slice) >= WIN_MIN_SAMPLE
+        else 0.5  # insufficient history — stay neutral
+    )
 
     # rolling_pnl_z: most recent PnL vs the preceding n_pnl-1 peers (no self-contamination)
     pnl_slice = pnls[:n_pnl]
@@ -1183,6 +1190,15 @@ class TradingSystem:
             )
             _ofi_action, _ofi_exec_feats = _ofi_choose_action(_ofi_exec_feats)
             _log_ofi_action(logger, market_id, _ofi_action, _ofi_exec_feats)
+            # OFI graduation: gated behind OFI_POLICY_ACTIVE so the path can be
+            # enabled after offline Sharpe validation without another code change.
+            if getattr(config_production, "OFI_POLICY_ACTIVE", False) and _ofi_action == "WAIT":
+                logger.info(
+                    "ofi_policy_deferred_order",
+                    market_id=market_id,
+                    action=_ofi_action,
+                )
+                return
         except Exception as _ofi_err:
             logger.warning("ofi_policy_log_failed", error=str(_ofi_err))
 
@@ -1307,14 +1323,21 @@ class TradingSystem:
                         ),
                     )
 
-        if not result.success:
+        if result is None or not result.success:
+            _exec_err = getattr(result, "error", "null_result")
+            _exec_code = getattr(result, "error_code", "null_result")
+            _exec_status = (
+                result.status.value
+                if (result is not None and hasattr(result.status, "value"))
+                else (str(result.status) if result is not None else "null_result")
+            )
             logger.error(
                 "execution_failed",
                 market_id=market_id,
                 token_id=token_id,
-                error=result.error,
-                error_code=result.error_code,
-                status=result.status.value if hasattr(result.status, "value") else str(result.status),
+                error=_exec_err,
+                error_code=_exec_code,
+                status=_exec_status,
                 trigger=trigger,
             )
             return
@@ -1991,7 +2014,12 @@ class TradingSystem:
                                         _mkt_price = Decimal(
                                             str(_mkt.get("market_price") or "0.50")
                                         )
-                                        _p_win = Decimal("0.5")  # placeholder until Charlie signal
+                                        # TODO(sniper): wire real Charlie p_win here once the
+                                        # signal is available on the sniper path.  Using 0.5
+                                        # means should_snipe() operates on a coin-flip prior,
+                                        # silently affecting size decisions.  Either inject a
+                                        # real signal or gate behind a feature flag.
+                                        _p_win = Decimal("0.5")  # placeholder — see TODO above
                                         if self.market_sniper.should_snipe(
                                             _mkt, _p_win, _mkt_price
                                         ):
@@ -2188,6 +2216,21 @@ class TradingSystem:
             except Exception as _re:
                 logger.warning("regime_update_failed", error=str(_re))
 
+            # --- Meta-gate model hot-reload: check if model file was updated ----
+            # If the model on disk is newer than the last time we loaded it, reset
+            # the module-level cache so the next should_trade() call re-reads it.
+            # Allows live retraining without a bot restart.
+            try:
+                from ml.meta_gate import _MODEL_PATH as _mgp, reload_model as _reload_meta
+                if _mgp.exists():
+                    _mgp_mtime = _mgp.stat().st_mtime
+                    if getattr(self._periodic_maintenance, "_last_model_mtime", 0) < _mgp_mtime:
+                        _reload_meta()
+                        self._periodic_maintenance._last_model_mtime = _mgp_mtime  # type: ignore[attr-defined]
+                        logger.info("meta_gate_model_hot_reloaded", mtime=_mgp_mtime)
+            except Exception as _mr_exc:
+                logger.warning("meta_gate_hot_reload_check_failed", error=str(_mr_exc))
+
             # Validate ledger
             if self.ledger:
                 is_balanced = await self._safe_await(
@@ -2238,7 +2281,34 @@ class TradingSystem:
             # Clear cache
             if self.secrets_manager:
                 self.secrets_manager.clear_cache()
-            
+
+            # --- Schema integrity guard: warn if hot-path index is missing ----
+            # Guards against ledger_async.py embedded schema drifting from
+            # schema.sql.  A missing index silently degrades settlement query
+            # performance without raising any error.
+            if self.ledger:
+                try:
+                    _idx_rows = await self._safe_await(
+                        "ledger.check_settled_closed_index",
+                        self.ledger.execute(
+                            "SELECT name FROM sqlite_master WHERE type='index'"
+                            " AND name='idx_ot_settled_closed'",
+                            fetch_all=True,
+                            as_dict=True,
+                        ),
+                        timeout_seconds=5.0,
+                        default=None,
+                    )
+                    if _idx_rows is not None and not _idx_rows:
+                        logger.warning(
+                            "missing_db_index",
+                            index="idx_ot_settled_closed",
+                            hint="Schema drift detected: apply index manually or"
+                                 " restart to allow schema init to recreate it",
+                        )
+                except Exception:
+                    pass
+
         except Exception as e:
             logger.error(
                 "periodic_maintenance_failed",
@@ -2394,13 +2464,28 @@ class TradingSystem:
 
             market = market_cache[market_id]
             # Resolution check: handle both CLOB (closed/resolved bool) and Gamma
-            # API (active=False) response formats.  active=False means the market
-            # window has closed; paired with outcomePrices it means fully resolved.
+            # API (active=False) response formats.
+            # GUARD: resolutionTime alone is not sufficient — markets carry a
+            # scheduled timestamp before they actually resolve, and active=False
+            # can mean "paused" rather than "resolved".  Require _outcome_posted
+            # as a second condition to prevent premature settlement and wrong PnL.
+            import time as _time
+            _res_ts = market.get("resolutionTime")
+            _resolved_in_past = (
+                _res_ts is not None
+                and isinstance(_res_ts, (int, float))
+                and _res_ts <= _time.time()
+            )
+            _outcome_posted = bool(
+                market.get("outcomePrices")
+                or market.get("payout_numerator")
+                or market.get("payout_per_share")
+            )
             market_resolved = bool(
                 market.get("closed")
                 or market.get("resolved")
-                or market.get("active") is False
-                or market.get("resolutionTime")
+                or (market.get("active") is False and _outcome_posted)
+                or (_resolved_in_past and _outcome_posted)
             )
             if not market_resolved:
                 continue
@@ -2505,13 +2590,15 @@ class TradingSystem:
                     _write_header = not _cal_csv.exists()
                     _actual = 1 if pnl > Decimal("0") else 0
                     with open(_cal_csv, "a", newline="") as _cf:
+                        from datetime import datetime as _dtime, timezone as _dtz
                         _w = _csv.DictWriter(
                             _cf,
-                            fieldnames=["market_id", "p_win_raw", "actual_outcome"],
+                            fieldnames=["settled_at", "market_id", "p_win_raw", "actual_outcome"],
                         )
                         if _write_header:
                             _w.writeheader()
                         _w.writerow({
+                            "settled_at": _dtime.now(_dtz.utc).isoformat(),
                             "market_id": market_id,
                             "p_win_raw": round(float(_cal_p_win), 6),
                             "actual_outcome": _actual,

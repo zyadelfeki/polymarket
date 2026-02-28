@@ -246,3 +246,11 @@ GLOBAL_RISK_BUDGET: dict = {
 # Raise towards 0.55-0.60 once the model accumulates >500 labelled samples
 # and calibration ECE improves.
 META_GATE_THRESHOLD: float = 0.50
+
+# ---------------------------------------------------------------------------
+# OFI policy graduation flag
+# ---------------------------------------------------------------------------
+# Set to True ONLY after offline Sharpe validation confirms OFI signal quality.
+# When False (default), OFI actions are computed and logged but never gate orders.
+# When True, _ofi_action == "WAIT" will defer order submission for that cycle.
+OFI_POLICY_ACTIVE: bool = False
