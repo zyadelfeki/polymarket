@@ -38,6 +38,26 @@ def safe_decimal(value: Any) -> Decimal:
     raise TypeError(f"Cannot convert {type(value)} to Decimal")
 
 
+def from_config(value: Any) -> Decimal:
+    """
+    Silent Decimal conversion for config/YAML values.
+
+    YAML loaders return numeric scalars as Python float by design.
+    Using safe_decimal() on every config read floods logs with
+    float_to_decimal_conversion_detected warnings that carry no signal.
+    Use from_config() for all values that come from config dicts/YAML
+    and safe_decimal() for runtime financial values where float
+    precision should be flagged.
+    """
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, str):
+        return Decimal(value)
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    raise TypeError(f"Cannot convert {type(value)} to Decimal for config read")
+
+
 def to_decimal(value: Any) -> Decimal:
     """Backward-compatible Decimal conversion."""
     return safe_decimal(value)
