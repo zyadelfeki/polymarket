@@ -35,15 +35,15 @@ trading:
   initial_capital: 10000.00
   
   # Position sizing
-  max_position_size_pct: 10.0  # Max 10% per position
-  max_total_exposure_pct: 80.0  # Max 80% total exposure
+  max_position_size_pct: "10.0"  # Max 10% per position
+  max_total_exposure_pct: "80.0"  # Max 80% total exposure
   min_position_size: 10.00  # Minimum $10 per position
   
   # Order limits
   min_order_size: 1.00
   max_order_size: 1000.00
-  min_price: 0.01  # 1 cent
-  max_price: 0.99  # 99 cents
+  min_price: "0.01"  # 1 cent
+  max_price: "0.99"  # 99 cents
   
   # Rate limiting
   max_orders_per_minute: 30
@@ -160,8 +160,8 @@ strategies:
   # Latency Arbitrage
   latency_arb:
     enabled: true
-    max_position_size_pct: 5.0
-    min_price_movement: 0.02  # 2%
+    max_position_size_pct: "5.0"
+    min_price_movement: "0.02"  # 2%
     max_latency_ms: 100
     confidence_threshold: 0.7
     timeframe_priority:
@@ -170,27 +170,27 @@ strategies:
       - 4hour
       - 15min
     enforce_orderbook_validation: true
-    min_orderbook_size: 10.0
+    min_orderbook_size: "10.0"
     peak_hours_only: false
     use_dynamic_edge_thresholds: true
     edge_thresholds:
-      15min: 0.03
-      hourly: 0.025
-      4hour: 0.02
-      daily: 0.015
+      15min: "0.03"
+      hourly: "0.025"
+      4hour: "0.02"
+      daily: "0.015"
   
   # Mean Reversion
   mean_reversion:
     enabled: true
-    max_position_size_pct: 3.0
+    max_position_size_pct: "3.0"
     lookback_window: 60  # seconds
     std_dev_threshold: 2.0
   
   # Volatility Breakout
   volatility_breakout:
     enabled: true
-    max_position_size_pct: 4.0
-    volatility_threshold: 5.0  # 5% movement
+    max_position_size_pct: "4.0"
+    volatility_threshold: "5.0"  # 5% movement
     confirmation_window: 10  # seconds
 
 # ==================================================================

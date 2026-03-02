@@ -103,6 +103,8 @@ BLOCKED_MARKETS: set = {
     '1447205',  #  7 trades, 14% win, -$958.75
     '1448902',  #  6 trades, 17% win, -$873   (added 2026-02-27)
     '1448693',  #  6 trades, 17% win, -$917   (added 2026-02-27)
+    '1450993',  #  7 trades, 14% win, -$919   (added 2026-03-02) NO bets near 50/50, resolved YES
+    '1451181',  #  7 trades, 14% win, -$906   (added 2026-03-02) NO bets near 50/50, resolved YES
 }
 
 # ---------------------------------------------------------------------------
