@@ -227,7 +227,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-            if count >= 3:
-                break
-    except Exception:
-        pass
