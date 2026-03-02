@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover - zoneinfo should exist on supported Pytho
 
 from config.settings import settings
 from strategies.confidence_booster import ConfidenceBooster
-from utils.decimal_helpers import quantize_quantity, to_decimal
+from utils.decimal_helpers import quantize_quantity, to_decimal, from_config
 
 try:
     from data_feeds.binance_features import get_all_features as _get_all_binance_features
@@ -115,17 +115,17 @@ class LatencyArbitrageEngine:
 
         cfg = config or {}
 
-        self.min_edge = to_decimal(cfg.get("min_edge", "0.03"))
+        self.min_edge = from_config(cfg.get("min_edge", "0.03"))
 
-        self.max_edge = to_decimal(cfg.get("max_edge", "0.50"))
+        self.max_edge = from_config(cfg.get("max_edge", "0.50"))
         self.stale_price_buffer = Decimal(str(cfg.get("stale_price_buffer", 500)))
         self.market_cache_ttl_seconds = int(cfg.get("market_cache_ttl_seconds", 10))
         self.market_scan_limit = int(cfg.get("market_scan_limit", 200))
         self.min_time_left_seconds = int(cfg.get("min_time_left_seconds", 15))
         self.max_time_left_seconds = int(cfg.get("max_time_left_seconds", 15 * 60))
-        self.min_volatility_pct = to_decimal(cfg.get("min_volatility_pct", "0.2"))
-        self.slippage_buffer = to_decimal(cfg.get("slippage_buffer", "0.01"))
-        self.min_orderbook_size = to_decimal(cfg.get("min_orderbook_size", "10"))
+        self.min_volatility_pct = from_config(cfg.get("min_volatility_pct", "0.2"))
+        self.slippage_buffer = from_config(cfg.get("slippage_buffer", "0.01"))
+        self.min_orderbook_size = from_config(cfg.get("min_orderbook_size", "10"))
         self.enforce_orderbook_validation = bool(cfg.get("enforce_orderbook_validation", False))
         self.max_spread_bps = float(cfg.get("max_spread_bps", 500))  # skip markets wider than 5%
         self.peak_hours_only = bool(cfg.get("peak_hours_only", False))
@@ -137,7 +137,7 @@ class LatencyArbitrageEngine:
             "daily": "0.015",
         }
         self.edge_thresholds = {
-            timeframe: to_decimal(value)
+            timeframe: from_config(value)
             for timeframe, value in edge_thresholds_cfg.items()
         }
 

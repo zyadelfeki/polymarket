@@ -83,6 +83,7 @@ class TripReason(Enum):
     SYSTEM_ERROR = "system_error"
     MANUAL = "manual"
     VOLATILITY_EXTREME = "volatility_extreme"
+    LOW_WIN_RATE = "low_win_rate"  # rolling win-rate below configured threshold
 
 
 @dataclass

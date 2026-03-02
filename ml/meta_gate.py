@@ -76,14 +76,30 @@ logger = structlog.get_logger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MODEL_PATH = _REPO_ROOT / "models" / "meta_gate.pkl"
 _DB_PATH    = _REPO_ROOT / "data" / "trading.db"
+# JSON file used to persist runtime threshold changes across restarts.
+# Takes priority over config_production.META_GATE_THRESHOLD when present.
+_THRESHOLD_OVERRIDE_PATH = _REPO_ROOT / "models" / "meta_gate_threshold.json"
 
 # ---------------------------------------------------------------------------
 # Threshold: meta-gate rejects when P(take) < threshold.
-# Default 0.50; configurable via config_production.META_GATE_THRESHOLD.
-# Loaded at import time via a lazy import to avoid circular dependency.
+# Priority order:
+#   1. models/meta_gate_threshold.json  (written by set_threshold() / trainer)
+#   2. config_production.META_GATE_THRESHOLD
+#   3. Hard-coded default 0.50
 # ---------------------------------------------------------------------------
 def _load_threshold() -> float:
-    """Read META_GATE_THRESHOLD from config_production, falling back to 0.50."""
+    """Read threshold, preferring the persisted JSON override."""
+    # 1. Check persisted override from set_threshold() or trainer
+    try:
+        if _THRESHOLD_OVERRIDE_PATH.exists():
+            import json as _json
+            data = _json.loads(_THRESHOLD_OVERRIDE_PATH.read_text())
+            val = float(data.get("threshold", 0.50))
+            logger.info("meta_gate_threshold_loaded_from_file", path=str(_THRESHOLD_OVERRIDE_PATH), threshold=val)
+            return val
+    except Exception:
+        pass
+    # 2. Fall back to config_production constant
     try:
         import importlib
         cfg = importlib.import_module("config_production")
@@ -111,7 +127,9 @@ def reload_model() -> None:
 
 def set_threshold(value: float) -> None:
     """
-    Update the global default classification threshold at runtime.
+    Update the global default classification threshold at runtime and persist
+    it to ``models/meta_gate_threshold.json`` so the new value survives a
+    restart without requiring a code change.
 
     Useful for tightening the gate in a bad regime without restarting the bot.
     The new threshold only applies to trades evaluated *after* this call;
@@ -122,9 +140,23 @@ def set_threshold(value: float) -> None:
     value:
         New threshold in [0.0, 1.0].  Values outside the range are clamped.
     """
+    import json as _json
+    from datetime import datetime, timezone
     global _DEFAULT_THRESHOLD
-    _DEFAULT_THRESHOLD = max(0.0, min(1.0, float(value)))
-    logger.info("meta_gate_threshold_updated", new_threshold=_DEFAULT_THRESHOLD)
+    clamped = max(0.0, min(1.0, float(value)))
+    _DEFAULT_THRESHOLD = clamped
+    # Persist so the value survives a restart.
+    try:
+        _THRESHOLD_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "threshold": clamped,
+            "set_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _THRESHOLD_OVERRIDE_PATH.write_text(_json.dumps(payload, indent=2))
+        logger.info("meta_gate_threshold_persisted", path=str(_THRESHOLD_OVERRIDE_PATH), new_threshold=clamped)
+    except Exception as exc:
+        logger.warning("meta_gate_threshold_persist_failed", error=str(exc))
+    logger.info("meta_gate_threshold_updated", new_threshold=clamped)
 
 
 # ---------------------------------------------------------------------------

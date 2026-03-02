@@ -39,7 +39,7 @@ from risk.circuit_breaker_v2 import CircuitBreakerV2
 from security.secrets_manager import SecretsManager, get_secrets_manager
 from validation.models import TradingConfig
 from strategies.latency_arbitrage_btc import LatencyArbitrageEngine as MultiTimeframeLatencyArbitrageEngine
-from utils.decimal_helpers import quantize_quantity, to_decimal
+from utils.decimal_helpers import quantize_quantity, to_decimal, from_config
 
 # Charlie integration — new modules
 from risk.performance_tracker import PerformanceTracker
@@ -720,8 +720,8 @@ class TradingSystem:
         trading_cfg = self.config.get("trading", {})
         strategy_cfg = self.config.get("strategies", {}).get("latency_arb", {})
 
-        min_price = to_decimal(trading_cfg.get("min_price", "0.01"))
-        max_price = to_decimal(trading_cfg.get("max_price", "0.99"))
+        min_price = from_config(trading_cfg.get("min_price", "0.01"))
+        max_price = from_config(trading_cfg.get("max_price", "0.99"))
         if not (min_price <= price <= max_price):
             logger.warning(
                 "opportunity_skipped",
@@ -751,14 +751,14 @@ class TradingSystem:
             )
             return
 
-        max_position_pct = to_decimal(
+        max_position_pct = from_config(
             strategy_cfg.get(
                 "max_position_size_pct",
                 trading_cfg.get("max_position_size_pct", "5.0"),
             )
         )
-        min_position_size = to_decimal(trading_cfg.get("min_position_size", "1.00"))
-        max_order_size = to_decimal(trading_cfg.get("max_order_size", "1000.00"))
+        min_position_size = from_config(trading_cfg.get("min_position_size", "1.00"))
+        max_order_size = from_config(trading_cfg.get("max_order_size", "1000.00"))
 
         raw_position_value = equity * (max_position_pct / Decimal("100"))
         position_value = max(raw_position_value, min_position_size)
@@ -2152,35 +2152,26 @@ class TradingSystem:
 
                 rolling_wr = self.performance_tracker.get_rolling_win_rate(win_rate_sample)
                 if rolling_wr is not None and Decimal(str(rolling_wr)) < Decimal(str(min_wr)):
+                    # Win-rate check enforced in ALL modes (paper and live).
+                    # Unlike the cross-session drawdown artefact above, rolling
+                    # win-rate over the last N settled trades is real signal
+                    # regardless of which session those trades came from.
                     _is_paper_mode = self.config.get("trading", {}).get("paper_trading", True)
-                    if _is_paper_mode:
-                        # Paper mode: warn only — stale historical orders from prior
-                        # sessions would otherwise immediately kill every fresh session.
-                        logger.warning(
-                            "performance_halt_win_rate",
-                            rolling_win_rate=f"{rolling_wr:.2%}",
-                            threshold=str(min_wr),
-                            sample_size=win_rate_sample,
-                            paper_mode=True,
-                            action="log_only",
+                    logger.critical(
+                        "performance_halt_win_rate",
+                        rolling_win_rate=f"{rolling_wr:.2%}",
+                        threshold=str(min_wr),
+                        sample_size=win_rate_sample,
+                        paper_mode=_is_paper_mode,
+                        action="circuit_breaker_trip",
+                    )
+                    if self.circuit_breaker:
+                        from risk.circuit_breaker_v2 import TripReason
+                        await self._safe_await(
+                            "circuit_breaker.trip_low_win_rate",
+                            self.circuit_breaker.trip(TripReason.LOW_WIN_RATE),
+                            default=None,
                         )
-                    else:
-                        # Live mode: enforce the halt.
-                        logger.critical(
-                            "performance_halt_win_rate",
-                            rolling_win_rate=f"{rolling_wr:.2%}",
-                            threshold=str(min_wr),
-                            sample_size=win_rate_sample,
-                            paper_mode=False,
-                            action="circuit_breaker_trip",
-                        )
-                        if self.circuit_breaker:
-                            from risk.circuit_breaker_v2 import TripReason
-                            await self._safe_await(
-                                "circuit_breaker.trip_loss_streak",
-                                self.circuit_breaker.trip(TripReason.LOSS_STREAK),
-                                default=None,
-                            )
 
         except Exception as e:
             logger.error(
