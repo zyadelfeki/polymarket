@@ -2620,15 +2620,13 @@ class TradingSystem:
                     _write_header = not _cal_csv.exists()
                     _actual = 1 if pnl > Decimal("0") else 0
                     with open(_cal_csv, "a", newline="") as _cf:
-                        from datetime import datetime as _dtime, timezone as _dtz
                         _w = _csv.DictWriter(
                             _cf,
-                            fieldnames=["settled_at", "market_id", "p_win_raw", "actual_outcome"],
+                            fieldnames=["market_id", "p_win_raw", "actual_outcome"],
                         )
                         if _write_header:
                             _w.writeheader()
                         _w.writerow({
-                            "settled_at": _dtime.now(_dtz.utc).isoformat(),
                             "market_id": market_id,
                             "p_win_raw": round(float(_cal_p_win), 6),
                             "actual_outcome": _actual,
