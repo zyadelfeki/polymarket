@@ -9,9 +9,11 @@ STARTING_CAPITAL = Decimal("13.98")
 # ---------------------------------------------------------------------------
 CHARLIE_CONFIG = {
     # Minimum edge (p_win - implied_prob) required for a YES or NO bet.
-    # 0.05 = Charlie must believe the outcome is at least 5 percentage points
-    # more likely than the market price implies.
-    "min_edge": Decimal("0.05"),
+    # Raised 0.05 → 0.10 (2026-03-04): calibration showed 90% of trades land
+    # in the [0.4–0.5) p_win bucket (coin-flip territory).  Doubling the edge
+    # floor cuts that bucket almost entirely while preserving the [0.6–0.7)
+    # bucket that carries the real 64% win-rate edge.
+    "min_edge": Decimal("0.10"),
 
     # Minimum meta-confidence from Charlie's ensemble + context fusion.
     # Range [0, 1].  0.60 ≈ "moderate conviction".
@@ -105,6 +107,11 @@ BLOCKED_MARKETS: set = {
     '1448693',  #  6 trades, 17% win, -$917   (added 2026-02-27)
     '1450993',  #  7 trades, 14% win, -$919   (added 2026-03-02) NO bets near 50/50, resolved YES
     '1451181',  #  7 trades, 14% win, -$906   (added 2026-03-02) NO bets near 50/50, resolved YES
+    # --- added 2026-03-04: calibration audit identified these as chronic losers ---
+    '1450921',  #  8 trades, 12% win, -$889
+    '1411624',  #  5 trades, 20% win, -$870
+    '1437414',  #  6 trades, 17% win, -$686
+    '1445053',  #  6 trades, 17% win, -$597
 }
 
 # ---------------------------------------------------------------------------
@@ -244,10 +251,10 @@ GLOBAL_RISK_BUDGET: dict = {
 # ML / meta-gate configuration
 # ---------------------------------------------------------------------------
 # Minimum predicted P(take) required for the meta-gate to approve a trade.
-# 0.50 is the calibrated default for cold-start (< 200 settled trades).
-# Raise towards 0.55-0.60 once the model accumulates >500 labelled samples
-# and calibration ECE improves.
-META_GATE_THRESHOLD: float = 0.50
+# Raised 0.50 → 0.60 (2026-03-04): only the [0.6–0.7) p_win bucket shows
+# real edge (64% actual win rate, 14 samples).  The 0.50 default was
+# letting the dense 0.483-win-rate coin-flip bucket slip through.
+META_GATE_THRESHOLD: float = 0.60
 
 # ---------------------------------------------------------------------------
 # OFI policy graduation flag
