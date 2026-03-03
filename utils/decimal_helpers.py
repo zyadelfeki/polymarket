@@ -63,6 +63,26 @@ def to_decimal(value: Any) -> Decimal:
     return safe_decimal(value)
 
 
+def from_config(value: Any) -> Decimal:
+    """
+    Silent Decimal converter for config-loading paths.
+
+    Identical to ``to_decimal`` but does NOT emit warnings or log entries when
+    the input is a bare Python float.  Use this wherever config values (e.g. from
+    YAML) are converted to Decimal so that human-readable float literals in config
+    files never pollute the logs.  Keep using ``to_decimal``/``safe_decimal`` on
+    the hot financial path where an unexpected float IS a bug worth surfacing.
+    """
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, str):
+        return Decimal(value)
+    if isinstance(value, (int, float)):
+        # round to 10 dp to strip floating-point noise before converting
+        return Decimal(str(round(float(value), 10)))
+    raise TypeError(f"from_config: unsupported type {type(value)!r} for value {value!r}")
+
+
 def quantize_price(value: Decimal) -> Decimal:
     """Round to 4 decimal places (Polymarket standard)."""
     return value.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
