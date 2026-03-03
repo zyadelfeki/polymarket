@@ -66,7 +66,7 @@ def main():
     with open(CSV_PATH, "r", newline="") as f:
         for row in csv.DictReader(f):
             p_raw.append(float(row["p_win_raw"]))
-            actual.append(int(row["actual_outcome"]))
+            actual.append(1 if float(row["actual_outcome"]) >= 0.5 else 0)
 
     n = len(p_raw)
     print(f"Calibration samples: {n}")
