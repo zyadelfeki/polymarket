@@ -2067,7 +2067,33 @@ class TradingSystem:
                         "circuit_breaker_open",
                         status=self.circuit_breaker.get_status()
                     )
-            
+
+            # --- Operator reset flag (live-mode CB reset without restart) ----
+            # scripts/reset_circuit_breaker.py writes runtime/cb_reset.flag.
+            # We consume it here, call manual_reset(), and delete the file so
+            # it fires exactly once.  Paper mode uses the startup auto-reset;
+            # this path exists for live-mode operator intervention.
+            _cb_flag = Path("runtime/cb_reset.flag")
+            if _cb_flag.exists() and self.circuit_breaker is not None:
+                try:
+                    await self._safe_await(
+                        "circuit_breaker.operator_manual_reset",
+                        self.circuit_breaker.manual_reset(),
+                        default=None,
+                    )
+                    _cb_flag.unlink(missing_ok=True)
+                    logger.warning(
+                        "circuit_breaker_manual_reset",
+                        source="operator_flag_file",
+                        flag_path=str(_cb_flag),
+                    )
+                except Exception as _cb_flag_exc:
+                    logger.error(
+                        "circuit_breaker_flag_reset_failed",
+                        error=str(_cb_flag_exc),
+                    )
+            # ------------------------------------------------------------------
+
             # Log system status
             api_healthy = await self._safe_await(
                 "api_client.health_check",
@@ -2152,26 +2178,39 @@ class TradingSystem:
 
                 rolling_wr = self.performance_tracker.get_rolling_win_rate(win_rate_sample)
                 if rolling_wr is not None and Decimal(str(rolling_wr)) < Decimal(str(min_wr)):
-                    # Win-rate check enforced in ALL modes (paper and live).
-                    # Unlike the cross-session drawdown artefact above, rolling
-                    # win-rate over the last N settled trades is real signal
-                    # regardless of which session those trades came from.
                     _is_paper_mode = self.config.get("trading", {}).get("paper_trading", True)
-                    logger.critical(
-                        "performance_halt_win_rate",
-                        rolling_win_rate=f"{rolling_wr:.2%}",
-                        threshold=str(min_wr),
-                        sample_size=win_rate_sample,
-                        paper_mode=_is_paper_mode,
-                        action="circuit_breaker_trip",
-                    )
-                    if self.circuit_breaker:
-                        from risk.circuit_breaker_v2 import TripReason
-                        await self._safe_await(
-                            "circuit_breaker.trip_low_win_rate",
-                            self.circuit_breaker.trip(TripReason.LOW_WIN_RATE),
-                            default=None,
+                    if _is_paper_mode:
+                        # Paper mode: log only — the settled-trade history spans
+                        # multiple sessions and predates config changes made
+                        # between sessions.  Tripping here re-blocks a fresh
+                        # paper session on every periodic_check cycle, immediately
+                        # undoing the paper startup manual_reset().
+                        # The CB already enforces session-scoped drawdown and
+                        # loss-streak limits; cross-session win-rate is informational.
+                        logger.critical(
+                            "performance_halt_win_rate",
+                            rolling_win_rate=f"{rolling_wr:.2%}",
+                            threshold=str(min_wr),
+                            sample_size=win_rate_sample,
+                            paper_mode=True,
+                            action="log_only",
                         )
+                    else:
+                        logger.critical(
+                            "performance_halt_win_rate",
+                            rolling_win_rate=f"{rolling_wr:.2%}",
+                            threshold=str(min_wr),
+                            sample_size=win_rate_sample,
+                            paper_mode=False,
+                            action="circuit_breaker_trip",
+                        )
+                        if self.circuit_breaker:
+                            from risk.circuit_breaker_v2 import TripReason
+                            await self._safe_await(
+                                "circuit_breaker.trip_low_win_rate",
+                                self.circuit_breaker.trip(TripReason.LOW_WIN_RATE),
+                                default=None,
+                            )
 
         except Exception as e:
             logger.error(
@@ -2735,11 +2774,16 @@ async def main():
     )
 
     _log_handlers: list = [logging.StreamHandler(sys.stderr)]
-    if _use_json:
-        Path("logs").mkdir(parents=True, exist_ok=True)
-        _log_handlers.append(
-            logging.FileHandler("logs/production.log", encoding="utf-8")
-        )
+    # Always write a log file regardless of mode:
+    #   live mode  → logs/production.log  (JSON lines)
+    #   paper mode → logs/paper.log       (ConsoleRenderer text)
+    # Previously the file handler was gated on _use_json, so paper-mode output
+    # went to stderr only — making the log file appear stale or empty.
+    Path("logs").mkdir(parents=True, exist_ok=True)
+    _log_file_name = "logs/production.log" if _use_json else "logs/paper.log"
+    _log_handlers.append(
+        logging.FileHandler(_log_file_name, encoding="utf-8")
+    )
 
     logging.basicConfig(
         level=logging.INFO,
