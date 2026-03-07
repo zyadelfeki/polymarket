@@ -1803,6 +1803,154 @@ class AsyncLedger:
 
         return positions
 
+    async def record_reconciled_position(
+        self,
+        market_id: str,
+        side: str,
+        quantity: Decimal,
+        entry_price: Decimal,
+        strategy: str = "reconciled",
+        token_id: str = "",
+        order_id: str = "",
+        metadata: Optional[Dict] = None,
+        correlation_id: Optional[str] = None,
+    ) -> int:
+        """
+        Record an externally discovered position without touching cash.
+
+        Mirrors the synchronous ledger semantics:
+        - DR Positions
+        - CR Owner Equity
+        """
+        quantity = Decimal(str(quantity))
+        entry_price = Decimal(str(entry_price))
+
+        if quantity <= 0:
+            raise ValueError(f"Quantity must be positive: {quantity}")
+        if entry_price <= 0 or entry_price > 1:
+            raise ValueError(f"Invalid entry price: {entry_price}")
+
+        cost = quantity * entry_price
+
+        async with self._write_lock:
+            conn = await self.pool.acquire()
+            try:
+                await conn.execute("BEGIN TRANSACTION")
+
+                cursor = await conn.execute(
+                    """
+                    INSERT INTO transactions (transaction_type, description, metadata, correlation_id, timestamp)
+                    VALUES ('POSITION_RECONCILE', ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        f"Reconcile {side} position on {market_id[:20]}",
+                        decimal_dumps(metadata) if metadata else None,
+                        correlation_id,
+                    ),
+                )
+                tx_id = cursor.lastrowid
+
+                cursor = await conn.execute(
+                    "SELECT id FROM accounts WHERE account_name = 'Positions' LIMIT 1"
+                )
+                positions_account = (await cursor.fetchone())[0]
+
+                cursor = await conn.execute(
+                    "SELECT id FROM accounts WHERE account_name = 'Owner Equity' LIMIT 1"
+                )
+                equity_account = (await cursor.fetchone())[0]
+
+                await conn.execute(
+                    "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
+                    (tx_id, positions_account, str(cost)),
+                )
+                await conn.execute(
+                    "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
+                    (tx_id, equity_account, str(-cost)),
+                )
+
+                position_metadata = dict(metadata or {})
+                if correlation_id:
+                    position_metadata.setdefault("correlation_id", correlation_id)
+                if position_metadata:
+                    metadata_json = decimal_dumps(position_metadata)
+                else:
+                    metadata_json = None
+
+                cursor = await conn.execute(
+                    """
+                    INSERT INTO positions (
+                        market_id, token_id, strategy, side,
+                        entry_price, quantity, current_price, status,
+                        entry_timestamp, opened_at, entry_order_id, entry_fees, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, 0, ?)
+                    """,
+                    (
+                        market_id,
+                        token_id,
+                        strategy,
+                        side,
+                        str(entry_price),
+                        str(quantity),
+                        str(entry_price),
+                        order_id or None,
+                        metadata_json,
+                    ),
+                )
+                position_id = cursor.lastrowid
+
+                await conn.execute(
+                    """
+                    INSERT INTO audit_log
+                    (operation, entity_type, entity_id, old_state, new_state, reason, context, correlation_id, details)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "STATE_CHANGE",
+                        "position",
+                        str(position_id),
+                        None,
+                        "OPEN",
+                        "startup_position_reconcile",
+                        decimal_dumps(
+                            {
+                                "market_id": market_id,
+                                "token_id": token_id,
+                                "quantity": str(quantity),
+                                "entry_price": str(entry_price),
+                                "strategy": strategy,
+                            }
+                        ),
+                        correlation_id,
+                        decimal_dumps(
+                            {
+                                "transaction_id": tx_id,
+                                "source": "exchange_position_reconcile",
+                            }
+                        ),
+                    ),
+                )
+
+                await conn.commit()
+                self.equity_cache.clear()
+                self.position_cache.clear()
+
+                logger.info(
+                    "reconciled_position_recorded",
+                    market_id=market_id,
+                    token_id=token_id,
+                    quantity=str(quantity),
+                    entry_price=str(entry_price),
+                    position_id=position_id,
+                    transaction_id=tx_id,
+                )
+                return position_id
+            except Exception:
+                await conn.rollback()
+                raise
+            finally:
+                await self.pool.release(conn)
+
     async def validate_ledger(self) -> bool:
         """
         Validate ledger integrity.

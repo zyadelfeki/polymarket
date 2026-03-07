@@ -635,6 +635,80 @@ class TradingSystem:
             market_ids=sorted(self._market_lifecycle_state.keys()),
         )
 
+    async def _reconcile_positions_on_startup(self) -> Dict[str, int]:
+        if self.ledger is None or self.api_client is None:
+            return {"exchange_positions": 0, "imported": 0, "already_known": 0, "skipped": 0}
+
+        exchange_positions = await self._safe_await(
+            "api_client.get_open_positions.startup_reconcile",
+            self.api_client.get_open_positions(),
+            timeout_seconds=30.0,
+            default=[],
+        ) or []
+        local_positions = await self._safe_await(
+            "ledger.get_open_positions.startup_reconcile",
+            self.ledger.get_open_positions(),
+            timeout_seconds=30.0,
+            default=[],
+        ) or []
+
+        known_keys = {
+            (str(position.market_id or ""), str(position.token_id or ""))
+            for position in local_positions
+        }
+
+        imported = 0
+        already_known = 0
+        skipped = 0
+
+        for position in exchange_positions:
+            market_id = str(position.get("market_id") or "")
+            token_id = str(position.get("token_id") or "")
+            if not market_id or not token_id:
+                skipped += 1
+                continue
+
+            position_key = (market_id, token_id)
+            if position_key in known_keys:
+                already_known += 1
+                continue
+
+            quantity_raw = position.get("quantity") or position.get("size") or position.get("shares") or "0"
+            price_raw = position.get("price") or position.get("entry_price") or position.get("avg_price") or "0"
+
+            quantity = Decimal(str(quantity_raw))
+            entry_price = Decimal(str(price_raw))
+            side = str(position.get("side") or position.get("outcome") or "UNKNOWN")
+
+            if quantity <= 0 or entry_price <= 0:
+                skipped += 1
+                continue
+
+            await self.ledger.record_reconciled_position(
+                market_id=market_id,
+                token_id=token_id,
+                side=side,
+                quantity=quantity,
+                entry_price=entry_price,
+                metadata={"source": "startup_position_reconcile", "exchange_position": dict(position)},
+            )
+            known_keys.add(position_key)
+            imported += 1
+
+        logger.info(
+            "startup_position_reconciliation_complete",
+            exchange_positions=len(exchange_positions),
+            imported=imported,
+            already_known=already_known,
+            skipped=skipped,
+        )
+        return {
+            "exchange_positions": len(exchange_positions),
+            "imported": imported,
+            "already_known": already_known,
+            "skipped": skipped,
+        }
+
     def _log_session_snapshot(self, *, force: bool = False) -> None:
         now = asyncio.get_running_loop().time()
         min_interval = float(self.runtime_controls.get("session_snapshot_interval_seconds", 60))
@@ -2426,6 +2500,8 @@ class TradingSystem:
                 resolved_offline=resolved_count,
                 recovered_pnl=str(recovered_pnl),
             )
+
+            await self._reconcile_positions_on_startup()
 
             # Refresh performance tracker after reconcile
             if self.performance_tracker is not None:
