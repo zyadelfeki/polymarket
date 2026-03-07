@@ -114,6 +114,8 @@ class TradeRecommendation:
     size:             Decimal   # USDC amount, Kelly-sized
     kelly_fraction:   Decimal   # fraction of bankroll
     p_win:            float
+    p_win_raw:        float
+    p_win_calibrated: float
     implied_prob:     float
     edge:             float
     confidence:       float
@@ -159,12 +161,18 @@ class CharliePredictionGate:
         min_confidence: Decimal = Decimal("0.60"),
         allowed_regimes: Optional[set] = None,
         signal_timeout: float = 8.0,
+        coin_flip_reject_band_abs: Optional[Decimal] = None,
     ) -> None:
         self._kelly_sizer = kelly_sizer
         self._min_edge = min_edge
         self._min_confidence = min_confidence
         self._allowed_regimes = allowed_regimes  # None = allow all regimes
         self._signal_timeout = signal_timeout
+        if coin_flip_reject_band_abs is None:
+            coin_flip_reject_band_abs = Decimal(
+                os.getenv("CHARLIE_COIN_FLIP_REJECT_BAND_ABS", "0.03")
+            )
+        self._coin_flip_reject_band_abs = Decimal(str(coin_flip_reject_band_abs))
         _load_charlie_api()
 
     # ------------------------------------------------------------------ public
@@ -313,18 +321,22 @@ class CharliePredictionGate:
         _fee = float(taker_fee_rate(Decimal(str(implied_prob)), question=market_question))
         edge = gross_edge - _fee  # net edge after fees
 
-        # --- 2b. Coin-flip rejection: p_win within 3% of 0.5 = no signal ----
+        # --- 2b. Coin-flip rejection: p_win near 0.5 = no signal -------------
         # Charlie is operating in degraded/neutral mode when it cannot
-        # distinguish direction.  A p_win of 0.5 ± 0.03 means the model has
-        # zero conviction — trading on it is pure noise.  Hard-block these.
-        if abs(p_win - 0.5) < 0.03:
+        # distinguish direction.  By default, a p_win of 0.5 ± 0.03 means the
+        # model has zero conviction — hard-block these.  A narrower band can be
+        # enabled explicitly for controlled proof / operational diagnostics via
+        # the constructor or `CHARLIE_COIN_FLIP_REJECT_BAND_ABS`.
+        coin_flip_reject_band_abs = float(self._coin_flip_reject_band_abs)
+        if abs(p_win - 0.5) < coin_flip_reject_band_abs:
             logger.warning(
                 "charlie_coin_flip_rejected",
                 market_id=market_id,
                 market_question=market_question[:80],
                 p_win=p_win,
-                reason="p_win within 3% of 0.5 = no signal",
+                reason=f"p_win within {coin_flip_reject_band_abs:.4f} of 0.5 = no signal",
                 symbol=symbol,
+                coin_flip_reject_band_abs=coin_flip_reject_band_abs,
             )
             return None
 
@@ -496,6 +508,8 @@ class CharliePredictionGate:
             size=size,
             kelly_fraction=kelly_fraction,
             p_win=effective_p_win,
+            p_win_raw=p_win_raw,
+            p_win_calibrated=p_win,
             implied_prob=implied_prob,
             edge=edge,
             confidence=confidence,
@@ -515,6 +529,7 @@ class CharliePredictionGate:
             kelly_fraction=str(kelly_fraction),
             p_win=effective_p_win,
             p_win_raw=float(p_win_raw),
+            p_win_calibrated=float(p_win),
             implied_prob=implied_prob,
             gross_edge=gross_edge,
             net_edge=edge,

@@ -1,0 +1,180 @@
+# Proof-only runtime config.
+# Ordinary `main.py` paper loop, but the strategy thresholds are made permissive
+# enough to force a natural scored opportunity without using the helper proof script.
+
+environment: paper_trading
+version: 1.0.0-proof
+debug: false
+log_level: INFO
+
+secrets:
+  backend: local
+  aws_region: us-east-1
+  local_secrets_path: .secrets.enc
+
+trading:
+  paper_trading: true
+  max_entry_price_abs: "0.65"
+  initial_capital: 10000.00
+  max_position_size_pct: "10.0"
+  max_total_exposure_pct: "80.0"
+  min_position_size: 10.00
+  min_order_size: 1.00
+  max_order_size: 1000.00
+  min_price: "0.01"
+  max_price: "0.99"
+  max_orders_per_minute: 30
+  max_orders_per_hour: 500
+  max_daily_orders: 5000
+
+runtime_controls:
+  blocked_markets:
+    - "1402904"
+    - "1402902"
+    - "1403073"
+    - "1403228"
+    - "1403232"
+    - "1403143"
+    - "1445001"
+    - "1447205"
+    - "1448902"
+    - "1448693"
+    - "1450993"
+    - "1451181"
+    - "1450921"
+    - "1411624"
+    - "1437414"
+    - "1445053"
+    - "1487045"
+    - "1487027"
+  lifecycle_guard:
+    enabled: true
+    max_active_entries_per_market: 1
+    allow_add_on: false
+    min_price_improvement_abs: "0.05"
+  max_entry_price_abs: "0.65"
+  calibration:
+    fail_closed: true
+    min_positive_coef: 0.0
+    require_monotonic_smoke_test: true
+    smoke_test_points: [0.30, 0.50, 0.79]
+    observe_only_on_invalid: true
+    dataset_export_path: data/calibration_dataset_v2.csv
+    observation_export_path: data/calibration_observations.csv
+  quarantine:
+    enabled: true
+    seed_static_blocklist: true
+    auto_review_after_days: 7
+  session_snapshot_interval_seconds: 60
+
+risk:
+  circuit_breaker_enabled: true
+  max_drawdown_pct: 15.0
+  max_loss_streak: 5
+  daily_loss_limit_pct: 10.0
+  recovery_threshold_pct: 5.0
+  cooldown_minutes: 30
+  half_open_max_position_pct: 2.0
+  max_open_positions: 20
+  max_positions_per_market: 3
+  max_exposure_per_strategy: 30.0
+
+api:
+  polymarket:
+    base_url: https://clob.polymarket.com
+    rate_limit: 8.0
+    timeout_seconds: 10.0
+    max_retries: 3
+    retry_delay_seconds: 1.0
+    max_retry_delay_seconds: 30.0
+  binance:
+    ws_url: wss://stream.binance.com:9443/ws
+    heartbeat_interval: 30.0
+    max_reconnect_delay: 60.0
+    message_queue_size: 1000
+
+database:
+  path: data/trading.db
+  pool_size: 5
+  cache_ttl_seconds: 5
+  enable_wal: true
+  vacuum_interval_hours: 24
+  backup_enabled: true
+  backup_interval_hours: 6
+  backup_path: data/backups/
+
+monitoring:
+  health_check_interval: 30.0
+  health_check_timeout: 10.0
+  failure_threshold: 3
+  metrics_enabled: true
+  metrics_interval: 60.0
+  metrics_retention_days: 30
+  alerts_enabled: true
+  alert_cooldown: 300.0
+  auto_restart_enabled: true
+  max_restart_attempts: 3
+  restart_cooldown: 60.0
+
+logging:
+  console_enabled: true
+  file_enabled: true
+  file_path: logs/trading.log
+  max_file_size_mb: 100
+  max_backup_count: 10
+  format: json
+  include_timestamp: true
+  include_level: true
+  include_logger: true
+  levels:
+    root: INFO
+    api_client: INFO
+    execution: INFO
+    websocket: INFO
+    health_monitor: INFO
+    circuit_breaker: WARNING
+    database: WARNING
+
+strategies:
+  latency_arb:
+    enabled: true
+    max_position_size_pct: "5.0"
+    min_price_movement: "0.00"
+    min_edge: "0.00"
+    min_volatility_pct: "0.0"
+    max_latency_ms: 100
+    confidence_threshold: 0.0
+    timeframe_priority:
+      - hourly
+      - daily
+      - 4hour
+      - 15min
+    enforce_orderbook_validation: true
+    min_orderbook_size: "1.0"
+    peak_hours_only: false
+    use_dynamic_edge_thresholds: false
+    max_spread_bps: 5000
+    min_time_left_seconds: 0
+    max_time_left_seconds: 3600
+  mean_reversion:
+    enabled: true
+    max_position_size_pct: "3.0"
+    lookback_window: 60
+    std_dev_threshold: 2.0
+  volatility_breakout:
+    enabled: true
+    max_position_size_pct: "4.0"
+    volatility_threshold: "5.0"
+    confirmation_window: 10
+
+markets:
+  crypto_symbols:
+    - BTC
+    - ETH
+    - SOL
+  min_volume_24h: 10000
+  min_liquidity: 1000
+  max_spread_pct: 5.0
+  market_data_refresh_seconds: 5
+  orderbook_refresh_seconds: 2
+  price_refresh_seconds: 1

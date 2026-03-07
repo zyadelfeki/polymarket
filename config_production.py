@@ -112,6 +112,9 @@ BLOCKED_MARKETS: set = {
     '1411624',  #  5 trades, 20% win, -$870
     '1437414',  #  6 trades, 17% win, -$686
     '1445053',  #  6 trades, 17% win, -$597
+    # --- added 2026-03-06: 0% and 25% win-rate chronic losers ---
+    '1487045',  #  5 trades,  0% win, -$468  (all 23:05, multi-bet single window)
+    '1487027',  #  8 trades, 25% win, -$375  (all 22:49, NO bets at 0.70-0.73 = negative edge)
 }
 
 # ---------------------------------------------------------------------------

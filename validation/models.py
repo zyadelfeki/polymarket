@@ -17,8 +17,8 @@ Standards:
 - Type-safe throughout
 """
 
-from pydantic import BaseModel, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional, List, Dict, Any, Literal
 from decimal import Decimal
 from datetime import datetime
@@ -318,7 +318,7 @@ class TransactionRequest(BaseModel):
     reference_id: Optional[str] = Field(None, max_length=100)
     
     # Transaction lines
-    lines: List[Dict[str, Any]] = Field(..., min_items=2)
+    lines: List[Dict[str, Any]] = Field(..., min_length=2)
     
     @model_validator(mode='after')
     def validate_balanced(self):
@@ -393,8 +393,7 @@ class TradingConfig(BaseSettings):
         
         return self
     
-    class Config:
-        env_prefix = 'TRADING_'
+    model_config = SettingsConfigDict(env_prefix='TRADING_')
 
 
 # ==================== API CREDENTIALS ====================
@@ -435,9 +434,7 @@ class APICredentials(BaseSettings):
                 )
         return self
     
-    class Config:
-        env_prefix = ''
-        env_file = '.env'
+    model_config = SettingsConfigDict(env_prefix='', env_file='.env')
 
 
 # ==================== VALIDATION UTILITIES ====================

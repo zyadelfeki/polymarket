@@ -9,7 +9,7 @@ network partitions when the threshold is exceeded.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 try:
@@ -72,12 +72,22 @@ class NetworkHealthMonitor:
 
     def __init__(self, partition_threshold_seconds: int = 15):
         self.state = NetworkPartitionState(
-            last_successful_api_call=datetime.utcnow(),
+            last_successful_api_call=self._utc_now(),
             partition_threshold_seconds=partition_threshold_seconds,
         )
 
+    @staticmethod
+    def _utc_now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _normalize_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
     def record_success(self) -> None:
-        self.state.last_successful_api_call = datetime.utcnow()
+        self.state.last_successful_api_call = self._utc_now()
         if self.state.is_partitioned:
             logger.info("network_recovered")
             self.state.is_partitioned = False
@@ -87,7 +97,7 @@ class NetworkHealthMonitor:
         self.state.last_failure = reason
 
     def check_partition(self) -> bool:
-        elapsed = (datetime.utcnow() - self.state.last_successful_api_call).total_seconds()
+        elapsed = (self._utc_now() - self._normalize_utc(self.state.last_successful_api_call)).total_seconds()
         if elapsed > self.state.partition_threshold_seconds and not self.state.is_partitioned:
             logger.critical(
                 "network_partition_detected",
@@ -99,4 +109,4 @@ class NetworkHealthMonitor:
         return self.state.is_partitioned
 
     def time_since_success(self) -> timedelta:
-        return datetime.utcnow() - self.state.last_successful_api_call
+        return self._utc_now() - self._normalize_utc(self.state.last_successful_api_call)

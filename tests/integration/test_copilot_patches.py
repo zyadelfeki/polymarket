@@ -36,6 +36,16 @@ class StubLedger:
     async def get_equity(self):
         return Decimal("1000")
 
+    def calculate_breakeven_price(
+        self,
+        entry_price: Decimal,
+        quantity: Decimal,
+        fee_rate: Decimal = Decimal("0.02"),
+    ) -> Decimal:
+        """Mirrors database.ledger.Ledger.calculate_breakeven_price."""
+        buy_cost = entry_price * (Decimal("1") + fee_rate)
+        return buy_cost / (Decimal("1") - fee_rate)
+
 
 class StubClient:
     paper_trading = True

@@ -1,12 +1,19 @@
 """
-Platt scaling calibration for Charlie p_win probabilities.
+Platt scaling calibration for Charlie YES-side raw probabilities.
 
 Two modes:
-  - If ``models/platt_scaler.pkl`` exists → apply logistic calibration
+    - If ``models/platt_scaler.pkl`` exists → apply logistic calibration
   - Otherwise → passthrough (return p_win unchanged)
 
 The scaler is fitted offline by ``scripts/fit_calibration.py`` once
 ``data/calibration_dataset.csv`` accumulates ≥ 100 samples.
+
+Inference contract
+------------------
+`calibrate_p_win()` expects the uncalibrated YES-side probability emitted by
+Charlie before any side selection.  The offline fitter must therefore train on
+the same feature representation: `logit(raw_yes_prob)` with labels
+`actual_yes_outcome`.
 """
 
 from __future__ import annotations
@@ -48,7 +55,7 @@ def _load_scaler():
 
 
 def calibrate_p_win(p_win_raw: float) -> float:
-    """Return calibrated p_win.  Passthrough if no scaler is available."""
+    """Return calibrated YES-side probability. Passthrough if no scaler is available."""
     model = _load_scaler()
     if model is None:
         return p_win_raw

@@ -390,15 +390,16 @@ else:
 
 # ---------- calibration progress ----------
 print(f"\n--- CALIBRATION PROGRESS ---")
-_cal_csv = Path("data/calibration_dataset.csv")
+_cal_csv = Path("data/calibration_dataset_v2.csv")
+_legacy_cal_csv = Path("data/calibration_dataset.csv")
+import csv as _csv
 if _cal_csv.exists():
-    import csv as _csv
     _cal_p, _cal_a = [], []
     with open(_cal_csv, "r", newline="") as _cf:
         for _row in _csv.DictReader(_cf):
             try:
-                _cal_p.append(float(_row["p_win_raw"]))
-                _cal_a.append(int(_row["actual_outcome"]))
+                _cal_p.append(float(_row["raw_yes_prob"]))
+                _cal_a.append(int(_row["actual_yes_outcome"]))
             except (KeyError, ValueError):
                 pass
     _cal_n = len(_cal_p)
@@ -428,7 +429,11 @@ if _cal_csv.exists():
         print(f"  [..] Need {_remaining} more samples before fitting (target: 100)")
         print(f"     At ~20-30 settlements/day -> ~{max(1, _remaining // 25)} more days")
 else:
-    print("  (no calibration data yet — run: python scripts/build_calibration_dataset.py)")
+    print("  (no schema-v2 calibration data yet — wait for scored observations to resolve)")
+if _legacy_cal_csv.exists():
+    with open(_legacy_cal_csv, "r", newline="") as _legacy_cf:
+        _legacy_rows = sum(1 for _ in _csv.DictReader(_legacy_cf))
+    print(f"  Legacy archive rows retained: {_legacy_rows}")
 
 # ---------- PnL attribution by market ----------
 print(f"\n--- PnL ATTRIBUTION BY MARKET ---")

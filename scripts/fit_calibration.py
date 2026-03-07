@@ -4,7 +4,7 @@ Fit Platt scaler from calibration dataset.
 
 Guard: exits without fitting if sample count < 100.
 When sufficient data is available, fits LogisticRegression(C=1.0) on
-logit(p_win_raw) → actual_outcome and saves to models/platt_scaler.pkl.
+logit(raw_yes_prob) → actual_yes_outcome and saves to models/platt_scaler.pkl.
 
 Prints ECE before/after and a 10-bin reliability table.
 """
@@ -18,7 +18,8 @@ from pathlib import Path
 
 import numpy as np
 
-CSV_PATH = Path("data/calibration_dataset.csv")
+CSV_PATH = Path("data/calibration_dataset_v2.csv")
+LEGACY_CSV_PATH = Path("data/calibration_dataset.csv")
 SCALER_PATH = Path("models/platt_scaler.pkl")
 MIN_SAMPLES = 100
 
@@ -58,18 +59,47 @@ def _reliability_table(
 
 def main():
     if not CSV_PATH.exists():
-        print(f"ERROR: {CSV_PATH} not found. Run build_calibration_dataset.py first.")
+        print(f"ERROR: {CSV_PATH} not found. Wait for schema-v2 observations to resolve first.")
         sys.exit(1)
 
-    # Load data
+    # Load data.  Inference expects RAW YES-side probability as input to the
+    # logit transform, so training must use the same feature space.  Legacy
+    # rows that only contain trade-side / already-calibrated probabilities are
+    # rejected because they do not match the inference contract.
     p_raw, actual = [], []
+    skipped_legacy = 0
     with open(CSV_PATH, "r", newline="") as f:
         for row in csv.DictReader(f):
-            p_raw.append(float(row["p_win_raw"]))
-            actual.append(1 if float(row["actual_outcome"]) >= 0.5 else 0)
+            schema_version = row.get("schema_version")
+            feature_space = row.get("feature_space")
+            label_space = row.get("label_space")
+            raw_yes_prob = row.get("raw_yes_prob")
+            actual_yes_outcome = row.get("actual_yes_outcome")
+
+            if schema_version == "2" and feature_space == "yes_side_raw_probability" and label_space == "yes_market_outcome":
+                p_raw.append(float(raw_yes_prob))
+                actual.append(1 if float(actual_yes_outcome) >= 0.5 else 0)
+            else:
+                skipped_legacy += 1
 
     n = len(p_raw)
+    archived_legacy_rows = 0
+    if LEGACY_CSV_PATH.exists():
+        with open(LEGACY_CSV_PATH, "r", newline="") as legacy_file:
+            archived_legacy_rows = sum(1 for _ in csv.DictReader(legacy_file))
+
     print(f"Calibration samples: {n}")
+    if skipped_legacy:
+        print(f"Skipped legacy / incompatible rows: {skipped_legacy}")
+    if archived_legacy_rows:
+        print(f"Archived legacy rows ignored: {archived_legacy_rows}")
+
+    if n == 0:
+        print(
+            f"\nERROR: {CSV_PATH.name} contains no schema_version=2 rows with "
+            "feature_space=yes_side_raw_probability and label_space=yes_market_outcome."
+        )
+        sys.exit(1)
 
     if n < MIN_SAMPLES:
         print(
