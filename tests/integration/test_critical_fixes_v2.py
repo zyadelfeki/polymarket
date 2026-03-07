@@ -197,6 +197,122 @@ async def test_async_record_reconciled_position_preserves_accounting_semantics(t
 
 
 @pytest.mark.asyncio
+async def test_startup_open_order_reconciliation_imports_exchange_only_order(tmp_path):
+    db_path = tmp_path / "open_orders_import.db"
+    ledger = AsyncLedger(db_path=str(db_path))
+    await ledger.initialize()
+
+    class StubClient:
+        async def get_open_orders(self):
+            return [
+                {
+                    "order_id": "exchange_1",
+                    "market_id": "m1",
+                    "token_id": "token_1",
+                    "outcome": "YES",
+                    "side": "BUY",
+                    "size": "15",
+                    "price": "0.42",
+                    "opened_at": "2026-03-07T00:00:00+00:00",
+                }
+            ]
+
+    bot = TradingSystem(config={})
+    bot.ledger = ledger
+    bot.api_client = StubClient()
+
+    summary = await bot._reconcile_missing_open_orders_on_startup()
+    open_orders = await ledger.get_open_orders()
+
+    assert summary == {"exchange_open_orders": 1, "imported": 1, "already_known": 0, "skipped": 0}
+    assert len(open_orders) == 1
+    assert open_orders[0]["order_id"] == "exchange_1"
+    assert open_orders[0]["market_id"] == "m1"
+    assert open_orders[0]["order_state"] == "SUBMITTED"
+    assert open_orders[0]["notes"] == "startup_open_order_reconcile"
+
+    await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_open_order_reconciliation_does_not_duplicate_known_local_order(tmp_path):
+    db_path = tmp_path / "open_orders_known.db"
+    ledger = AsyncLedger(db_path=str(db_path))
+    await ledger.initialize()
+    await ledger.import_exchange_open_order(
+        order_id="exchange_1",
+        market_id="m1",
+        token_id="token_1",
+        outcome="YES",
+        side="BUY",
+        size=Decimal("15"),
+        price=Decimal("0.42"),
+        notes="preexisting",
+    )
+
+    class StubClient:
+        async def get_open_orders(self):
+            return [
+                {
+                    "order_id": "exchange_1",
+                    "market_id": "m1",
+                    "token_id": "token_1",
+                    "outcome": "YES",
+                    "side": "BUY",
+                    "size": "15",
+                    "price": "0.42",
+                }
+            ]
+
+    bot = TradingSystem(config={})
+    bot.ledger = ledger
+    bot.api_client = StubClient()
+
+    summary = await bot._reconcile_missing_open_orders_on_startup()
+    open_orders = await ledger.get_open_orders()
+
+    assert summary == {"exchange_open_orders": 1, "imported": 0, "already_known": 1, "skipped": 0}
+    assert len(open_orders) == 1
+    assert open_orders[0]["notes"] == "preexisting"
+
+    await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_open_order_reconciliation_no_op_when_exchange_has_no_open_orders(tmp_path):
+    db_path = tmp_path / "open_orders_empty.db"
+    ledger = AsyncLedger(db_path=str(db_path))
+    await ledger.initialize()
+
+    class StubClient:
+        async def get_open_orders(self):
+            return []
+
+    bot = TradingSystem(config={})
+    bot.ledger = ledger
+    bot.api_client = StubClient()
+
+    summary = await bot._reconcile_missing_open_orders_on_startup()
+    open_orders = await ledger.get_open_orders()
+
+    assert summary == {"exchange_open_orders": 0, "imported": 0, "already_known": 0, "skipped": 0}
+    assert open_orders == []
+
+    await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_polymarket_client_v2_get_open_orders_returns_empty_list_when_unavailable():
+    client = PolymarketClientV2(paper_trading=True, retry_backoff_base=0)
+    client.client = object()
+    client.authenticated = True
+
+    open_orders = await client.get_open_orders()
+
+    assert open_orders == []
+
+
+@pytest.mark.asyncio
 async def test_network_partition_blocks_order_v2():
     class StubClient:
         paper_trading = True

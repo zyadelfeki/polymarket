@@ -635,6 +635,78 @@ class TradingSystem:
             market_ids=sorted(self._market_lifecycle_state.keys()),
         )
 
+    async def _reconcile_missing_open_orders_on_startup(self) -> Dict[str, int]:
+        if self.ledger is None or self.api_client is None:
+            return {"exchange_open_orders": 0, "imported": 0, "already_known": 0, "skipped": 0}
+
+        exchange_open_orders = await self._safe_await(
+            "api_client.get_open_orders.startup_reconcile",
+            self.api_client.get_open_orders(),
+            timeout_seconds=30.0,
+            default=[],
+        ) or []
+        local_open_orders = await self._safe_await(
+            "ledger.get_open_orders.startup_reconcile",
+            self.ledger.get_open_orders(),
+            timeout_seconds=30.0,
+            default=[],
+        ) or []
+
+        known_order_ids = {
+            str(order.get("order_id") or "")
+            for order in local_open_orders
+            if str(order.get("order_id") or "")
+        }
+
+        imported = 0
+        already_known = 0
+        skipped = 0
+
+        for order in exchange_open_orders:
+            order_id = str(order.get("order_id") or "")
+            market_id = str(order.get("market_id") or "")
+            if not order_id or not market_id:
+                skipped += 1
+                continue
+
+            if order_id in known_order_ids:
+                already_known += 1
+                continue
+
+            size = Decimal(str(order.get("size") or "0"))
+            price = Decimal(str(order.get("price") or "0"))
+            if size <= 0 or price <= 0:
+                skipped += 1
+                continue
+
+            await self.ledger.import_exchange_open_order(
+                order_id=order_id,
+                market_id=market_id,
+                token_id=str(order.get("token_id") or ""),
+                outcome=str(order.get("outcome") or order.get("side") or "UNKNOWN"),
+                side=str(order.get("side") or "BUY"),
+                size=size,
+                price=price,
+                opened_at=order.get("opened_at"),
+                notes="startup_open_order_reconcile",
+            )
+            known_order_ids.add(order_id)
+            imported += 1
+
+        logger.info(
+            "startup_open_order_reconciliation_complete",
+            exchange_open_orders=len(exchange_open_orders),
+            imported=imported,
+            already_known=already_known,
+            skipped=skipped,
+        )
+        return {
+            "exchange_open_orders": len(exchange_open_orders),
+            "imported": imported,
+            "already_known": already_known,
+            "skipped": skipped,
+        }
+
     async def _reconcile_positions_on_startup(self) -> Dict[str, int]:
         if self.ledger is None or self.api_client is None:
             return {"exchange_positions": 0, "imported": 0, "already_known": 0, "skipped": 0}
@@ -2501,6 +2573,7 @@ class TradingSystem:
                 recovered_pnl=str(recovered_pnl),
             )
 
+            await self._reconcile_missing_open_orders_on_startup()
             await self._reconcile_positions_on_startup()
 
             # Refresh performance tracker after reconcile

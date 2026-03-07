@@ -2090,6 +2090,61 @@ class AsyncLedger:
             ),
         )
 
+    async def import_exchange_open_order(
+        self,
+        *,
+        order_id: str,
+        market_id: str,
+        token_id: str = "",
+        outcome: str,
+        side: str = "BUY",
+        size: Decimal,
+        price: Decimal,
+        opened_at: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> None:
+        """Idempotently import an exchange-open order into local order tracking."""
+        order_id = str(order_id or "").strip()
+        market_id = str(market_id or "").strip()
+        if not order_id:
+            raise ValueError("order_id is required")
+        if not market_id:
+            raise ValueError("market_id is required")
+
+        size = Decimal(str(size))
+        price = Decimal(str(price))
+        if size <= 0:
+            raise ValueError(f"Size must be positive: {size}")
+        if price <= 0:
+            raise ValueError(f"Price must be positive: {price}")
+
+        opened_at_value = opened_at or datetime.now(timezone.utc).isoformat()
+        order_state = str(side or "BUY").upper()
+        if order_state not in self._OPEN_ORDER_STATES:
+            order_state = "SUBMITTED"
+
+        await self.execute(
+            """
+            INSERT INTO order_tracking
+                (order_id, market_id, token_id, outcome, side, size, price,
+                 order_state, opened_at, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(order_id) DO NOTHING
+            """,
+            (
+                order_id,
+                market_id,
+                token_id,
+                str(outcome or side or "UNKNOWN").upper(),
+                str(side or "BUY").upper(),
+                str(size),
+                str(price),
+                order_state,
+                opened_at_value,
+                notes,
+            ),
+        )
+
     async def transition_order_state(
         self,
         order_id: str,
