@@ -637,7 +637,15 @@ class TradingSystem:
 
     async def _reconcile_missing_open_orders_on_startup(self) -> Dict[str, int]:
         if self.ledger is None or self.api_client is None:
-            return {"exchange_open_orders": 0, "imported": 0, "already_known": 0, "skipped": 0}
+            return {
+                "exchange_open_orders": 0,
+                "imported": 0,
+                "already_known": 0,
+                "skipped": 0,
+                "cancelled": 0,
+                "cancel_failures": 0,
+                "left_open_after_failed_cancel": 0,
+            }
 
         exchange_open_orders = await self._safe_await(
             "api_client.get_open_orders.startup_reconcile",
@@ -661,6 +669,9 @@ class TradingSystem:
         imported = 0
         already_known = 0
         skipped = 0
+        cancelled = 0
+        cancel_failures = 0
+        left_open_after_failed_cancel = 0
 
         for order in exchange_open_orders:
             order_id = str(order.get("order_id") or "")
@@ -693,18 +704,58 @@ class TradingSystem:
             known_order_ids.add(order_id)
             imported += 1
 
+            cancel_error: Optional[str] = None
+            cancel_ok = False
+            if hasattr(self.api_client, "cancel_order"):
+                try:
+                    cancel_ok = await asyncio.wait_for(
+                        self.api_client.cancel_order(order_id), timeout=8.0
+                    )
+                except Exception as exc:
+                    cancel_error = str(exc)
+            else:
+                cancel_error = "cancel_order_not_available"
+
+            if cancel_ok:
+                await self.ledger.transition_order_state(
+                    order_id,
+                    "CANCELLED",
+                    notes="startup_orphan_auto_cancelled",
+                )
+                cancelled += 1
+                logger.info(
+                    "startup_orphan_order_auto_cancelled",
+                    order_id=order_id,
+                    market_id=market_id,
+                )
+            else:
+                cancel_failures += 1
+                left_open_after_failed_cancel += 1
+                logger.warning(
+                    "startup_orphan_order_auto_cancel_failed",
+                    order_id=order_id,
+                    market_id=market_id,
+                    error=cancel_error or "cancel_returned_false",
+                )
+
         logger.info(
             "startup_open_order_reconciliation_complete",
             exchange_open_orders=len(exchange_open_orders),
             imported=imported,
             already_known=already_known,
             skipped=skipped,
+            cancelled=cancelled,
+            cancel_failures=cancel_failures,
+            left_open_after_failed_cancel=left_open_after_failed_cancel,
         )
         return {
             "exchange_open_orders": len(exchange_open_orders),
             "imported": imported,
             "already_known": already_known,
             "skipped": skipped,
+            "cancelled": cancelled,
+            "cancel_failures": cancel_failures,
+            "left_open_after_failed_cancel": left_open_after_failed_cancel,
         }
 
     async def _reconcile_positions_on_startup(self) -> Dict[str, int]:
