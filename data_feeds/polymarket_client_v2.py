@@ -1936,6 +1936,69 @@ class PolymarketClientV2:
             return positions
         return []
 
+    async def get_open_orders(self) -> List[Dict]:
+        """Return currently open exchange orders with a stable dict shape."""
+        if not self.client:
+            return []
+
+        async def _fetch_open_orders() -> Any:
+            await self._throttle()
+            loop = asyncio.get_running_loop()
+            if hasattr(self.client, "get_open_orders"):
+                return await loop.run_in_executor(None, self.client.get_open_orders)
+            if hasattr(self.client, "get_orders"):
+                return await loop.run_in_executor(None, self.client.get_orders)
+            logger.warning("get_open_orders_not_available")
+            return []
+
+        raw_orders = await self._execute_with_retries("get_open_orders", _fetch_open_orders)
+        if not isinstance(raw_orders, list):
+            return []
+
+        normalized_orders: List[Dict] = []
+        for order in raw_orders:
+            if isinstance(order, dict):
+                data = dict(order)
+                get_value = data.get
+            else:
+                data = order
+                get_value = lambda key, default=None: getattr(data, key, default)
+
+            normalized_orders.append(
+                {
+                    "order_id": str(
+                        get_value("order_id")
+                        or get_value("id")
+                        or get_value("orderID")
+                        or ""
+                    ),
+                    "market_id": str(
+                        get_value("market_id")
+                        or get_value("market")
+                        or get_value("condition_id")
+                        or ""
+                    ),
+                    "token_id": str(
+                        get_value("token_id")
+                        or get_value("asset_id")
+                        or get_value("assetId")
+                        or ""
+                    ),
+                    "outcome": str(get_value("outcome") or ""),
+                    "side": str(get_value("side") or "BUY"),
+                    "size": str(
+                        get_value("size")
+                        or get_value("original_size")
+                        or get_value("amount")
+                        or "0"
+                    ),
+                    "price": str(get_value("price") or "0"),
+                    "status": str(get_value("status") or get_value("state") or "SUBMITTED"),
+                    "opened_at": get_value("opened_at") or get_value("created_at") or get_value("timestamp"),
+                }
+            )
+        return normalized_orders
+
     async def get_account_balance(self) -> Decimal:
         """Return total USDC balance as Decimal."""
         if self.paper_trading:
