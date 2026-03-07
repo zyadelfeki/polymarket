@@ -921,63 +921,6 @@ class TradingSystem:
                     trigger=trigger,
                 )
 
-                # Record paper position in order_tracking so the settlement loop
-                # (_settle_resolved_open_orders → ledger.get_open_orders) can find it.
-                #
-                # WHY HERE and not only inside _execute_opportunity:
-                # _execute_opportunity already calls record_order_created BUT only
-                # after passing the Charlie gate, risk checks, and execution service.
-                # In paper mode all three can fail (no live API key / Charlie
-                # unavailable), which either skips recording entirely or transitions
-                # the created row to ERROR (a terminal state invisible to
-                # get_open_orders).  By recording unconditionally here we guarantee
-                # a CREATED row in order_tracking for every detected opportunity,
-                # regardless of what the downstream execution path does.
-                #
-                # NOTE: record_order_created (→ order_tracking) is intentionally
-                # used over record_trade_entry (→ positions) because
-                # _settle_resolved_open_orders calls get_open_orders(), which only
-                # queries order_tracking.  Using record_trade_entry would write to
-                # the wrong table and the settlement scan would still see 0 rows.
-                if self.ledger is not None:
-                    _pm_market_id = str(opportunity.get("market_id") or "").strip()
-                    _pm_token_id = str(opportunity.get("token_id") or "").strip()
-                    _pm_side = str(opportunity.get("side") or "YES").upper()
-                    _pm_price_raw = opportunity.get("market_price") or opportunity.get("price")
-                    if _pm_market_id and _pm_token_id and _pm_price_raw is not None:
-                        try:
-                            # Deterministic: same market+token always produces the same
-                            # order_id.  record_order_created uses ON CONFLICT(order_id)
-                            # DO NOTHING, so repeated scans of the same opportunity are
-                            # no-ops — one row per market/token stays open until settled.
-                            _pm_order_id = f"paper_{_pm_market_id}_{_pm_token_id}"
-                            _pm_price = to_decimal(_pm_price_raw)
-                            _pm_size = to_decimal(
-                                self.config.get("trading", {}).get("min_position_size", "10.00")
-                            )
-                            await self.ledger.record_order_created(
-                                order_id=_pm_order_id,
-                                market_id=_pm_market_id,
-                                token_id=_pm_token_id,
-                                outcome=_pm_side,
-                                side="BUY",
-                                size=_pm_size,
-                                price=_pm_price,
-                                strategy="latency_arbitrage_btc",
-                            )
-                            logger.debug(
-                                "paper_trade_recorded",
-                                market_id=_pm_market_id,
-                                order_id=_pm_order_id,
-                                price=str(_pm_price),
-                                size=str(_pm_size),
-                            )
-                        except Exception as _pm_exc:
-                            logger.warning(
-                                "paper_trade_record_failed",
-                                error=str(_pm_exc),
-                            )
-
             await self._execute_opportunity(opportunity=opportunity, trigger=trigger)
 
     def _resolve_opportunity_confidence(self, confidence_value: Any) -> Decimal:
@@ -1316,7 +1259,6 @@ class TradingSystem:
                 timeout_seconds=10.0,
                 default=None,
             )
-
             if charlie_rec is None:
                 logger.info(
                     "order_blocked_no_charlie_signal",
@@ -1351,6 +1293,42 @@ class TradingSystem:
                     "observe_only_bad_calibration" if observe_only_bad_calibration else "trade_enabled"
                 ),
             )
+
+            if charlie_rec.side != _opp_original_side:
+                remapped_token_id = str(
+                    opportunity.get("yes_token_id") if charlie_rec.side == "YES" else opportunity.get("no_token_id")
+                ).strip()
+                remapped_price_raw = (
+                    opportunity.get("yes_price") if charlie_rec.side == "YES" else opportunity.get("no_price")
+                )
+                if not remapped_token_id or remapped_price_raw is None:
+                    await self._update_calibration_observation(
+                        observation_id,
+                        guard_block_reason="charlie_side_mismatch",
+                        training_eligibility="blocked_pre_execution",
+                    )
+                    logger.warning(
+                        "blocked_by_charlie_side_mismatch",
+                        market_id=market_id,
+                        token_id=token_id,
+                        opportunity_side=_opp_original_side,
+                        charlie_side=charlie_rec.side,
+                        trigger=trigger,
+                    )
+                    self._session_stats["blocked_charlie_rejected"] += 1
+                    return
+
+                token_id = remapped_token_id
+                price = to_decimal(remapped_price_raw)
+                logger.info(
+                    "charlie_execution_target_remapped",
+                    market_id=market_id,
+                    opportunity_side=_opp_original_side,
+                    charlie_side=charlie_rec.side,
+                    token_id=token_id,
+                    price=str(price),
+                    trigger=trigger,
+                )
 
             quarantine_entry = self._get_active_quarantine_entry(market_id)
             if quarantine_entry is not None:
@@ -1607,10 +1585,13 @@ class TradingSystem:
                 )
                 return
         else:
-            logger.warning(
-                "charlie_gate_not_initialised — proceeding without Charlie (should not happen in production)",
+            logger.error(
+                "opportunity_blocked_charlie_unavailable",
                 market_id=market_id,
+                trigger=trigger,
             )
+            self._session_stats["blocked_charlie_rejected"] += 1
+            return
 
         # --- Absolute max entry-price filter (side-symmetric) ---------------
         # Block any bet — YES or NO — when the token being purchased costs more

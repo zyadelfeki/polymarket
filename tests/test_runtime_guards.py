@@ -211,6 +211,92 @@ async def test_charlie_receives_yes_price_for_yes_opportunity(base_config):
 
 
 @pytest.mark.asyncio
+async def test_charlie_unavailable_blocks_trade_submission(base_config):
+    system = TradingSystem(base_config)
+    system.execution = AsyncMock()
+    system.execution.place_order_with_risk_check = AsyncMock()
+    system.ledger = AsyncMock()
+    system.ledger.get_equity.return_value = Decimal("100")
+    system.circuit_breaker = AsyncMock()
+    system.circuit_breaker.can_trade = AsyncMock(return_value=True)
+
+    await system._execute_opportunity(
+        {
+            "market_id": "market-charlie-missing",
+            "token_id": "token-yes",
+            "side": "YES",
+            "edge": Decimal("0.05"),
+            "market_price": Decimal("0.50"),
+            "confidence": "HIGH",
+        },
+        trigger="test",
+    )
+
+    assert system.execution.place_order_with_risk_check.await_count == 0
+    assert system._session_stats["blocked_charlie_rejected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_charlie_side_flip_without_explicit_token_mapping_blocks_trade(base_config):
+    system = TradingSystem(base_config)
+    system.execution = AsyncMock()
+    system.execution.place_order_with_risk_check = AsyncMock()
+    system.ledger = AsyncMock()
+    system.ledger.get_equity.return_value = Decimal("100")
+    system.circuit_breaker = AsyncMock()
+    system.circuit_breaker.can_trade = AsyncMock(return_value=True)
+    system.charlie_gate = CaptureCharlieGate(result=DummyRec(side="NO"))
+
+    await system._execute_opportunity(
+        {
+            "market_id": "market-side-flip",
+            "token_id": "token-yes",
+            "side": "YES",
+            "edge": Decimal("0.05"),
+            "market_price": Decimal("0.41"),
+            "confidence": "HIGH",
+            "question": "Will BTC close above 100k?",
+        },
+        trigger="test",
+    )
+
+    assert system.execution.place_order_with_risk_check.await_count == 0
+    assert system._session_stats["blocked_charlie_rejected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_paper_scan_does_not_leave_open_order_when_charlie_rejects(tmp_path, base_config):
+    system = TradingSystem(base_config)
+    ledger = await _attach_sqlite_runtime_store(system, tmp_path / "runtime.db")
+    try:
+        system.execution = AsyncMock()
+        system.execution.place_order_with_risk_check = AsyncMock()
+        system.circuit_breaker = AsyncMock()
+        system.circuit_breaker.can_trade = AsyncMock(return_value=True)
+        system.strategy_engine = AsyncMock()
+        system.charlie_gate = CaptureCharlieGate(result=None)
+        system.strategy_engine.scan_opportunities = AsyncMock(
+            return_value={
+                "market_id": "market-paper-reject",
+                "token_id": "token-yes",
+                "side": "YES",
+                "edge": Decimal("0.05"),
+                "market_price": Decimal("0.50"),
+                "confidence": "HIGH",
+                "question": "Will BTC close above 100k?",
+            }
+        )
+
+        await system._run_strategy_scan(trigger="unit_test")
+
+        open_orders = await ledger.get_open_orders()
+        assert open_orders == []
+        assert system.execution.place_order_with_risk_check.await_count == 0
+    finally:
+        await ledger.close()
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_guard_blocks_side_flip_and_allows_improved_add_on(base_config):
     config = _resolve_runtime_controls(base_config | {
         "runtime_controls": {
