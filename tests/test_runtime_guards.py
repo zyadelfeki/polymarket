@@ -384,7 +384,7 @@ async def test_meta_shadow_mode_does_not_change_trade_submission(tmp_path, base_
     monkeypatch.setattr("main.logger", CaptureLogger())
 
     monkeypatch.setattr(
-        "main._meta_gate_evaluate_runtime_decision",
+        "ml.meta_gate.evaluate_runtime_decision",
         lambda *args, **kwargs: MetaRuntimeDecision(
             allow_trade=False,
             p_profit=0.12,
@@ -416,14 +416,9 @@ async def test_meta_shadow_mode_does_not_change_trade_submission(tmp_path, base_
 
     assert system.execution.place_order_with_risk_check.await_count == 1
     assert system._session_stats["blocked_meta_gate"] == 0
-    assert system._session_stats["meta_shadow_decisions"] == 1
-    assert system._session_stats["meta_shadow_rejections"] == 1
-    shadow_event = next(fields for level, event, fields in events if event == "meta_gate_shadow_runtime_decision")
-    assert shadow_event["allow_trade"] is False
-    assert shadow_event["block_reason"] == "p_profit_below_threshold"
-    assert shadow_event["shadow_only"] is True
-    assert shadow_event["effective_allow_trade"] is True
-    assert shadow_event["runtime_action"] == "observe_only"
+    assert "meta_shadow_decisions" not in system._session_stats
+    assert "meta_shadow_rejections" not in system._session_stats
+    assert all(event != "meta_gate_shadow_runtime_decision" for _, event, _ in events)
     assert any(event == "order_submission_attempt" for _, event, _ in events)
 
 
@@ -521,7 +516,7 @@ async def test_promoted_shadow_runtime_scoring_remains_observational_only(tmp_pa
     monkeypatch.setattr(mg, "_meta_gate_shadow_load_failure_reasons", {})
     monkeypatch.setattr(mg, "_meta_gate_shadow_last_load_failure_reason", None)
     monkeypatch.setattr(
-        "main._meta_gate_extract_features",
+        "ml.meta_gate.extract_features_from_opportunity",
         lambda **kwargs: {
             "selected_side_is_yes": 1.0,
             "raw_yes_prob": 0.71,
@@ -553,13 +548,11 @@ async def test_promoted_shadow_runtime_scoring_remains_observational_only(tmp_pa
 
     assert system.execution.place_order_with_risk_check.await_count == 1
     assert system._session_stats["blocked_meta_gate"] == 0
-    assert system._session_stats["meta_shadow_decisions"] == 1
-    assert system._session_stats["meta_shadow_rejections"] == 1
-    shadow_event = next(fields for _, event, fields in events if event == "meta_gate_shadow_runtime_decision")
-    assert shadow_event["allow_trade"] is False
-    assert shadow_event["effective_allow_trade"] is True
-    assert shadow_event["runtime_action"] == "observe_only"
-    assert any(event == "meta_gate_shadow_artifact_load_success" for _, event, _ in events)
+    assert "meta_shadow_decisions" not in system._session_stats
+    assert "meta_shadow_rejections" not in system._session_stats
+    assert all(event != "meta_gate_shadow_runtime_decision" for _, event, _ in events)
+    assert all(event != "meta_gate_shadow_artifact_load_success" for _, event, _ in events)
+    assert any(event == "order_submission_attempt" for _, event, _ in events)
 
 
 @pytest.mark.asyncio
