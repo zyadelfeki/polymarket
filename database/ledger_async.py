@@ -486,6 +486,126 @@ class ConnectionPool:
                 await temp_conn.execute("PRAGMA foreign_keys = ON")
                 await temp_conn.execute("PRAGMA journal_mode = WAL")
                 await temp_conn.execute("PRAGMA synchronous = NORMAL")  # safe + faster writes in WAL mode
+
+                calibration_table_sql = """
+                    CREATE TABLE IF NOT EXISTS calibration_observations (
+                        observation_id           TEXT PRIMARY KEY,
+                        candidate_id             TEXT NOT NULL DEFAULT '',
+                        cluster_id               TEXT NOT NULL DEFAULT '',
+                        feature_snapshot_ts      TEXT NOT NULL DEFAULT '',
+                        feature_schema_version   TEXT NOT NULL DEFAULT 'meta_candidate_v1',
+                        cluster_policy_version   TEXT NOT NULL DEFAULT 'cluster_v1',
+                        training_eligibility     TEXT NOT NULL DEFAULT 'pending_execution',
+                        market_id                TEXT NOT NULL,
+                        token_id                 TEXT NOT NULL DEFAULT '',
+                        market_question          TEXT,
+                        signal_side              TEXT,
+                        opportunity_side         TEXT,
+                        selected_side            TEXT,
+                        observation_source       TEXT NOT NULL,
+                        observation_mode         TEXT NOT NULL,
+                        raw_yes_prob             TEXT,
+                        yes_side_raw_probability TEXT,
+                        calibrated_yes_prob      TEXT,
+                        selected_side_prob       TEXT,
+                        charlie_confidence       TEXT,
+                        charlie_implied_prob     TEXT,
+                        charlie_edge             TEXT,
+                        spread_bps               TEXT,
+                        time_to_expiry_seconds   INTEGER,
+                        token_price              TEXT,
+                        normalized_yes_price     TEXT,
+                        timestamp                TEXT NOT NULL,
+                        observed_at              TEXT NOT NULL,
+                        resolution_time_hint     TEXT,
+                        guard_block_reason       TEXT,
+                        calibration_blocked      INTEGER NOT NULL DEFAULT 0,
+                        trigger                  TEXT,
+                        status                   TEXT NOT NULL DEFAULT 'pending',
+                        actual_yes_outcome       TEXT,
+                        eventual_yes_market_outcome TEXT,
+                        resolved_at              TEXT,
+                        resolution_time          TEXT,
+                        order_id                 TEXT,
+                        trade_outcome            TEXT,
+                        created_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                """
+                calibration_candidate_columns = {
+                    "candidate_id": "ALTER TABLE calibration_observations ADD COLUMN candidate_id TEXT NOT NULL DEFAULT ''",
+                    "cluster_id": "ALTER TABLE calibration_observations ADD COLUMN cluster_id TEXT NOT NULL DEFAULT ''",
+                    "feature_snapshot_ts": "ALTER TABLE calibration_observations ADD COLUMN feature_snapshot_ts TEXT NOT NULL DEFAULT ''",
+                    "feature_schema_version": "ALTER TABLE calibration_observations ADD COLUMN feature_schema_version TEXT NOT NULL DEFAULT 'meta_candidate_v1'",
+                    "cluster_policy_version": "ALTER TABLE calibration_observations ADD COLUMN cluster_policy_version TEXT NOT NULL DEFAULT 'cluster_v1'",
+                    "training_eligibility": "ALTER TABLE calibration_observations ADD COLUMN training_eligibility TEXT NOT NULL DEFAULT 'pending_execution'",
+                    "charlie_confidence": "ALTER TABLE calibration_observations ADD COLUMN charlie_confidence TEXT",
+                    "charlie_implied_prob": "ALTER TABLE calibration_observations ADD COLUMN charlie_implied_prob TEXT",
+                    "charlie_edge": "ALTER TABLE calibration_observations ADD COLUMN charlie_edge TEXT",
+                    "spread_bps": "ALTER TABLE calibration_observations ADD COLUMN spread_bps TEXT",
+                    "time_to_expiry_seconds": "ALTER TABLE calibration_observations ADD COLUMN time_to_expiry_seconds INTEGER",
+                }
+                calibration_required_columns = {
+                    "candidate_id",
+                    "cluster_id",
+                    "feature_snapshot_ts",
+                    "feature_schema_version",
+                    "cluster_policy_version",
+                    "training_eligibility",
+                    "charlie_confidence",
+                    "charlie_implied_prob",
+                    "charlie_edge",
+                    "spread_bps",
+                    "time_to_expiry_seconds",
+                    "timestamp",
+                    "observed_at",
+                    "resolved_at",
+                    "resolution_time",
+                    "created_at",
+                    "updated_at",
+                }
+                calibration_index_statements = {
+                    "idx_calibration_observations_status": """
+                        CREATE INDEX IF NOT EXISTS idx_calibration_observations_status
+                        ON calibration_observations(status, observed_at)
+                    """,
+                    "idx_calibration_observations_market": """
+                        CREATE INDEX IF NOT EXISTS idx_calibration_observations_market
+                        ON calibration_observations(market_id, observed_at)
+                    """,
+                    "idx_calibration_observations_cluster": """
+                        CREATE INDEX IF NOT EXISTS idx_calibration_observations_cluster
+                        ON calibration_observations(cluster_id, feature_snapshot_ts)
+                    """,
+                }
+
+                async def _get_table_columns(table_name: str) -> List[str]:
+                    cursor = await temp_conn.execute(f"PRAGMA table_info({table_name})")
+                    return [row[1] for row in await cursor.fetchall()]
+
+                async def _ensure_calibration_observations_columns() -> List[str]:
+                    await temp_conn.execute(calibration_table_sql)
+                    calibration_columns = await _get_table_columns("calibration_observations")
+                    for column_name, alter_sql in calibration_candidate_columns.items():
+                        if column_name not in calibration_columns:
+                            await temp_conn.execute(alter_sql)
+                            calibration_columns.append(column_name)
+                    await temp_conn.commit()
+                    return calibration_columns
+
+                async def _verify_calibration_observations_schema() -> List[str]:
+                    calibration_columns = await _get_table_columns("calibration_observations")
+                    missing_columns = sorted(
+                        calibration_required_columns.difference(calibration_columns)
+                    )
+                    if missing_columns:
+                        raise RuntimeError(
+                            "calibration_observations physical schema verification failed; missing columns: "
+                            + ", ".join(missing_columns)
+                        )
+                    return calibration_columns
+
+                await _ensure_calibration_observations_columns()
                 
                 # Execute schema
                 await temp_conn.executescript(schema_sql)
@@ -605,91 +725,8 @@ class ConnectionPool:
                     )
                 await temp_conn.commit()
 
-                # Schema version table — tracks applied migrations
-                await temp_conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS schema_version (
-                        version     INTEGER PRIMARY KEY,
-                        applied_at  TEXT DEFAULT CURRENT_TIMESTAMP,
-                        description TEXT
-                    )
-                    """
-                )
-                await temp_conn.execute(
-                    "INSERT OR IGNORE INTO schema_version (version, description)"
-                    " VALUES (1, 'initial schema')"
-                )
-                await temp_conn.execute(
-                    "INSERT OR IGNORE INTO schema_version (version, description)"
-                    " VALUES (2, 'mode column + slippage tracking on order_tracking and positions')"
-                )
-                await temp_conn.execute(
-                    "INSERT OR IGNORE INTO schema_version (version, description)"
-                    " VALUES (3, 'sqlite-backed market quarantine registry')"
-                )
-                await temp_conn.execute(
-                    "INSERT OR IGNORE INTO schema_version (version, description)"
-                    " VALUES (4, 'sqlite-backed calibration observations + richer quarantine metadata')"
-                )
-                await temp_conn.execute(
-                    "INSERT OR IGNORE INTO schema_version (version, description)"
-                    " VALUES (5, 'canonical quarantine status + normalized calibration timestamps')"
-                )
-                await temp_conn.execute(
-                    "INSERT OR IGNORE INTO schema_version (version, description)"
-                    " VALUES (6, 'candidate snapshot metadata for meta-ready observation exhaust')"
-                )
                 await temp_conn.executescript(
                     """
-                    CREATE TABLE IF NOT EXISTS calibration_observations (
-                        observation_id           TEXT PRIMARY KEY,
-                        candidate_id             TEXT NOT NULL DEFAULT '',
-                        cluster_id               TEXT NOT NULL DEFAULT '',
-                        feature_snapshot_ts      TEXT NOT NULL DEFAULT '',
-                        feature_schema_version   TEXT NOT NULL DEFAULT 'meta_candidate_v1',
-                        cluster_policy_version   TEXT NOT NULL DEFAULT 'cluster_v1',
-                        training_eligibility     TEXT NOT NULL DEFAULT 'pending_execution',
-                        market_id                TEXT NOT NULL,
-                        token_id                 TEXT NOT NULL DEFAULT '',
-                        market_question          TEXT,
-                        signal_side              TEXT,
-                        opportunity_side         TEXT,
-                        selected_side            TEXT,
-                        observation_source       TEXT NOT NULL,
-                        observation_mode         TEXT NOT NULL,
-                        raw_yes_prob             TEXT,
-                        yes_side_raw_probability TEXT,
-                        calibrated_yes_prob      TEXT,
-                        selected_side_prob       TEXT,
-                        charlie_confidence       TEXT,
-                        charlie_implied_prob     TEXT,
-                        charlie_edge             TEXT,
-                        spread_bps               TEXT,
-                        time_to_expiry_seconds   INTEGER,
-                        token_price              TEXT,
-                        normalized_yes_price     TEXT,
-                        timestamp                TEXT NOT NULL,
-                        observed_at              TEXT NOT NULL,
-                        resolution_time_hint     TEXT,
-                        guard_block_reason       TEXT,
-                        calibration_blocked      INTEGER NOT NULL DEFAULT 0,
-                        trigger                  TEXT,
-                        status                   TEXT NOT NULL DEFAULT 'pending',
-                        actual_yes_outcome       TEXT,
-                        eventual_yes_market_outcome TEXT,
-                        resolved_at              TEXT,
-                        resolution_time          TEXT,
-                        order_id                 TEXT,
-                        trade_outcome            TEXT,
-                        created_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        updated_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_calibration_observations_status
-                    ON calibration_observations(status, observed_at);
-                    CREATE INDEX IF NOT EXISTS idx_calibration_observations_market
-                    ON calibration_observations(market_id, observed_at);
-                    CREATE INDEX IF NOT EXISTS idx_calibration_observations_cluster
-                    ON calibration_observations(cluster_id, feature_snapshot_ts);
                     CREATE TABLE IF NOT EXISTS market_quarantine (
                         market_id             TEXT PRIMARY KEY,
                         reason                TEXT NOT NULL,
@@ -708,27 +745,7 @@ class ConnectionPool:
                     ON market_quarantine(status, review_at, expiry_at);
                     """
                 )
-                calibration_cursor = await temp_conn.execute("PRAGMA table_info(calibration_observations)")
-                calibration_columns = [row[1] for row in await calibration_cursor.fetchall()]
-                calibration_candidate_columns = {
-                    "candidate_id": "ALTER TABLE calibration_observations ADD COLUMN candidate_id TEXT NOT NULL DEFAULT ''",
-                    "cluster_id": "ALTER TABLE calibration_observations ADD COLUMN cluster_id TEXT NOT NULL DEFAULT ''",
-                    "feature_snapshot_ts": "ALTER TABLE calibration_observations ADD COLUMN feature_snapshot_ts TEXT NOT NULL DEFAULT ''",
-                    "feature_schema_version": "ALTER TABLE calibration_observations ADD COLUMN feature_schema_version TEXT NOT NULL DEFAULT 'meta_candidate_v1'",
-                    "cluster_policy_version": "ALTER TABLE calibration_observations ADD COLUMN cluster_policy_version TEXT NOT NULL DEFAULT 'cluster_v1'",
-                    "training_eligibility": "ALTER TABLE calibration_observations ADD COLUMN training_eligibility TEXT NOT NULL DEFAULT 'pending_execution'",
-                    "charlie_confidence": "ALTER TABLE calibration_observations ADD COLUMN charlie_confidence TEXT",
-                    "charlie_implied_prob": "ALTER TABLE calibration_observations ADD COLUMN charlie_implied_prob TEXT",
-                    "charlie_edge": "ALTER TABLE calibration_observations ADD COLUMN charlie_edge TEXT",
-                    "spread_bps": "ALTER TABLE calibration_observations ADD COLUMN spread_bps TEXT",
-                    "time_to_expiry_seconds": "ALTER TABLE calibration_observations ADD COLUMN time_to_expiry_seconds INTEGER",
-                }
-                for column_name, alter_sql in calibration_candidate_columns.items():
-                    if column_name not in calibration_columns:
-                        await temp_conn.execute(alter_sql)
-                await temp_conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_calibration_observations_cluster ON calibration_observations(cluster_id, feature_snapshot_ts)"
-                )
+                await _ensure_calibration_observations_columns()
                 cursor = await temp_conn.execute("PRAGMA table_info(market_quarantine)")
                 quarantine_columns = [row[1] for row in await cursor.fetchall()]
                 if "status" not in quarantine_columns:
@@ -821,6 +838,60 @@ class ConnectionPool:
                             observation_id,
                         ),
                     )
+
+                await _verify_calibration_observations_schema()
+                for index_sql in calibration_index_statements.values():
+                    await temp_conn.execute(index_sql)
+
+                calibration_index_cursor = await temp_conn.execute(
+                    "PRAGMA index_list(calibration_observations)"
+                )
+                calibration_index_names = {
+                    row[1] for row in await calibration_index_cursor.fetchall()
+                }
+                missing_calibration_indexes = sorted(
+                    set(calibration_index_statements).difference(calibration_index_names)
+                )
+                if missing_calibration_indexes:
+                    raise RuntimeError(
+                        "calibration_observations physical schema verification failed; missing indexes: "
+                        + ", ".join(missing_calibration_indexes)
+                    )
+
+                # Schema version table — tracks applied migrations only after physical verification passes
+                await temp_conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS schema_version (
+                        version     INTEGER PRIMARY KEY,
+                        applied_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+                        description TEXT
+                    )
+                    """
+                )
+                await temp_conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, description)"
+                    " VALUES (1, 'initial schema')"
+                )
+                await temp_conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, description)"
+                    " VALUES (2, 'mode column + slippage tracking on order_tracking and positions')"
+                )
+                await temp_conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, description)"
+                    " VALUES (3, 'sqlite-backed market quarantine registry')"
+                )
+                await temp_conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, description)"
+                    " VALUES (4, 'sqlite-backed calibration observations + richer quarantine metadata')"
+                )
+                await temp_conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, description)"
+                    " VALUES (5, 'canonical quarantine status + normalized calibration timestamps')"
+                )
+                await temp_conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, description)"
+                    " VALUES (6, 'candidate snapshot metadata for meta-ready observation exhaust')"
+                )
                 await temp_conn.commit()
 
                 cursor = await temp_conn.execute(
