@@ -66,3 +66,4 @@ secrets.json
 run/
 *.pid
 
+results/
