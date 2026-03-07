@@ -11,7 +11,7 @@ from services.network_health import NetworkPartitionError
 from risk.circuit_breaker_v2 import CircuitBreakerV2, CircuitState
 from strategies.latency_arbitrage import LatencyArbitrageEngine
 from database.ledger_async import AsyncLedger
-from main_v2 import TradingBot
+from main import TradingSystem
 
 
 class StubAlertService:
@@ -68,14 +68,130 @@ async def test_position_reconciliation_imports_orphaned(tmp_path):
                 }
             ]
 
-    bot = TradingBot(config={"mode": "paper", "initial_capital": 10})
+    bot = TradingSystem(config={})
     bot.ledger = ledger
-    bot.polymarket_client = StubClient()
+    bot.api_client = StubClient()
 
-    await bot._reconcile_positions_on_startup()
+    summary = await bot._reconcile_positions_on_startup()
     positions = await ledger.get_open_positions()
+
+    assert summary == {"exchange_positions": 1, "imported": 1, "already_known": 0, "skipped": 0}
     assert len(positions) == 1
     assert positions[0].token_id == "token_1"
+
+    await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_position_reconciliation_does_not_duplicate_known_local_position(tmp_path):
+    db_path = tmp_path / "positions_known.db"
+    ledger = AsyncLedger(db_path=str(db_path))
+    await ledger.initialize()
+    await ledger.record_reconciled_position(
+        market_id="m1",
+        token_id="token_1",
+        side="BUY",
+        quantity=Decimal("1"),
+        entry_price=Decimal("0.5"),
+    )
+
+    class StubClient:
+        async def get_open_positions(self):
+            return [
+                {
+                    "token_id": "token_1",
+                    "market_id": "m1",
+                    "quantity": "1",
+                    "price": "0.5",
+                    "side": "BUY",
+                }
+            ]
+
+    bot = TradingSystem(config={})
+    bot.ledger = ledger
+    bot.api_client = StubClient()
+
+    summary = await bot._reconcile_positions_on_startup()
+    positions = await ledger.get_open_positions()
+
+    assert summary == {"exchange_positions": 1, "imported": 0, "already_known": 1, "skipped": 0}
+    assert len(positions) == 1
+
+    await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_position_reconciliation_no_op_on_empty_exchange_positions(tmp_path):
+    db_path = tmp_path / "positions_empty.db"
+    ledger = AsyncLedger(db_path=str(db_path))
+    await ledger.initialize()
+
+    class StubClient:
+        async def get_open_positions(self):
+            return []
+
+    bot = TradingSystem(config={})
+    bot.ledger = ledger
+    bot.api_client = StubClient()
+
+    summary = await bot._reconcile_positions_on_startup()
+    positions = await ledger.get_open_positions()
+
+    assert summary == {"exchange_positions": 0, "imported": 0, "already_known": 0, "skipped": 0}
+    assert positions == []
+
+    await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_async_record_reconciled_position_preserves_accounting_semantics(tmp_path):
+    db_path = tmp_path / "positions_accounting.db"
+    ledger = AsyncLedger(db_path=str(db_path))
+    await ledger.initialize()
+
+    position_id = await ledger.record_reconciled_position(
+        market_id="m2",
+        token_id="token_2",
+        side="BUY",
+        quantity=Decimal("2"),
+        entry_price=Decimal("0.4"),
+        metadata={"source": "test"},
+    )
+
+    position_rows = await ledger.execute(
+        "SELECT market_id, token_id, strategy, side, entry_price, quantity, status, entry_order_id FROM positions WHERE id = ?",
+        (position_id,),
+        fetch_all=True,
+    )
+    transaction_lines = await ledger.execute(
+        """
+        SELECT transaction_id, SUM(CAST(amount AS REAL))
+        FROM transaction_lines
+        GROUP BY transaction_id
+        """,
+        fetch_all=True,
+    )
+    equity = await ledger.get_equity()
+    cash_balance = await ledger.execute_scalar(
+        "SELECT balance FROM accounts WHERE account_name = 'Cash'"
+    )
+    owner_equity_balance = await ledger.execute_scalar(
+        "SELECT balance FROM accounts WHERE account_name = 'Owner Equity'"
+    )
+
+    assert position_rows[0][0] == "m2"
+    assert position_rows[0][1] == "token_2"
+    assert position_rows[0][2] == "reconciled"
+    assert position_rows[0][3] == "BUY"
+    assert position_rows[0][4] == Decimal("0.4")
+    assert position_rows[0][5] == Decimal("2")
+    assert position_rows[0][6] == "OPEN"
+    assert position_rows[0][7] in (None, "")
+    assert len(transaction_lines) == 1
+    assert Decimal(str(transaction_lines[0][1])) == Decimal("0")
+    assert equity == Decimal("0.8")
+    assert Decimal(str(cash_balance)) == Decimal("0")
+    assert Decimal(str(owner_equity_balance)) == Decimal("-0.8")
 
     await ledger.close()
 
