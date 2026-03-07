@@ -174,3 +174,74 @@ CREATE INDEX IF NOT EXISTS idx_order_tracking_opened   ON order_tracking(opened_
 -- Composite index for _get_rolling_features() hot-path query:
 -- WHERE order_state='SETTLED' AND pnl IS NOT NULL AND closed_at IS NOT NULL ORDER BY closed_at DESC
 CREATE INDEX IF NOT EXISTS idx_ot_settled_closed ON order_tracking(order_state, closed_at DESC);
+
+-- SQLite is the source of truth for calibration observations and resolved labels.
+CREATE TABLE IF NOT EXISTS calibration_observations (
+    observation_id           TEXT PRIMARY KEY,
+    candidate_id             TEXT NOT NULL DEFAULT '',
+    cluster_id               TEXT NOT NULL DEFAULT '',
+    feature_snapshot_ts      TEXT NOT NULL DEFAULT '',
+    feature_schema_version   TEXT NOT NULL DEFAULT 'meta_candidate_v1',
+    cluster_policy_version   TEXT NOT NULL DEFAULT 'cluster_v1',
+    training_eligibility     TEXT NOT NULL DEFAULT 'pending_execution',
+    market_id                TEXT NOT NULL,
+    token_id                 TEXT NOT NULL DEFAULT '',
+    market_question          TEXT,
+    signal_side              TEXT,
+    opportunity_side         TEXT,
+    selected_side            TEXT,
+    observation_source       TEXT NOT NULL,
+    observation_mode         TEXT NOT NULL,
+    raw_yes_prob             TEXT,
+    yes_side_raw_probability TEXT,
+    calibrated_yes_prob      TEXT,
+    selected_side_prob       TEXT,
+    charlie_confidence       TEXT,
+    charlie_implied_prob     TEXT,
+    charlie_edge             TEXT,
+    spread_bps               TEXT,
+    time_to_expiry_seconds   INTEGER,
+    token_price              TEXT,
+    normalized_yes_price     TEXT,
+    timestamp                TEXT NOT NULL,
+    observed_at              TEXT NOT NULL,
+    resolution_time_hint     TEXT,
+    guard_block_reason       TEXT,
+    calibration_blocked      INTEGER NOT NULL DEFAULT 0,
+    trigger                  TEXT,
+    status                   TEXT NOT NULL DEFAULT 'pending',
+    actual_yes_outcome       TEXT,
+    eventual_yes_market_outcome TEXT,
+    resolved_at              TEXT,
+    resolution_time          TEXT,
+    order_id                 TEXT,
+    trade_outcome            TEXT,
+    created_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_calibration_observations_status
+    ON calibration_observations(status, observed_at);
+CREATE INDEX IF NOT EXISTS idx_calibration_observations_market
+    ON calibration_observations(market_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_calibration_observations_cluster
+    ON calibration_observations(cluster_id, feature_snapshot_ts);
+
+-- Durable quarantine registry for reviewable market blocks.
+CREATE TABLE IF NOT EXISTS market_quarantine (
+    market_id             TEXT PRIMARY KEY,
+    reason                TEXT NOT NULL,
+    source                TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'pending_review',
+    added_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    evidence_sample_size  INTEGER NOT NULL DEFAULT 0,
+    rolling_win_rate      TEXT,
+    rolling_pnl           TEXT,
+    review_at             TEXT,
+    expiry_at             TEXT,
+    notes                 TEXT,
+    disabled_by_config    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_quarantine_review
+    ON market_quarantine(status, review_at, expiry_at);

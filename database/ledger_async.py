@@ -267,6 +267,75 @@ CREATE INDEX IF NOT EXISTS idx_order_tracking_opened ON order_tracking(opened_at
 -- Composite index for _get_rolling_features() hot-path query:
 -- WHERE order_state='SETTLED' AND pnl IS NOT NULL AND closed_at IS NOT NULL ORDER BY closed_at DESC
 CREATE INDEX IF NOT EXISTS idx_ot_settled_closed ON order_tracking(order_state, closed_at DESC);
+
+CREATE TABLE IF NOT EXISTS calibration_observations (
+    observation_id           TEXT PRIMARY KEY,
+    candidate_id             TEXT NOT NULL DEFAULT '',
+    cluster_id               TEXT NOT NULL DEFAULT '',
+    feature_snapshot_ts      TEXT NOT NULL DEFAULT '',
+    feature_schema_version   TEXT NOT NULL DEFAULT 'meta_candidate_v1',
+    cluster_policy_version   TEXT NOT NULL DEFAULT 'cluster_v1',
+    training_eligibility     TEXT NOT NULL DEFAULT 'pending_execution',
+    market_id                TEXT NOT NULL,
+    token_id                 TEXT NOT NULL DEFAULT '',
+    market_question          TEXT,
+    signal_side              TEXT,
+    opportunity_side         TEXT,
+    selected_side            TEXT,
+    observation_source       TEXT NOT NULL,
+    observation_mode         TEXT NOT NULL,
+    raw_yes_prob             TEXT,
+    yes_side_raw_probability TEXT,
+    calibrated_yes_prob      TEXT,
+    selected_side_prob       TEXT,
+    charlie_confidence       TEXT,
+    charlie_implied_prob     TEXT,
+    charlie_edge             TEXT,
+    spread_bps               TEXT,
+    time_to_expiry_seconds   INTEGER,
+    token_price              TEXT,
+    normalized_yes_price     TEXT,
+    timestamp                TEXT NOT NULL,
+    observed_at              TEXT NOT NULL,
+    resolution_time_hint     TEXT,
+    guard_block_reason       TEXT,
+    calibration_blocked      INTEGER NOT NULL DEFAULT 0,
+    trigger                  TEXT,
+    status                   TEXT NOT NULL DEFAULT 'pending',
+    actual_yes_outcome       TEXT,
+    eventual_yes_market_outcome TEXT,
+    resolved_at              TEXT,
+    resolution_time          TEXT,
+    order_id                 TEXT,
+    trade_outcome            TEXT,
+    created_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_calibration_observations_status
+ON calibration_observations(status, observed_at);
+CREATE INDEX IF NOT EXISTS idx_calibration_observations_market
+ON calibration_observations(market_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_calibration_observations_cluster
+ON calibration_observations(cluster_id, feature_snapshot_ts);
+
+CREATE TABLE IF NOT EXISTS market_quarantine (
+    market_id             TEXT PRIMARY KEY,
+    reason                TEXT NOT NULL,
+    source                TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'pending_review',
+    added_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    evidence_sample_size  INTEGER NOT NULL DEFAULT 0,
+    rolling_win_rate      TEXT,
+    rolling_pnl           TEXT,
+    review_at             TEXT,
+    expiry_at             TEXT,
+    notes                 TEXT,
+    disabled_by_config    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_quarantine_review
+ON market_quarantine(status, review_at, expiry_at);
 """
 
 
@@ -318,6 +387,30 @@ class ConnectionPool:
             if db_dir and not os.path.exists(db_dir):
                 os.makedirs(db_dir, exist_ok=True)
                 logger.info("database_directory_created", path=db_dir)
+
+    @staticmethod
+    def _normalize_utc_text(value: Any) -> str:
+        if value in {None, ""}:
+            return ""
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        raw = str(value).strip()
+        if not raw:
+            return ""
+        try:
+            numeric_value = float(raw)
+            return datetime.fromtimestamp(numeric_value, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            pass
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed.isoformat().replace("+00:00", "Z")
+        except ValueError:
+            return raw
     
     async def initialize(self):
         """Initialize connection pool and create schema if needed."""
@@ -530,6 +623,204 @@ class ConnectionPool:
                     "INSERT OR IGNORE INTO schema_version (version, description)"
                     " VALUES (2, 'mode column + slippage tracking on order_tracking and positions')"
                 )
+                await temp_conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, description)"
+                    " VALUES (3, 'sqlite-backed market quarantine registry')"
+                )
+                await temp_conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, description)"
+                    " VALUES (4, 'sqlite-backed calibration observations + richer quarantine metadata')"
+                )
+                await temp_conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, description)"
+                    " VALUES (5, 'canonical quarantine status + normalized calibration timestamps')"
+                )
+                await temp_conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version, description)"
+                    " VALUES (6, 'candidate snapshot metadata for meta-ready observation exhaust')"
+                )
+                await temp_conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS calibration_observations (
+                        observation_id           TEXT PRIMARY KEY,
+                        candidate_id             TEXT NOT NULL DEFAULT '',
+                        cluster_id               TEXT NOT NULL DEFAULT '',
+                        feature_snapshot_ts      TEXT NOT NULL DEFAULT '',
+                        feature_schema_version   TEXT NOT NULL DEFAULT 'meta_candidate_v1',
+                        cluster_policy_version   TEXT NOT NULL DEFAULT 'cluster_v1',
+                        training_eligibility     TEXT NOT NULL DEFAULT 'pending_execution',
+                        market_id                TEXT NOT NULL,
+                        token_id                 TEXT NOT NULL DEFAULT '',
+                        market_question          TEXT,
+                        signal_side              TEXT,
+                        opportunity_side         TEXT,
+                        selected_side            TEXT,
+                        observation_source       TEXT NOT NULL,
+                        observation_mode         TEXT NOT NULL,
+                        raw_yes_prob             TEXT,
+                        yes_side_raw_probability TEXT,
+                        calibrated_yes_prob      TEXT,
+                        selected_side_prob       TEXT,
+                        charlie_confidence       TEXT,
+                        charlie_implied_prob     TEXT,
+                        charlie_edge             TEXT,
+                        spread_bps               TEXT,
+                        time_to_expiry_seconds   INTEGER,
+                        token_price              TEXT,
+                        normalized_yes_price     TEXT,
+                        timestamp                TEXT NOT NULL,
+                        observed_at              TEXT NOT NULL,
+                        resolution_time_hint     TEXT,
+                        guard_block_reason       TEXT,
+                        calibration_blocked      INTEGER NOT NULL DEFAULT 0,
+                        trigger                  TEXT,
+                        status                   TEXT NOT NULL DEFAULT 'pending',
+                        actual_yes_outcome       TEXT,
+                        eventual_yes_market_outcome TEXT,
+                        resolved_at              TEXT,
+                        resolution_time          TEXT,
+                        order_id                 TEXT,
+                        trade_outcome            TEXT,
+                        created_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_calibration_observations_status
+                    ON calibration_observations(status, observed_at);
+                    CREATE INDEX IF NOT EXISTS idx_calibration_observations_market
+                    ON calibration_observations(market_id, observed_at);
+                    CREATE INDEX IF NOT EXISTS idx_calibration_observations_cluster
+                    ON calibration_observations(cluster_id, feature_snapshot_ts);
+                    CREATE TABLE IF NOT EXISTS market_quarantine (
+                        market_id             TEXT PRIMARY KEY,
+                        reason                TEXT NOT NULL,
+                        source                TEXT NOT NULL,
+                        status                TEXT NOT NULL DEFAULT 'pending_review',
+                        added_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        evidence_sample_size  INTEGER NOT NULL DEFAULT 0,
+                        rolling_win_rate      TEXT,
+                        rolling_pnl           TEXT,
+                        review_at             TEXT,
+                        expiry_at             TEXT,
+                        notes                 TEXT,
+                        disabled_by_config    INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_market_quarantine_review
+                    ON market_quarantine(status, review_at, expiry_at);
+                    """
+                )
+                calibration_cursor = await temp_conn.execute("PRAGMA table_info(calibration_observations)")
+                calibration_columns = [row[1] for row in await calibration_cursor.fetchall()]
+                calibration_candidate_columns = {
+                    "candidate_id": "ALTER TABLE calibration_observations ADD COLUMN candidate_id TEXT NOT NULL DEFAULT ''",
+                    "cluster_id": "ALTER TABLE calibration_observations ADD COLUMN cluster_id TEXT NOT NULL DEFAULT ''",
+                    "feature_snapshot_ts": "ALTER TABLE calibration_observations ADD COLUMN feature_snapshot_ts TEXT NOT NULL DEFAULT ''",
+                    "feature_schema_version": "ALTER TABLE calibration_observations ADD COLUMN feature_schema_version TEXT NOT NULL DEFAULT 'meta_candidate_v1'",
+                    "cluster_policy_version": "ALTER TABLE calibration_observations ADD COLUMN cluster_policy_version TEXT NOT NULL DEFAULT 'cluster_v1'",
+                    "training_eligibility": "ALTER TABLE calibration_observations ADD COLUMN training_eligibility TEXT NOT NULL DEFAULT 'pending_execution'",
+                    "charlie_confidence": "ALTER TABLE calibration_observations ADD COLUMN charlie_confidence TEXT",
+                    "charlie_implied_prob": "ALTER TABLE calibration_observations ADD COLUMN charlie_implied_prob TEXT",
+                    "charlie_edge": "ALTER TABLE calibration_observations ADD COLUMN charlie_edge TEXT",
+                    "spread_bps": "ALTER TABLE calibration_observations ADD COLUMN spread_bps TEXT",
+                    "time_to_expiry_seconds": "ALTER TABLE calibration_observations ADD COLUMN time_to_expiry_seconds INTEGER",
+                }
+                for column_name, alter_sql in calibration_candidate_columns.items():
+                    if column_name not in calibration_columns:
+                        await temp_conn.execute(alter_sql)
+                await temp_conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_calibration_observations_cluster ON calibration_observations(cluster_id, feature_snapshot_ts)"
+                )
+                cursor = await temp_conn.execute("PRAGMA table_info(market_quarantine)")
+                quarantine_columns = [row[1] for row in await cursor.fetchall()]
+                if "status" not in quarantine_columns:
+                    await temp_conn.execute(
+                        "ALTER TABLE market_quarantine ADD COLUMN status TEXT DEFAULT 'pending_review'"
+                    )
+                if "notes" not in quarantine_columns:
+                    await temp_conn.execute(
+                        "ALTER TABLE market_quarantine ADD COLUMN notes TEXT"
+                    )
+                if "review_status" in quarantine_columns:
+                    await temp_conn.executescript(
+                        """
+                        DROP INDEX IF EXISTS idx_market_quarantine_review;
+                        CREATE TABLE market_quarantine_v2 (
+                            market_id             TEXT PRIMARY KEY,
+                            reason                TEXT NOT NULL,
+                            source                TEXT NOT NULL,
+                            status                TEXT NOT NULL DEFAULT 'pending_review',
+                            added_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            evidence_sample_size  INTEGER NOT NULL DEFAULT 0,
+                            rolling_win_rate      TEXT,
+                            rolling_pnl           TEXT,
+                            review_at             TEXT,
+                            expiry_at             TEXT,
+                            notes                 TEXT,
+                            disabled_by_config    INTEGER NOT NULL DEFAULT 0
+                        );
+                        INSERT INTO market_quarantine_v2 (
+                            market_id, reason, source, status, added_at,
+                            evidence_sample_size, rolling_win_rate, rolling_pnl,
+                            review_at, expiry_at, notes, disabled_by_config
+                        )
+                        SELECT market_id,
+                               reason,
+                               source,
+                               COALESCE(status, review_status, 'pending_review'),
+                               added_at,
+                               evidence_sample_size,
+                               rolling_win_rate,
+                               rolling_pnl,
+                               review_at,
+                               expiry_at,
+                               notes,
+                               disabled_by_config
+                        FROM market_quarantine;
+                        DROP TABLE market_quarantine;
+                        ALTER TABLE market_quarantine_v2 RENAME TO market_quarantine;
+                        CREATE INDEX IF NOT EXISTS idx_market_quarantine_review
+                        ON market_quarantine(status, review_at, expiry_at);
+                        """
+                    )
+
+                calibration_cursor = await temp_conn.execute(
+                    "SELECT observation_id, candidate_id, cluster_id, feature_snapshot_ts, timestamp, observed_at, resolved_at, resolution_time, created_at, updated_at FROM calibration_observations"
+                )
+                calibration_rows = await calibration_cursor.fetchall()
+                for observation_id, candidate_id_value, cluster_id_value, feature_snapshot_ts_value, timestamp_value, observed_at_value, resolved_at_value, resolution_time_value, created_at_value, updated_at_value in calibration_rows:
+                    fallback_now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    normalized_timestamp = self._normalize_utc_text(timestamp_value or observed_at_value or created_at_value or fallback_now)
+                    normalized_observed_at = self._normalize_utc_text(observed_at_value or normalized_timestamp)
+                    normalized_feature_snapshot_ts = self._normalize_utc_text(feature_snapshot_ts_value or normalized_observed_at)
+                    normalized_resolved_at = self._normalize_utc_text(resolved_at_value)
+                    normalized_resolution_time = self._normalize_utc_text(resolution_time_value)
+                    normalized_created_at = self._normalize_utc_text(created_at_value or normalized_observed_at)
+                    normalized_updated_at = self._normalize_utc_text(updated_at_value or normalized_created_at)
+                    await temp_conn.execute(
+                        """
+                        UPDATE calibration_observations
+                        SET candidate_id = COALESCE(NULLIF(candidate_id, ''), ?),
+                            cluster_id = COALESCE(cluster_id, ''),
+                            feature_snapshot_ts = COALESCE(NULLIF(feature_snapshot_ts, ''), ?),
+                            timestamp = ?,
+                            observed_at = ?,
+                            resolved_at = ?,
+                            resolution_time = ?,
+                            created_at = ?,
+                            updated_at = ?
+                        WHERE observation_id = ?
+                        """,
+                        (
+                            candidate_id_value or observation_id,
+                            normalized_feature_snapshot_ts,
+                            normalized_timestamp,
+                            normalized_observed_at,
+                            normalized_resolved_at,
+                            normalized_resolution_time,
+                            normalized_created_at,
+                            normalized_updated_at,
+                            observation_id,
+                        ),
+                    )
                 await temp_conn.commit()
 
                 cursor = await temp_conn.execute(
@@ -722,6 +1013,30 @@ class AsyncLedger:
         self.cache_misses = 0
         self.total_query_time_ms = 0.0
         self._write_lock = asyncio.Lock()
+
+    @staticmethod
+    def _normalize_utc_text(value: Any) -> str:
+        if value in {None, ""}:
+            return ""
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        raw = str(value).strip()
+        if not raw:
+            return ""
+        try:
+            numeric_value = float(raw)
+            return datetime.fromtimestamp(numeric_value, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            pass
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed.isoformat().replace("+00:00", "Z")
+        except ValueError:
+            return raw
 
         logger.info(
             "async_ledger_initialized",

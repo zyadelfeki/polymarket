@@ -22,10 +22,11 @@ import argparse
 import logging
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from decimal import Decimal
 import yaml
 import structlog
+import config_production
 
 from scripts.ensure_single_instance import acquire_instance_lock
 
@@ -56,13 +57,19 @@ from config_production import (
     MARKET_TAG_BLOCKLIST,
     REGIME_RISK_CONFIG,
 )
-from ml.meta_gate import should_trade as _meta_gate_should_trade, extract_features_from_opportunity as _meta_gate_extract_features
 from utils.market_performance_guard import is_market_blocked_by_performance
 from services.portfolio_state import PortfolioState
 from services.do_not_trade import DoNotTradeRegistry
 from data_feeds.binance_features import get_all_features as _get_binance_features
 from risk.portfolio_risk import PortfolioRiskEngine, DrawdownMonitor
 from services.health_server import HealthServer
+from services.calibration_observation_service import (
+    CALIBRATION_DATASET_FIELDNAMES,
+    CALIBRATION_OBSERVATION_FIELDNAMES,
+    CalibrationObservationService,
+)
+from services.runtime_guard_evaluator import RuntimeGuardEvaluator
+from database.quarantine_repository import QuarantineRepository
 
 # Phase 3-6 features (log-only)
 from data_feeds.arb_scanner import scan_yes_no_arb
@@ -177,6 +184,112 @@ def _build_model_feedback_callback():
 logger = structlog.get_logger(__name__)
 
 
+def _resolve_runtime_controls(config: dict) -> dict:
+    """Merge YAML runtime controls with safe defaults.
+
+    `config_production.py` remains the default source for legacy constants, but
+    live runtime behavior is driven from the parsed YAML config after this merge.
+    """
+    trading_cfg = config.setdefault("trading", {})
+    runtime_controls = config.setdefault("runtime_controls", {})
+
+    blocked_markets = runtime_controls.get("blocked_markets")
+    if blocked_markets is None:
+        blocked_markets = sorted(str(market_id) for market_id in BLOCKED_MARKETS)
+    else:
+        blocked_markets = [str(market_id) for market_id in blocked_markets]
+    runtime_controls["blocked_markets"] = blocked_markets
+
+    lifecycle_cfg = runtime_controls.get("lifecycle_guard") or {}
+    runtime_controls["lifecycle_guard"] = {
+        "enabled": bool(lifecycle_cfg.get("enabled", True)),
+        "max_active_entries_per_market": int(
+            lifecycle_cfg.get("max_active_entries_per_market", 1)
+        ),
+        "allow_add_on": bool(lifecycle_cfg.get("allow_add_on", False)),
+        "min_price_improvement_abs": str(
+            lifecycle_cfg.get("min_price_improvement_abs", "0.05")
+        ),
+    }
+
+    max_entry_price_abs = runtime_controls.get(
+        "max_entry_price_abs",
+        trading_cfg.get("max_entry_price_abs", "0.65"),
+    )
+    trading_cfg["max_entry_price_abs"] = str(max_entry_price_abs)
+    runtime_controls["max_entry_price_abs"] = str(max_entry_price_abs)
+
+    calibration_cfg = runtime_controls.get("calibration") or {}
+    runtime_controls["calibration"] = {
+        "fail_closed": bool(calibration_cfg.get("fail_closed", True)),
+        "min_positive_coef": float(calibration_cfg.get("min_positive_coef", 0.0)),
+        "require_monotonic_smoke_test": bool(
+            calibration_cfg.get("require_monotonic_smoke_test", True)
+        ),
+        "smoke_test_points": list(
+            calibration_cfg.get("smoke_test_points", [0.30, 0.50, 0.79])
+        ),
+        "observe_only_on_invalid": bool(
+            calibration_cfg.get("observe_only_on_invalid", True)
+        ),
+        "dataset_export_path": str(
+            calibration_cfg.get(
+                "dataset_export_path",
+                calibration_cfg.get("dataset_path", "data/calibration_dataset_v2.csv"),
+            )
+        ),
+        "observation_export_path": str(
+            calibration_cfg.get(
+                "observation_export_path",
+                calibration_cfg.get("observation_store_path", "data/calibration_observations.csv"),
+            )
+        ),
+        "meta_candidate_feature_schema_version": str(
+            calibration_cfg.get("meta_candidate_feature_schema_version", "meta_candidate_v1")
+        ),
+        "meta_candidate_cluster_policy_version": str(
+            calibration_cfg.get("meta_candidate_cluster_policy_version", "cluster_v1")
+        ),
+        "meta_candidate_cluster_time_bucket_seconds": int(
+            calibration_cfg.get("meta_candidate_cluster_time_bucket_seconds", 10)
+        ),
+        "meta_candidate_cluster_price_bucket_abs": str(
+            calibration_cfg.get("meta_candidate_cluster_price_bucket_abs", "0.01")
+        ),
+    }
+
+    meta_gate_cfg = runtime_controls.get("meta_gate") or {}
+    runtime_controls["meta_gate"] = {
+        "decision_mode": "shadow",
+        "shadow_only": True,
+        "feature_schema_version": str(
+            meta_gate_cfg.get(
+                "feature_schema_version",
+                runtime_controls["calibration"]["meta_candidate_feature_schema_version"],
+            )
+        ),
+        "calibration_version": str(
+            meta_gate_cfg.get("calibration_version", "platt_scaler_v1")
+        ),
+    }
+
+    quarantine_cfg = runtime_controls.get("quarantine") or {}
+    runtime_controls["quarantine"] = {
+        "enabled": bool(quarantine_cfg.get("enabled", True)),
+        "seed_static_blocklist": bool(
+            quarantine_cfg.get("seed_static_blocklist", True)
+        ),
+        "auto_review_after_days": int(
+            quarantine_cfg.get("auto_review_after_days", 7)
+        ),
+    }
+
+    runtime_controls["session_snapshot_interval_seconds"] = int(
+        runtime_controls.get("session_snapshot_interval_seconds", 60)
+    )
+    return config
+
+
 async def _get_rolling_features(
     ledger,
     n_win: int = 20,
@@ -258,6 +371,26 @@ class TradingSystem:
         self.config = config
         self.running = False
         self.shutdown_event = asyncio.Event()
+        self.runtime_controls = config.get("runtime_controls", {})
+        self.blocked_markets = {
+            str(market_id) for market_id in self.runtime_controls.get("blocked_markets", [])
+        }
+        self.lifecycle_guard_config = self.runtime_controls.get("lifecycle_guard", {})
+        self.calibration_guard_config = self.runtime_controls.get("calibration", {})
+        self.quarantine_config = self.runtime_controls.get("quarantine", {})
+        self.calibration_dataset_path = Path(
+            str(self.calibration_guard_config.get("dataset_export_path", "data/calibration_dataset_v2.csv"))
+        )
+        self.calibration_observations_path = Path(
+            str(self.calibration_guard_config.get("observation_export_path", "data/calibration_observations.csv"))
+        )
+        self._market_quarantine: Dict[str, Dict[str, Any]] = {}
+        self.guard_evaluator = RuntimeGuardEvaluator(
+            lifecycle_guard_config=self.lifecycle_guard_config,
+            calibration_guard_config=self.calibration_guard_config,
+        )
+        self.quarantine_repository: Optional[QuarantineRepository] = None
+        self.calibration_observation_service: Optional[CalibrationObservationService] = None
         
         # Components (initialized in start())
         self.secrets_manager: Optional[SecretsManager] = None
@@ -289,6 +422,34 @@ class TradingSystem:
         # multiple scans before the idempotency cache would dedup them (the
         # cache key includes price, so a 1-tick price change defeats it).
         self._paper_order_cooldowns: Dict[str, float] = {}
+        # Per-market lifecycle state, populated from actual submitted/open orders.
+        # This is the authoritative market-entry guard used to prevent repeated
+        # entries, side flips, and uncontrolled add-ons.
+        self._market_lifecycle_state: Dict[str, Dict[str, Any]] = {}
+        # Session-level event counters for the end-of-session observability report.
+        # Incremented at each decision point; logged on stop().
+        self._session_stats: Dict[str, int] = {
+            "opportunities_evaluated": 0,
+            "blocked_static_list": 0,
+            "blocked_quarantine": 0,
+            "blocked_lifecycle_guard": 0,
+            "blocked_side_flip_rule": 0,
+            "blocked_charlie_rejected": 0,
+            "blocked_meta_gate": 0,
+            "blocked_risk_budget": 0,
+            "blocked_max_entry_price": 0,
+            "blocked_bad_calibration": 0,
+            "observe_only_bad_calibration": 0,
+            "orders_submitted": 0,
+        }
+        self._calibration_guard_status: Dict[str, Any] = {
+            "blocked": False,
+            "reason": None,
+            "coef": None,
+            "monotonic": None,
+            "smoke_results": [],
+        }
+        self._last_session_snapshot_at: float = 0.0
         self._paper_session_start: Optional[str] = None
         self.last_discovered_markets = []
         self.market_sniper = MarketSniper()
@@ -320,6 +481,10 @@ class TradingSystem:
             network_timeout_seconds=self.network_timeout_seconds,
             loop_tick_seconds=self.loop_tick_seconds,
             strategy_scan_min_interval_seconds=self.strategy_scan_min_interval_seconds,
+            blocked_markets_count=len(self.blocked_markets),
+            active_quarantines=len(self._market_quarantine),
+            lifecycle_guard=self.lifecycle_guard_config,
+            calibration_guard=self.calibration_guard_config,
         )
 
     async def _await_step(self, step_name: str, coro, timeout_seconds: Optional[float] = None):
@@ -356,6 +521,256 @@ class TradingSystem:
                 error_type=type(e).__name__
             )
             return default
+
+    def _ensure_runtime_services(self) -> None:
+        if not isinstance(self.ledger, AsyncLedger):
+            return
+        if self.quarantine_repository is None:
+            self.quarantine_repository = QuarantineRepository(self.ledger)
+        if self.calibration_observation_service is None:
+            self.calibration_observation_service = CalibrationObservationService(
+                ledger=self.ledger,
+                observation_export_path=str(self.calibration_observations_path),
+                dataset_export_path=str(self.calibration_dataset_path),
+                feature_schema_version=str(self.calibration_guard_config.get("meta_candidate_feature_schema_version", "meta_candidate_v1")),
+                cluster_policy_version=str(self.calibration_guard_config.get("meta_candidate_cluster_policy_version", "cluster_v1")),
+                cluster_time_bucket_seconds=int(self.calibration_guard_config.get("meta_candidate_cluster_time_bucket_seconds", 10)),
+                cluster_price_bucket_abs=str(self.calibration_guard_config.get("meta_candidate_cluster_price_bucket_abs", "0.01")),
+            )
+
+    def _evaluate_calibration_guard(self) -> Dict[str, Any]:
+        return self.guard_evaluator.evaluate_calibration_guard()
+
+    def _check_lifecycle_guard(
+        self,
+        *,
+        market_id: str,
+        side: str,
+        token_price: Decimal,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        return self.guard_evaluator.check_lifecycle_guard(
+            self._market_lifecycle_state,
+            market_id=market_id,
+            side=side,
+            token_price=token_price,
+        )
+
+    def _record_lifecycle_entry(
+        self,
+        *,
+        market_id: str,
+        side: str,
+        token_id: str,
+        token_price: Decimal,
+        order_id: Optional[str] = None,
+    ) -> None:
+        state = self._market_lifecycle_state.get(market_id)
+        if state is None:
+            self._market_lifecycle_state[market_id] = {
+                "side": side,
+                "token_id": token_id,
+                "entry_count": 1,
+                "best_token_price": str(token_price),
+                "last_token_price": str(token_price),
+                "last_order_id": order_id,
+                "opened_at_monotonic": asyncio.get_running_loop().time(),
+            }
+            return
+
+        best_price = min(Decimal(str(state.get("best_token_price") or token_price)), token_price)
+        state.update(
+            {
+                "side": side,
+                "token_id": token_id,
+                "entry_count": int(state.get("entry_count") or 0) + 1,
+                "best_token_price": str(best_price),
+                "last_token_price": str(token_price),
+                "last_order_id": order_id,
+                "updated_at_monotonic": asyncio.get_running_loop().time(),
+            }
+        )
+
+    def _clear_lifecycle_entry(self, market_id: str, *, reason: str) -> None:
+        if market_id in self._market_lifecycle_state:
+            self._market_lifecycle_state.pop(market_id, None)
+            logger.info("lifecycle_state_cleared", market_id=market_id, reason=reason)
+
+    async def _sync_lifecycle_state_from_open_orders(self) -> None:
+        if self.ledger is None:
+            return
+        open_orders = await self._safe_await(
+            "ledger.get_open_orders.lifecycle_sync",
+            self.ledger.get_open_orders(),
+            default=[],
+        )
+        synced_markets: Dict[str, Dict[str, Any]] = {}
+        for row in open_orders or []:
+            market_id = str(row.get("market_id") or "")
+            if not market_id:
+                continue
+            state = synced_markets.setdefault(
+                market_id,
+                {
+                    "side": str(row.get("outcome") or ""),
+                    "token_id": str(row.get("token_id") or ""),
+                    "entry_count": 0,
+                    "best_token_price": str(row.get("price") or "0"),
+                    "last_token_price": str(row.get("price") or "0"),
+                    "last_order_id": row.get("order_id"),
+                    "opened_at_monotonic": asyncio.get_running_loop().time(),
+                },
+            )
+            state["entry_count"] += 1
+            price = Decimal(str(row.get("price") or "0"))
+            best_price = Decimal(str(state.get("best_token_price") or price))
+            if state["entry_count"] == 1 or price < best_price:
+                state["best_token_price"] = str(price)
+            state["last_token_price"] = str(price)
+            state["last_order_id"] = row.get("order_id")
+
+        self._market_lifecycle_state = synced_markets
+        logger.info(
+            "lifecycle_state_synced",
+            markets=len(self._market_lifecycle_state),
+            market_ids=sorted(self._market_lifecycle_state.keys()),
+        )
+
+    def _log_session_snapshot(self, *, force: bool = False) -> None:
+        now = asyncio.get_running_loop().time()
+        min_interval = float(self.runtime_controls.get("session_snapshot_interval_seconds", 60))
+        if not force and (now - self._last_session_snapshot_at) < min_interval:
+            return
+        self._last_session_snapshot_at = now
+        logger.info(
+            "session_snapshot",
+            opportunities_evaluated=self._session_stats.get("opportunities_evaluated", 0),
+            orders_submitted=self._session_stats.get("orders_submitted", 0),
+            blocked_by_blocklist=self._session_stats.get("blocked_static_list", 0),
+            blocked_by_quarantine=self._session_stats.get("blocked_quarantine", 0),
+            blocked_by_lifecycle_guard=self._session_stats.get("blocked_lifecycle_guard", 0),
+            blocked_by_side_flip_rule=self._session_stats.get("blocked_side_flip_rule", 0),
+            blocked_by_max_entry_price=self._session_stats.get("blocked_max_entry_price", 0),
+            blocked_by_bad_calibration=self._session_stats.get("blocked_bad_calibration", 0),
+            observe_only_bad_calibration=self._session_stats.get("observe_only_bad_calibration", 0),
+            blocked_by_meta_gate=self._session_stats.get("blocked_meta_gate", 0),
+            blocked_by_risk_budget=self._session_stats.get("blocked_risk_budget", 0),
+            lifecycle_markets=len(self._market_lifecycle_state),
+            calibration_blocked=self._calibration_guard_status.get("blocked", False),
+            calibration_reason=self._calibration_guard_status.get("reason"),
+        )
+
+    @staticmethod
+    def _parse_note_token(notes: str, field: str) -> Optional[str]:
+        prefix = f"{field}="
+        for part in (notes or "").split():
+            if part.startswith(prefix):
+                return part[len(prefix):]
+        return None
+
+    async def _initialize_quarantine_store(self) -> None:
+        self._ensure_runtime_services()
+        if (
+            self.ledger is None
+            or self.quarantine_repository is None
+            or not self.quarantine_config.get("enabled", True)
+        ):
+            return
+
+        self._market_quarantine = await self._safe_await(
+            "quarantine_repository.load_active_entries",
+            self.quarantine_repository.load_active_entries(),
+            default={},
+        ) or {}
+
+        await self._seed_static_quarantine()
+        logger.info(
+            "quarantine_store_initialized",
+            backend="sqlite",
+            active_quarantines=len(self._market_quarantine),
+            auto_review_after_days=int(self.quarantine_config.get("auto_review_after_days", 7)),
+        )
+
+    async def _seed_static_quarantine(self) -> None:
+        if self.quarantine_repository is None or not self.quarantine_config.get("enabled", True):
+            return
+        if not self.quarantine_config.get("seed_static_blocklist", True):
+            return
+
+        changed = await self._safe_await(
+            "quarantine_repository.seed_runtime_blocklist",
+            self.quarantine_repository.seed_runtime_blocklist(
+                self.blocked_markets,
+                auto_review_after_days=int(self.quarantine_config.get("auto_review_after_days", 7)),
+            ),
+            default=0,
+        ) or 0
+        self._market_quarantine = await self._safe_await(
+            "quarantine_repository.reload_after_seed",
+            self.quarantine_repository.load_active_entries(),
+            default=self._market_quarantine,
+        ) or self._market_quarantine
+
+        if changed:
+            logger.info(
+                "quarantine_seeded_from_runtime_controls",
+                added=changed,
+                total=len(self._market_quarantine),
+            )
+
+    def _get_active_quarantine_entry(self, market_id: str) -> Optional[Dict[str, Any]]:
+        if self.quarantine_repository is None or not self.quarantine_config.get("enabled", True):
+            return None
+        return self.quarantine_repository.get_active_entry(self._market_quarantine, market_id)
+
+    async def _update_calibration_observation(self, observation_id: Optional[str], **updates: Any) -> None:
+        self._ensure_runtime_services()
+        if self.calibration_observation_service is None:
+            return
+        await self.calibration_observation_service.update_observation(observation_id, **updates)
+
+    async def _record_calibration_observation(
+        self,
+        *,
+        market_id: str,
+        token_id: str,
+        opportunity: Dict[str, Any],
+        charlie_rec: TradeRecommendation,
+        token_price: Decimal,
+        normalized_yes_price: Decimal,
+        trigger: str,
+        observation_mode: str,
+        guard_block_reason: str = "",
+    ) -> str:
+        self._ensure_runtime_services()
+        if self.calibration_observation_service is None:
+            return ""
+        return await self.calibration_observation_service.record_observation(
+            market_id=market_id,
+            token_id=token_id,
+            opportunity=opportunity,
+            charlie_rec=charlie_rec,
+            token_price=token_price,
+            normalized_yes_price=normalized_yes_price,
+            trigger=trigger,
+            observation_mode=observation_mode,
+            calibration_blocked=bool(self._calibration_guard_status.get("blocked")),
+            guard_block_reason=guard_block_reason,
+        )
+
+    async def _resolve_pending_calibration_observations(self) -> None:
+        self._ensure_runtime_services()
+        if self.calibration_observation_service is None:
+            return
+        resolved_count = await self.calibration_observation_service.resolve_pending_observations(
+            self.api_client,
+            self._safe_await,
+        )
+        if resolved_count:
+            logger.info(
+                "calibration_observations_resolved",
+                resolved_count=resolved_count,
+                dataset_export_path=str(self.calibration_dataset_path),
+            )
 
     async def _market_discovery_probe(self):
         if not self.api_client:
@@ -585,6 +1000,7 @@ class TradingSystem:
             return Decimal("0.6")
 
     async def _execute_opportunity(self, opportunity: Dict[str, Any], trigger: str) -> None:
+        self._session_stats["opportunities_evaluated"] += 1
         if not self.execution or not self.ledger:
             logger.warning(
                 "opportunity_skipped",
@@ -615,15 +1031,10 @@ class TradingSystem:
             )
             return
 
-        # --- Static blocked-market filter (chronic losers, hand-curated) ---
-        if market_id in BLOCKED_MARKETS:
-            logger.info(
-                "market_blocked",
-                reason="static_blocked_markets",
-                market_id=market_id,
-                trigger=trigger,
-            )
-            return
+        calibration_blocked = bool(self._calibration_guard_status.get("blocked"))
+        observe_only_bad_calibration = calibration_blocked and bool(
+            self.calibration_guard_config.get("observe_only_on_invalid", True)
+        )
 
         # --- Dynamic performance guard (auto-blocks bad markets after 5+ trades) ---
         if is_market_blocked_by_performance(market_id):
@@ -839,6 +1250,7 @@ class TradingSystem:
         charlie_p_win: Optional[Decimal] = None
         charlie_conf_dec: Optional[Decimal] = None
         charlie_regime: Optional[str] = None
+        observation_id: Optional[str] = None
         # Initialized here so the OFI block below is safe even when charlie_gate
         # is None (degraded startup / unit-test path).
         _extra_features: Optional[dict] = None
@@ -873,11 +1285,23 @@ class TradingSystem:
                                symbol=opp_symbol,
                                msg="Charlie will run in degraded mode — coin-flip rejection will block trade")
 
+            # Charlie's edge model always treats market_price as the YES token
+            # price.  When the strategy surfaces a NO opportunity it sets
+            # market_price = no_token_price (the complement).  Passing that
+            # directly inverts Charlie's edge calculation — it thinks YES is
+            # cheap when it is actually expensive, and vice-versa.  Normalise
+            # here so Charlie always receives the canonical YES price and can
+            # independently choose the better side from the correct baseline.
+            _opp_original_side = str(opportunity.get("side") or "YES").upper()
+            _charlie_market_price = (
+                price if _opp_original_side == "YES"
+                else (Decimal("1") - price)
+            )
             charlie_rec = await self._safe_await(
                 "charlie_gate.evaluate_market",
                 self.charlie_gate.evaluate_market(
                     market_id=market_id,
-                    market_price=price,
+                    market_price=_charlie_market_price,
                     symbol=opp_symbol,
                     timeframe="15m",
                     bankroll=equity,
@@ -899,61 +1323,79 @@ class TradingSystem:
                     market_id=market_id,
                     trigger=trigger,
                 )
+                self._session_stats["blocked_charlie_rejected"] += 1
                 return
 
-            # --- Meta-gate: ML classifier that decides TAKE vs SKIP ---------
-            # Runs AFTER Charlie approves and OFI is resolved (inside
-            # charlie_booster), but BEFORE regime multiplier and Kelly sizing.
-            # Fail-open: if the model is absent/corrupt, _meta_gate_should_trade
-            # returns True so no trade is ever silently blocked by infra failure.
-            _rolling_win_rate, _rolling_pnl_z = 0.5, 0.0
-            if self.ledger is not None:
-                try:
-                    _rolling_win_rate, _rolling_pnl_z = await _get_rolling_features(
-                        self.ledger
-                    )
-                except Exception as _rgf_exc:
-                    logger.warning(
-                        "rolling_features_db_error",
-                        error=str(_rgf_exc),
-                        fallback="0.5/0.0",
-                    )
-            _meta_features = _meta_gate_extract_features(
-                charlie_p_win_raw=charlie_rec.p_win,
-                net_edge=charlie_rec.edge,
-                # fee = gross_edge - net_edge  (identity: net = p_win - implied - fee)
-                fee=charlie_rec.p_win - charlie_rec.implied_prob - charlie_rec.edge,
-                implied_prob=charlie_rec.implied_prob,
-                confidence=charlie_rec.confidence,
-                ofi_conflict=charlie_rec.ofi_conflict,
-                rolling_win_rate=_rolling_win_rate,
-                rolling_pnl_z=_rolling_pnl_z,
+            logger.info(
+                "charlie_normalization_trace",
+                market_id=market_id,
+                opportunity_side=_opp_original_side,
+                token_price=str(price),
+                normalized_yes_price=str(_charlie_market_price),
+                p_win_raw=round(float(charlie_rec.p_win_raw), 6),
+                p_win_calibrated=round(float(charlie_rec.p_win_calibrated), 6),
+                charlie_selected_side=charlie_rec.side,
+                charlie_selected_side_p_win=round(float(charlie_rec.p_win), 6),
+                trigger=trigger,
             )
-            _meta_take, _meta_proba = _meta_gate_should_trade(_meta_features)
-            if _meta_take:
-                logger.info(
-                    "meta_gate_approved",
-                    market_id=market_id,
-                    proba=round(float(_meta_proba), 4),
-                    p_win=charlie_rec.p_win,
-                    edge=charlie_rec.edge,
-                    confidence=charlie_rec.confidence,
+
+            observation_id = await self._record_calibration_observation(
+                market_id=market_id,
+                token_id=token_id,
+                opportunity=opportunity,
+                charlie_rec=charlie_rec,
+                token_price=price,
+                normalized_yes_price=_charlie_market_price,
+                trigger=trigger,
+                observation_mode=(
+                    "observe_only_bad_calibration" if observe_only_bad_calibration else "trade_enabled"
+                ),
+            )
+
+            quarantine_entry = self._get_active_quarantine_entry(market_id)
+            if quarantine_entry is not None:
+                await self._update_calibration_observation(
+                    observation_id,
+                    guard_block_reason="quarantine",
+                    training_eligibility="blocked_pre_execution",
                 )
-            else:
                 logger.info(
-                    "meta_gate_rejected",
+                    "blocked_by_quarantine",
                     market_id=market_id,
-                    proba=round(float(_meta_proba), 4),
-                    p_win=charlie_rec.p_win,
-                    net_edge=charlie_rec.edge,
-                    fee=_meta_features.get("fee"),
-                    implied_prob=charlie_rec.implied_prob,
-                    confidence=charlie_rec.confidence,
-                    ofi_conflict=_meta_features.get("ofi_conflict"),
-                    rolling_win_rate=_meta_features.get("rolling_win_rate"),
-                    rolling_pnl_z=_meta_features.get("rolling_pnl_z"),
                     trigger=trigger,
+                    observation_id=observation_id,
+                    **self.quarantine_repository.to_block_log_context(quarantine_entry),
                 )
+                self._session_stats["blocked_quarantine"] += 1
+                self._session_stats["blocked_static_list"] += 1
+                return
+
+            if calibration_blocked:
+                await self._update_calibration_observation(
+                    observation_id,
+                    guard_block_reason="bad_calibration",
+                    training_eligibility="blocked_pre_execution",
+                )
+                logger.warning(
+                    "blocked_by_bad_calibration",
+                    market_id=market_id,
+                    trigger=trigger,
+                    observation_id=observation_id,
+                    **self.guard_evaluator.calibration_block_log_context(
+                        self._calibration_guard_status,
+                        observe_only=observe_only_bad_calibration,
+                    ),
+                )
+                self._session_stats["blocked_bad_calibration"] += 1
+                if observe_only_bad_calibration:
+                    self._session_stats["observe_only_bad_calibration"] += 1
+                    logger.info(
+                        "observe_only_bad_calibration",
+                        market_id=market_id,
+                        observation_id=observation_id,
+                        trigger=trigger,
+                    )
+                    return
                 return
 
             # Stamp the cooldown as soon as Charlie approves.  Without this,
@@ -971,6 +1413,8 @@ class TradingSystem:
             charlie_p_win  = Decimal(str(charlie_rec.p_win))
             charlie_conf_dec = Decimal(str(charlie_rec.confidence))
             charlie_regime = charlie_rec.regime
+            _charlie_p_win_raw = Decimal(str(charlie_rec.p_win_raw))
+            _charlie_p_win_calibrated = Decimal(str(charlie_rec.p_win_calibrated))
 
             # --- Regime-based position-size multiplier (fallback only) -----
             # The new dynamic regime classifier (utils.regime_classifier) runs
@@ -1014,6 +1458,12 @@ class TradingSystem:
                         equity=str(equity),
                         trigger=trigger,
                     )
+                    await self._update_calibration_observation(
+                        observation_id,
+                        guard_block_reason="risk_budget",
+                        training_eligibility="blocked_pre_execution",
+                    )
+                    self._session_stats["blocked_risk_budget"] += 1
                     return
                 if not self.portfolio_state.within_market_budget(market_id, order_value):
                     logger.warning(
@@ -1024,7 +1474,37 @@ class TradingSystem:
                         equity=str(equity),
                         trigger=trigger,
                     )
+                    await self._update_calibration_observation(
+                        observation_id,
+                        guard_block_reason="risk_budget",
+                        training_eligibility="blocked_pre_execution",
+                    )
+                    self._session_stats["blocked_risk_budget"] += 1
                     return
+
+            # --- Per-market lifecycle guard ----------------------------------
+            _blocked, _lifecycle_reason, _lifecycle_context = self._check_lifecycle_guard(
+                market_id=market_id,
+                side=side,
+                token_price=price,
+            )
+            if _blocked:
+                await self._update_calibration_observation(
+                    observation_id,
+                    guard_block_reason=_lifecycle_reason,
+                    training_eligibility="blocked_pre_execution",
+                )
+                logger.warning(
+                    self.guard_evaluator.lifecycle_block_event_name(_lifecycle_reason),
+                    market_id=market_id,
+                    trigger=trigger,
+                    **_lifecycle_context,
+                )
+                if _lifecycle_reason == "side_flip_rule":
+                    self._session_stats["blocked_side_flip_rule"] += 1
+                else:
+                    self._session_stats["blocked_lifecycle_guard"] += 1
+                return
 
             # --- Institutional portfolio risk check (category + correlation) -
             if self.portfolio_risk_engine is not None:
@@ -1132,6 +1612,42 @@ class TradingSystem:
                 market_id=market_id,
             )
 
+        # --- Absolute max entry-price filter (side-symmetric) ---------------
+        # Block any bet — YES or NO — when the token being purchased costs more
+        # than max_entry_price_abs (default 0.65).  Catches two failure modes:
+        #
+        #   YES token ≥ 0.65: market consensus already heavily prices in YES;
+        #     limited upside with high calibration-error sensitivity.
+        #
+        #   NO token ≥ 0.65 (= YES token ≤ 0.35): the historically-bad trades
+        #     on 2026-03-06 (e.g. buying NO at 0.73 with p(NO)=0.437) had
+        #     direct negative EV.  This guard would have blocked them:
+        #       price = no_token_price = 0.73 > 0.65 → blocked.
+        #
+        # Note: `price` is opportunity.market_price = the token-being-bought
+        # price (no_price for NO opps, yes_price for YES opps), so this guard
+        # is correctly side-symmetric without needing to know the side.
+        # Configurable via trading.max_entry_price_abs (default 0.65).
+        _max_entry_price = Decimal(
+            str(self.config.get("trading", {}).get("max_entry_price_abs", "0.65"))
+        )
+        if price > _max_entry_price:
+            await self._update_calibration_observation(
+                observation_id,
+                guard_block_reason="max_entry_price",
+                training_eligibility="blocked_pre_execution",
+            )
+            logger.warning(
+                "blocked_by_max_entry_price",
+                market_id=market_id,
+                side=side,
+                token_price=str(price),
+                max_entry_price=str(_max_entry_price),
+                trigger=trigger,
+            )
+            self._session_stats["blocked_max_entry_price"] += 1
+            return
+
         metadata = {
             "trigger": trigger,
             "outcome": side,
@@ -1141,6 +1657,10 @@ class TradingSystem:
             "question": str(opportunity.get("question") or ""),
             "btc_price": str(opportunity.get("btc_price")) if opportunity.get("btc_price") is not None else None,
             "charlie_p_win": str(charlie_p_win) if charlie_p_win is not None else None,
+            "charlie_p_win_raw": str(_charlie_p_win_raw) if self.charlie_gate is not None else None,
+            "charlie_p_win_calibrated_yes": str(_charlie_p_win_calibrated) if self.charlie_gate is not None else None,
+            "charlie_yes_price_equiv": str(_charlie_market_price) if self.charlie_gate is not None else None,
+            "opportunity_side": _opp_original_side if self.charlie_gate is not None else side,
             "charlie_confidence": str(charlie_conf_dec) if charlie_conf_dec is not None else None,
             "charlie_regime": charlie_regime,
             "charlie_edge": str(charlie_rec.edge) if charlie_rec is not None else None,
@@ -1156,6 +1676,21 @@ class TradingSystem:
         _client_order_id = _hashlib.sha256(_dedup_input.encode()).hexdigest()[:16]
         metadata["client_order_id"] = _client_order_id
         metadata["expected_price"] = str(price)  # For slippage tracking on fill
+        metadata["observation_id"] = observation_id
+        _order_notes = None
+        if charlie_rec is not None:
+            _order_notes = (
+                f"{charlie_rec.reason} "
+                f"raw_yes_p={float(charlie_rec.p_win_raw):.6f} "
+                f"cal_yes_p={float(charlie_rec.p_win_calibrated):.6f} "
+                f"selected_side_p={float(charlie_rec.p_win):.6f} "
+                f"normalized_yes_price={str(_charlie_market_price)} "
+                f"token_price={str(price)} "
+                f"opportunity_side={_opp_original_side} "
+                f"observation_id={observation_id} "
+                f"schema_version=2 feature_space=yes_side_raw_probability "
+                f"label_space=yes_market_outcome"
+            )
 
         # Write CREATED row to unified order ledger before sending to exchange.
         # Stores model_votes so per-model feedback works on settlement.
@@ -1176,7 +1711,7 @@ class TradingSystem:
                     charlie_regime=charlie_regime,
                     strategy="latency_arbitrage_btc",
                     model_votes=charlie_rec.model_votes if charlie_rec is not None else None,
-                    notes=charlie_rec.reason if charlie_rec else None,
+                    notes=_order_notes,
                 ),
             )
 
@@ -1213,6 +1748,10 @@ class TradingSystem:
             order_value=str(order_value),
             edge=str(edge),
             charlie_p_win=str(charlie_p_win),
+            charlie_p_win_raw=str(_charlie_p_win_raw) if self.charlie_gate is not None else None,
+            charlie_p_win_calibrated_yes=str(_charlie_p_win_calibrated) if self.charlie_gate is not None else None,
+            normalized_yes_price=str(_charlie_market_price) if self.charlie_gate is not None else None,
+            opportunity_side=_opp_original_side if self.charlie_gate is not None else side,
             charlie_confidence=str(charlie_conf_dec),
             charlie_regime=charlie_regime,
             trigger=trigger,
@@ -1252,7 +1791,7 @@ class TradingSystem:
                             charlie_regime=charlie_regime,
                             strategy="latency_arbitrage_btc",
                             model_votes=charlie_rec.model_votes if charlie_rec is not None else None,
-                            notes=charlie_rec.reason if charlie_rec else None,
+                            notes=_order_notes,
                         ),
                     )
                     # pre_ row is superseded by the confirmed exchange order ID.
@@ -1273,7 +1812,19 @@ class TradingSystem:
                             exchange_order_id, new_state_str
                         ),
                     )
+                await self._update_calibration_observation(
+                    observation_id,
+                    order_id=exchange_order_id,
+                    training_eligibility="pending_resolution",
+                )
                 # --- Slippage tracking: record filled_price vs expected_price ---
+                self._record_lifecycle_entry(
+                    market_id=market_id,
+                    side=side,
+                    token_id=token_id,
+                    token_price=price,
+                    order_id=exchange_order_id,
+                )
                 _fill_price = (
                     getattr(result, "avg_price", None)
                     or getattr(result, "average_price", None)
@@ -1322,8 +1873,16 @@ class TradingSystem:
                             notes=_err_msg,
                         ),
                     )
+                await self._update_calibration_observation(
+                    observation_id,
+                    training_eligibility="not_executed",
+                )
 
         if result is None or not result.success:
+            await self._update_calibration_observation(
+                observation_id,
+                training_eligibility="not_executed",
+            )
             _exec_err = getattr(result, "error", "null_result")
             _exec_code = getattr(result, "error_code", "null_result")
             _exec_status = (
@@ -1349,7 +1908,8 @@ class TradingSystem:
             token_id=token_id,
             trigger=trigger,
         )
-        # Cooldown already stamped earlier (after Charlie+meta-gate approval).
+        self._session_stats["orders_submitted"] += 1
+        # Cooldown and lifecycle lock already stamped earlier (Charlie approval).
         # Stamping again here was a leftover from before that fix and would
         # overwrite the key with a later timestamp — no semantic harm, but
         # it obscures intent.  The earlier stamp (inside the charlie_gate block)
@@ -1426,7 +1986,23 @@ class TradingSystem:
             )
             logger.info("component_construct_success", component="ledger")
             await self._await_step("ledger.pool.initialize", self.ledger.pool.initialize())
+            self.quarantine_repository = QuarantineRepository(self.ledger)
+            self.calibration_observation_service = CalibrationObservationService(
+                ledger=self.ledger,
+                observation_export_path=str(self.calibration_observations_path),
+                dataset_export_path=str(self.calibration_dataset_path),
+                feature_schema_version=str(self.calibration_guard_config.get("meta_candidate_feature_schema_version", "meta_candidate_v1")),
+                cluster_policy_version=str(self.calibration_guard_config.get("meta_candidate_cluster_policy_version", "cluster_v1")),
+                cluster_time_bucket_seconds=int(self.calibration_guard_config.get("meta_candidate_cluster_time_bucket_seconds", 10)),
+                cluster_price_bucket_abs=str(self.calibration_guard_config.get("meta_candidate_cluster_price_bucket_abs", "0.01")),
+            )
             logger.info("ledger_initialized", path=db_path)
+            await self._safe_await(
+                "initialize_quarantine_store",
+                self._initialize_quarantine_store(),
+                timeout_seconds=25.0,
+                default=None,
+            )
             
             # Initialize with capital if needed
             equity = await self._await_step("ledger.get_equity", self.ledger.get_equity())
@@ -1610,15 +2186,19 @@ class TradingSystem:
             logger.info("component_construct_success", component="kelly_sizer")
 
             # 10. Charlie Prediction Gate
-            charlie_min_edge = CHARLIE_CONFIG.get("min_edge", Decimal("0.05"))
-            charlie_min_conf = CHARLIE_CONFIG.get("min_confidence", Decimal("0.60"))
+            charlie_min_edge = Decimal(
+                str(os.getenv("CHARLIE_MIN_EDGE", CHARLIE_CONFIG.get("min_edge", Decimal("0.05"))))
+            )
+            charlie_min_conf = Decimal(
+                str(os.getenv("CHARLIE_MIN_CONFIDENCE", CHARLIE_CONFIG.get("min_confidence", Decimal("0.60"))))
+            )
             charlie_regimes = CHARLIE_CONFIG.get("allowed_regimes", None)
             charlie_timeout = float(CHARLIE_CONFIG.get("signal_timeout_seconds", 8.0))
             logger.info("component_construct_begin", component="charlie_gate")
             self.charlie_gate = CharliePredictionGate(
                 kelly_sizer=self.kelly_sizer,
-                min_edge=Decimal(str(charlie_min_edge)),
-                min_confidence=Decimal(str(charlie_min_conf)),
+                min_edge=charlie_min_edge,
+                min_confidence=charlie_min_conf,
                 allowed_regimes=charlie_regimes,
                 signal_timeout=charlie_timeout,
             )
@@ -1627,6 +2207,9 @@ class TradingSystem:
                 component="charlie_gate",
                 min_edge=str(charlie_min_edge),
                 min_confidence=str(charlie_min_conf),
+                coin_flip_reject_band_abs=str(
+                    getattr(self.charlie_gate, "_coin_flip_reject_band_abs", Decimal("0.03"))
+                ),
             )
 
             # 11. Performance Tracker
@@ -1715,6 +2298,39 @@ class TradingSystem:
                 component="binance_trade_feed",
                 symbols=_trade_feed_symbols,
             )
+
+            # --- Calibration smoke test / fail-closed gate -----------------------
+            try:
+                self._calibration_guard_status = self._evaluate_calibration_guard()
+                for _result in self._calibration_guard_status.get("smoke_results", []):
+                    logger.info(
+                        "calibration_smoke_test",
+                        p_win_raw=round(_result["raw"], 4),
+                        p_win_calibrated=round(_result["calibrated"], 4),
+                        delta=round(_result["delta"], 4),
+                    )
+
+                if self._calibration_guard_status.get("coef") is not None:
+                    logger.info(
+                        "calibration_scaler_loaded",
+                        coef=round(float(self._calibration_guard_status["coef"]), 6),
+                        monotonic=bool(self._calibration_guard_status.get("monotonic")),
+                    )
+
+                if self._calibration_guard_status.get("blocked"):
+                    logger.error(
+                        "calibration_guard_blocking_trading",
+                        reason=self._calibration_guard_status.get("reason"),
+                        coef=self._calibration_guard_status.get("coef"),
+                        monotonic=self._calibration_guard_status.get("monotonic"),
+                    )
+                elif not self._calibration_guard_status.get("scaler_exists"):
+                    logger.warning(
+                        "calibration_smoke_passthrough_warning",
+                        msg="Scaler absent — calibration is passthrough until a valid scaler is fitted.",
+                    )
+            except Exception as _smoke_exc:
+                logger.warning("calibration_smoke_test_failed", error=str(_smoke_exc))
 
             logger.info("all_components_initialized")
             
@@ -1837,6 +2453,8 @@ class TradingSystem:
                     self.performance_tracker.refresh(),
                 )
 
+            await self._sync_lifecycle_state_from_open_orders()
+
             # --- Paper-mode peak_equity guard -----------------------------------
             # Each paper session starts fresh equity at STARTING_CAPITAL.  If the
             # performance tracker's equity-curve peak is from a prior session (and
@@ -1909,6 +2527,8 @@ class TradingSystem:
                 asyncio.create_task(self.health_server.serve())
                 logger.info("health_server_task_started", port=int(os.environ.get("HEALTH_PORT", "8765")))
 
+            self._log_session_snapshot(force=True)
+
             await self._main_loop()
             
         except Exception as e:
@@ -1924,6 +2544,10 @@ class TradingSystem:
         logger.info("entering_main_loop", tick_seconds=self.loop_tick_seconds)
         
         iteration = 0
+        loop = asyncio.get_running_loop()
+        next_iteration_at = loop.time() + self.loop_tick_seconds
+        snapshot_interval_seconds = float(self.runtime_controls.get("session_snapshot_interval_seconds", 60))
+        next_session_snapshot_at = loop.time() + snapshot_interval_seconds
         
         while self.running:
             try:
@@ -1931,15 +2555,17 @@ class TradingSystem:
                 
                 # Wait for shutdown or next iteration
                 try:
+                    wait_seconds = max(0.0, next_iteration_at - loop.time())
                     await asyncio.wait_for(
                         self.shutdown_event.wait(),
-                        timeout=self.loop_tick_seconds
+                        timeout=wait_seconds
                     )
                     break  # Shutdown requested
                 except asyncio.TimeoutError:
                     pass  # Continue normal operation
 
-                now = asyncio.get_running_loop().time()
+                now = loop.time()
+                next_iteration_at += self.loop_tick_seconds
                 if (now - self.last_heartbeat_at) >= self.loop_tick_seconds:
                     self.last_heartbeat_at = now
                     logger.info(
@@ -1956,6 +2582,11 @@ class TradingSystem:
                 maintenance_every = max(1, int(60 / max(self.loop_tick_seconds, 1.0)))
                 if iteration % maintenance_every == 0:
                     await self._periodic_maintenance()
+
+                if now >= next_session_snapshot_at:
+                    self._log_session_snapshot()
+                    while next_session_snapshot_at <= now:
+                        next_session_snapshot_at += snapshot_interval_seconds
 
                 if (now - self.last_market_probe_at) >= self.market_probe_interval_seconds:
                     self.last_market_probe_at = now
@@ -2288,6 +2919,12 @@ class TradingSystem:
                 timeout_seconds=300.0,
                 default=None,
             )
+            await self._safe_await(
+                "resolve_pending_calibration_observations",
+                self._resolve_pending_calibration_observations(),
+                timeout_seconds=120.0,
+                default=None,
+            )
 
             # Clean up execution service
             if self.execution:
@@ -2338,7 +2975,6 @@ class TradingSystem:
                         )
                 except Exception:
                     pass
-
         except Exception as e:
             logger.error(
                 "periodic_maintenance_failed",
@@ -2599,6 +3235,7 @@ class TradingSystem:
                     ),
                     timeout_seconds=5.0,
                 )
+                self._clear_lifecycle_entry(market_id, reason="market_settled")
             settled_count += 1
             settled_order_ids.append(order_id)
             logger.info(
@@ -2610,38 +3247,69 @@ class TradingSystem:
                 payout_per_share=str(payout_per_share),
             )
 
-            # --- Calibration data collection: append (p_win, actual) to CSV --
-            _cal_p_win = row.get("charlie_p_win")
-            if _cal_p_win is not None:
+            # --- Calibration data collection: schema-versioned YES-side dataset --
+            _notes = str(row.get("notes") or "")
+            _raw_yes_p = self._parse_note_token(_notes, "raw_yes_p")
+            _cal_yes_p = self._parse_note_token(_notes, "cal_yes_p")
+            _selected_side_p = self._parse_note_token(_notes, "selected_side_p")
+            _normalized_yes_price = self._parse_note_token(_notes, "normalized_yes_price")
+            _token_price = self._parse_note_token(_notes, "token_price")
+            _observation_id = self._parse_note_token(_notes, "observation_id")
+            _trade_side = str(row.get("outcome") or "")
+            _actual_yes_outcome = 1 if str(winning_side).upper() == "YES" else 0
+            _trade_outcome = 1 if pnl > Decimal("0") else 0
+            if _observation_id:
+                logger.debug(
+                    "calibration_data_deferred_to_observation_resolver",
+                    market_id=market_id,
+                    order_id=order_id,
+                    observation_id=_observation_id,
+                )
+            elif (
+                self.calibration_observation_service is not None
+                and _raw_yes_p is not None
+                and _cal_yes_p is not None
+            ):
                 try:
-                    import csv as _csv
-                    from pathlib import Path as _Path
-                    _cal_csv = _Path("data/calibration_dataset.csv")
-                    _write_header = not _cal_csv.exists()
-                    _actual = 1 if pnl > Decimal("0") else 0
-                    with open(_cal_csv, "a", newline="") as _cf:
-                        _w = _csv.DictWriter(
-                            _cf,
-                            fieldnames=["market_id", "p_win_raw", "actual_outcome"],
-                        )
-                        if _write_header:
-                            _w.writeheader()
-                        _w.writerow({
-                            "market_id": market_id,
-                            "p_win_raw": round(float(_cal_p_win), 6),
-                            "actual_outcome": _actual,
-                        })
+                    await self.calibration_observation_service.record_settled_trade_fallback(
+                        market_id=market_id,
+                        order_id=order_id,
+                        signal_side=_trade_side,
+                        selected_side=_trade_side,
+                        raw_yes_prob=str(round(float(_raw_yes_p), 6)),
+                        calibrated_yes_prob=str(round(float(_cal_yes_p), 6)),
+                        selected_side_prob=(
+                            str(round(float(_selected_side_p), 6))
+                            if _selected_side_p is not None
+                            else ""
+                        ),
+                        token_price=_token_price or "",
+                        normalized_yes_price=_normalized_yes_price or "",
+                        timestamp=str(row.get("opened_at") or ""),
+                        resolution_time=str(row.get("closed_at") or ""),
+                        actual_yes_outcome=_actual_yes_outcome,
+                        trade_outcome=_trade_outcome,
+                    )
                     logger.debug(
                         "calibration_data_appended",
                         market_id=market_id,
-                        p_win_raw=float(_cal_p_win),
-                        actual=_actual,
+                        raw_yes_prob=float(_raw_yes_p),
+                        calibrated_yes_prob=float(_cal_yes_p),
+                        actual_yes_outcome=_actual_yes_outcome,
+                        trade_outcome=_trade_outcome,
                     )
                 except Exception as _cal_exc:
                     logger.warning(
                         "calibration_data_append_failed",
                         error=str(_cal_exc),
                     )
+            elif row.get("charlie_p_win") is not None:
+                logger.warning(
+                    "calibration_data_skipped_legacy_schema",
+                    market_id=market_id,
+                    order_id=order_id,
+                    reason="missing_raw_yes_p_or_cal_yes_p_in_notes",
+                )
 
         logger.info(
             "settlement_scan_complete",
@@ -2703,6 +3371,27 @@ class TradingSystem:
                 await self._safe_await("ledger.close", self.ledger.close(), timeout_seconds=15.0)
                 logger.info("ledger_closed")
             
+            # --- Session summary -------------------------------------------
+            # Emit structured counts for the current session.  Separated from
+            # the shutdown snapshot (which reads the DB) so it is always
+            # logged even if the ledger is unavailable.
+            logger.info(
+                "session_summary",
+                opportunities_evaluated=self._session_stats.get("opportunities_evaluated", 0),
+                orders_submitted=self._session_stats.get("orders_submitted", 0),
+                blocked_by_blocklist=self._session_stats.get("blocked_static_list", 0),
+                blocked_by_quarantine=self._session_stats.get("blocked_quarantine", 0),
+                blocked_by_lifecycle_guard=self._session_stats.get("blocked_lifecycle_guard", 0),
+                blocked_by_side_flip_rule=self._session_stats.get("blocked_side_flip_rule", 0),
+                blocked_charlie_rejected=self._session_stats.get("blocked_charlie_rejected", 0),
+                blocked_meta_gate=self._session_stats.get("blocked_meta_gate", 0),
+                blocked_risk_budget=self._session_stats.get("blocked_risk_budget", 0),
+                blocked_by_max_entry_price=self._session_stats.get("blocked_max_entry_price", 0),
+                blocked_by_bad_calibration=self._session_stats.get("blocked_bad_calibration", 0),
+                observe_only_bad_calibration=self._session_stats.get("observe_only_bad_calibration", 0),
+                markets_lifecycle_locked=len(self._market_lifecycle_state),
+            )
+
             logger.info("trading_system_stopped")
             
         except Exception as e:
@@ -2820,6 +3509,7 @@ async def main():
     
     with open(config_path) as f:
         config = yaml.safe_load(f)
+    config = _resolve_runtime_controls(config)
     
     # Override paper trading mode from command line
     if args.mode == 'replay':
@@ -2852,6 +3542,16 @@ async def main():
         config_path=str(config_path),
         mode=args.mode,
         paper_trading=config['trading']['paper_trading']
+    )
+    logger.info(
+        "runtime_controls_loaded",
+        blocked_markets=config["runtime_controls"]["blocked_markets"],
+        blocked_markets_count=len(config["runtime_controls"]["blocked_markets"]),
+        lifecycle_guard=config["runtime_controls"]["lifecycle_guard"],
+        max_entry_price_abs=config["runtime_controls"]["max_entry_price_abs"],
+        calibration=config["runtime_controls"]["calibration"],
+        quarantine=config["runtime_controls"]["quarantine"],
+        session_snapshot_interval_seconds=config["runtime_controls"]["session_snapshot_interval_seconds"],
     )
     
     # Create trading system

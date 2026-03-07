@@ -30,6 +30,7 @@ secrets:
 trading:
   # Paper trading mode
   paper_trading: true
+  max_entry_price_abs: "0.65"
   
   # Initial capital
   initial_capital: 10000.00
@@ -49,6 +50,51 @@ trading:
   max_orders_per_minute: 30
   max_orders_per_hour: 500
   max_daily_orders: 5000
+
+# ==================================================================
+# RUNTIME CONTROLS
+# Source of truth for live guard behavior loaded by `main.py`.
+# `config_production.py` now acts only as a fallback default source.
+# ==================================================================
+runtime_controls:
+  blocked_markets:
+    - "1402904"
+    - "1402902"
+    - "1403073"
+    - "1403228"
+    - "1403232"
+    - "1403143"
+    - "1445001"
+    - "1447205"
+    - "1448902"
+    - "1448693"
+    - "1450993"
+    - "1451181"
+    - "1450921"
+    - "1411624"
+    - "1437414"
+    - "1445053"
+    - "1487045"
+    - "1487027"
+  lifecycle_guard:
+    enabled: true
+    max_active_entries_per_market: 1
+    allow_add_on: false
+    min_price_improvement_abs: "0.05"
+  max_entry_price_abs: "0.65"
+  calibration:
+    fail_closed: true
+    min_positive_coef: 0.0
+    require_monotonic_smoke_test: true
+    smoke_test_points: [0.30, 0.50, 0.79]
+    observe_only_on_invalid: true
+    dataset_export_path: data/calibration_dataset_v2.csv
+    observation_export_path: data/calibration_observations.csv
+  quarantine:
+    enabled: true
+    seed_static_blocklist: true
+    auto_review_after_days: 7
+  session_snapshot_interval_seconds: 60
 
 # ==================================================================
 # RISK MANAGEMENT
