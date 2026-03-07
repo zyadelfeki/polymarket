@@ -197,10 +197,12 @@ async def test_async_record_reconciled_position_preserves_accounting_semantics(t
 
 
 @pytest.mark.asyncio
-async def test_startup_open_order_reconciliation_imports_exchange_only_order(tmp_path):
+async def test_startup_open_order_reconciliation_auto_cancels_imported_orphan(tmp_path):
     db_path = tmp_path / "open_orders_import.db"
     ledger = AsyncLedger(db_path=str(db_path))
     await ledger.initialize()
+
+    cancel_calls = []
 
     class StubClient:
         async def get_open_orders(self):
@@ -217,25 +219,38 @@ async def test_startup_open_order_reconciliation_imports_exchange_only_order(tmp
                 }
             ]
 
+        async def cancel_order(self, order_id):
+            cancel_calls.append(order_id)
+            return True
+
     bot = TradingSystem(config={})
     bot.ledger = ledger
     bot.api_client = StubClient()
 
     summary = await bot._reconcile_missing_open_orders_on_startup()
-    open_orders = await ledger.get_open_orders()
+    open_orders = await ledger.get_all_tracked_orders()
 
-    assert summary == {"exchange_open_orders": 1, "imported": 1, "already_known": 0, "skipped": 0}
+    assert summary == {
+        "exchange_open_orders": 1,
+        "imported": 1,
+        "already_known": 0,
+        "skipped": 0,
+        "cancelled": 1,
+        "cancel_failures": 0,
+        "left_open_after_failed_cancel": 0,
+    }
+    assert cancel_calls == ["exchange_1"]
     assert len(open_orders) == 1
     assert open_orders[0]["order_id"] == "exchange_1"
     assert open_orders[0]["market_id"] == "m1"
-    assert open_orders[0]["order_state"] == "SUBMITTED"
-    assert open_orders[0]["notes"] == "startup_open_order_reconcile"
+    assert open_orders[0]["order_state"] == "CANCELLED"
+    assert open_orders[0]["notes"] == "startup_orphan_auto_cancelled"
 
     await ledger.close()
 
 
 @pytest.mark.asyncio
-async def test_startup_open_order_reconciliation_does_not_duplicate_known_local_order(tmp_path):
+async def test_startup_open_order_reconciliation_does_not_cancel_known_local_order(tmp_path):
     db_path = tmp_path / "open_orders_known.db"
     ledger = AsyncLedger(db_path=str(db_path))
     await ledger.initialize()
@@ -249,6 +264,8 @@ async def test_startup_open_order_reconciliation_does_not_duplicate_known_local_
         price=Decimal("0.42"),
         notes="preexisting",
     )
+
+    cancel_calls = []
 
     class StubClient:
         async def get_open_orders(self):
@@ -264,6 +281,10 @@ async def test_startup_open_order_reconciliation_does_not_duplicate_known_local_
                 }
             ]
 
+        async def cancel_order(self, order_id):
+            cancel_calls.append(order_id)
+            return True
+
     bot = TradingSystem(config={})
     bot.ledger = ledger
     bot.api_client = StubClient()
@@ -271,9 +292,64 @@ async def test_startup_open_order_reconciliation_does_not_duplicate_known_local_
     summary = await bot._reconcile_missing_open_orders_on_startup()
     open_orders = await ledger.get_open_orders()
 
-    assert summary == {"exchange_open_orders": 1, "imported": 0, "already_known": 1, "skipped": 0}
+    assert summary == {
+        "exchange_open_orders": 1,
+        "imported": 0,
+        "already_known": 1,
+        "skipped": 0,
+        "cancelled": 0,
+        "cancel_failures": 0,
+        "left_open_after_failed_cancel": 0,
+    }
+    assert cancel_calls == []
     assert len(open_orders) == 1
     assert open_orders[0]["notes"] == "preexisting"
+
+    await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_open_order_reconciliation_leaves_imported_order_open_when_cancel_fails(tmp_path):
+    db_path = tmp_path / "open_orders_cancel_fail.db"
+    ledger = AsyncLedger(db_path=str(db_path))
+    await ledger.initialize()
+
+    class StubClient:
+        async def get_open_orders(self):
+            return [
+                {
+                    "order_id": "exchange_1",
+                    "market_id": "m1",
+                    "token_id": "token_1",
+                    "outcome": "YES",
+                    "side": "BUY",
+                    "size": "15",
+                    "price": "0.42",
+                }
+            ]
+
+        async def cancel_order(self, order_id):
+            return False
+
+    bot = TradingSystem(config={})
+    bot.ledger = ledger
+    bot.api_client = StubClient()
+
+    summary = await bot._reconcile_missing_open_orders_on_startup()
+    open_orders = await ledger.get_open_orders()
+
+    assert summary == {
+        "exchange_open_orders": 1,
+        "imported": 1,
+        "already_known": 0,
+        "skipped": 0,
+        "cancelled": 0,
+        "cancel_failures": 1,
+        "left_open_after_failed_cancel": 1,
+    }
+    assert len(open_orders) == 1
+    assert open_orders[0]["order_state"] == "SUBMITTED"
+    assert open_orders[0]["notes"] == "startup_open_order_reconcile"
 
     await ledger.close()
 
@@ -295,7 +371,15 @@ async def test_startup_open_order_reconciliation_no_op_when_exchange_has_no_open
     summary = await bot._reconcile_missing_open_orders_on_startup()
     open_orders = await ledger.get_open_orders()
 
-    assert summary == {"exchange_open_orders": 0, "imported": 0, "already_known": 0, "skipped": 0}
+    assert summary == {
+        "exchange_open_orders": 0,
+        "imported": 0,
+        "already_known": 0,
+        "skipped": 0,
+        "cancelled": 0,
+        "cancel_failures": 0,
+        "left_open_after_failed_cancel": 0,
+    }
     assert open_orders == []
 
     await ledger.close()
