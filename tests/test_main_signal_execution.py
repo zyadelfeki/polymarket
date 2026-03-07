@@ -7,6 +7,32 @@ from main import TradingSystem
 from services.execution_service_v2 import OrderResult, OrderStatus
 
 
+class _StaticRecommendation:
+    def __init__(self, side: str) -> None:
+        self.side = side
+        self.size = Decimal("10")
+        self.kelly_fraction = Decimal("0.1")
+        self.p_win = 0.62
+        self.p_win_raw = 0.64
+        self.p_win_calibrated = 0.62
+        self.implied_prob = 0.50
+        self.edge = 0.08
+        self.confidence = 0.8
+        self.regime = "BULLISH"
+        self.technical_regime = "TRENDING"
+        self.reason = "unit_test_charlie"
+        self.model_votes = None
+        self.ofi_conflict = False
+
+
+class _StaticCharlieGate:
+    def __init__(self, side: str) -> None:
+        self._recommendation = _StaticRecommendation(side)
+
+    async def evaluate_market(self, **kwargs):
+        return self._recommendation
+
+
 def _build_config() -> dict:
     return {
         "trading": {
@@ -36,6 +62,7 @@ async def test_execute_opportunity_submits_order_when_valid():
     system.execution = AsyncMock()
     system.ledger = AsyncMock()
     system.circuit_breaker = AsyncMock()
+    system.charlie_gate = _StaticCharlieGate("YES")
 
     system.ledger.get_equity.return_value = Decimal("100")
     system.circuit_breaker.can_trade = AsyncMock(return_value=True)
@@ -77,6 +104,7 @@ async def test_execute_opportunity_skips_when_circuit_breaker_blocks():
     system.execution = AsyncMock()
     system.ledger = AsyncMock()
     system.circuit_breaker = AsyncMock()
+    system.charlie_gate = _StaticCharlieGate("YES")
 
     system.ledger.get_equity.return_value = Decimal("100")
     system.circuit_breaker.can_trade = AsyncMock(return_value=False)
@@ -102,6 +130,7 @@ async def test_run_strategy_scan_executes_found_opportunity():
     system.ledger = AsyncMock()
     system.circuit_breaker = AsyncMock()
     system.strategy_engine = AsyncMock()
+    system.charlie_gate = _StaticCharlieGate("NO")
 
     system.ledger.get_equity.return_value = Decimal("100")
     system.circuit_breaker.can_trade = AsyncMock(return_value=True)
