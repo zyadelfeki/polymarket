@@ -19,8 +19,11 @@ call venv\Scripts\activate.bat
 echo [2/2] Launching bot...
 echo.
 
-REM Launch bot with arguments (defaults to paper mode with $10k)
-venv\Scripts\python.exe main_v2.py --mode paper --capital 10000 %*
+echo [INFO] main.py uses config-defined capital; launcher ignores explicit capital overrides.
+
+REM Launch bot with the supported entrypoint
+venv\Scripts\python.exe main.py --config config/production.yaml --mode paper
+
 
 echo.
 echo Bot shutdown complete.

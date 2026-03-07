@@ -58,8 +58,10 @@ foreach ($pkg in $required) {
 Write-Host "[3/3] Launching bot..." -ForegroundColor Green
 Write-Host ""
 
-# Launch bot with full path to venv Python
-& ".\venv\Scripts\python.exe" main_v2.py --mode $Mode --capital $Capital
+Write-Host "[INFO] main.py uses config-defined capital; -Capital is ignored by this launcher." -ForegroundColor Yellow
+
+# Launch bot with the supported entrypoint
+& ".\venv\Scripts\python.exe" main.py --config config/production.yaml --mode $Mode
 
 $exitCode = $LASTEXITCODE
 Write-Host ""
