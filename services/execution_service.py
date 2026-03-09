@@ -626,7 +626,9 @@ class ExecutionService:
                     return None, None, None
                 
                 await asyncio.sleep(poll_interval)
-            
+
+            except SlippageError:
+                raise
             except Exception as e:
                 self.network_monitor.record_failure(str(e))
                 logger.error(f"Error checking order status: {e}")

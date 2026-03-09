@@ -161,7 +161,7 @@ class OrderResult(dict):
         slippage_bps: Decimal = Decimal("0"),
         execution_time_ms: float = 0.0,
     ):
-        super().__init__(
+        payload = dict(
             success=success,
             order_id=order_id,
             status=status,
@@ -177,6 +177,8 @@ class OrderResult(dict):
             slippage_bps=slippage_bps,
             execution_time_ms=execution_time_ms,
         )
+        super().__init__(payload)
+        self.__dict__.update(payload)
 
     def __getattr__(self, item: str):
         try:
@@ -186,6 +188,7 @@ class OrderResult(dict):
 
     def __setattr__(self, key: str, value) -> None:
         self[key] = value
+        self.__dict__[key] = value
 
     @property
     def is_complete(self) -> bool:
@@ -559,11 +562,7 @@ class ExecutionServiceV2:
 
         with CorrelationContext.use(correlation_id):
             try:
-                # Network partition detection is only meaningful in live mode.
-                # In paper mode no real API calls are made so record_success()
-                # is never called → the monitor always trips after 15 s → every
-                # paper order is blocked.  Skip the check entirely for paper runs.
-                if not is_paper_trading and self.network_monitor.check_partition():
+                if self.network_monitor.check_partition():
                     raise NetworkPartitionError("Trading halted: network partition detected")
                 if not token_id or not isinstance(token_id, str):
                     raise ValueError("Invalid token_id")

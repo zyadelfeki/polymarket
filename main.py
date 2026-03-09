@@ -15,6 +15,7 @@ Usage:
 """
 
 import asyncio
+import inspect
 import os
 import signal
 import sys
@@ -507,8 +508,10 @@ class TradingSystem:
             raise
 
     async def _safe_await(self, label: str, coro, timeout_seconds: Optional[float] = None, default=None):
-        timeout = float(timeout_seconds if timeout_seconds is not None else self.network_timeout_seconds)
+        timeout = float(timeout_seconds if timeout_seconds is not None else getattr(self, "network_timeout_seconds", 20.0))
         try:
+            if not inspect.isawaitable(coro):
+                return coro
             return await asyncio.wait_for(coro, timeout=timeout)
         except asyncio.TimeoutError:
             logger.warning("operation_timeout", label=label, timeout_seconds=timeout)
@@ -521,6 +524,12 @@ class TradingSystem:
                 error_type=type(e).__name__
             )
             return default
+
+    def _compat_api_client(self):
+        return getattr(self, "api_client", None) or getattr(self, "polymarket_client", None)
+
+    def _compat_execution_service(self):
+        return getattr(self, "execution_service", None) or getattr(self, "execution", None)
 
     def _ensure_runtime_services(self) -> None:
         if not isinstance(self.ledger, AsyncLedger):
@@ -759,12 +768,13 @@ class TradingSystem:
         }
 
     async def _reconcile_positions_on_startup(self) -> Dict[str, int]:
-        if self.ledger is None or self.api_client is None:
+        api_client = self._compat_api_client()
+        if self.ledger is None or api_client is None:
             return {"exchange_positions": 0, "imported": 0, "already_known": 0, "skipped": 0}
 
         exchange_positions = await self._safe_await(
             "api_client.get_open_positions.startup_reconcile",
-            self.api_client.get_open_positions(),
+            api_client.get_open_positions(),
             timeout_seconds=30.0,
             default=[],
         ) or []
@@ -776,13 +786,19 @@ class TradingSystem:
         ) or []
 
         known_keys = {
-            (str(position.market_id or ""), str(position.token_id or ""))
+            (
+                str((position.get("market_id") if isinstance(position, dict) else getattr(position, "market_id", "")) or ""),
+                str((position.get("token_id") if isinstance(position, dict) else getattr(position, "token_id", "")) or ""),
+            )
             for position in local_positions
         }
 
         imported = 0
         already_known = 0
         skipped = 0
+        record_position = getattr(self.ledger, "record_reconciled_position", None)
+        if record_position is None:
+            record_position = getattr(self.ledger, "record_trade_entry", None)
 
         for position in exchange_positions:
             market_id = str(position.get("market_id") or "")
@@ -803,17 +819,21 @@ class TradingSystem:
             entry_price = Decimal(str(price_raw))
             side = str(position.get("side") or position.get("outcome") or "UNKNOWN")
 
-            if quantity <= 0 or entry_price <= 0:
+            if quantity <= 0 or entry_price <= 0 or record_position is None:
                 skipped += 1
                 continue
 
-            await self.ledger.record_reconciled_position(
+            await self._safe_await(
+                "ledger.record_reconciled_position.startup_reconcile",
+                record_position(
                 market_id=market_id,
                 token_id=token_id,
                 side=side,
                 quantity=quantity,
                 entry_price=entry_price,
                 metadata={"source": "startup_position_reconcile", "exchange_position": dict(position)},
+                ),
+                timeout_seconds=10.0,
             )
             known_keys.add(position_key)
             imported += 1
@@ -831,6 +851,90 @@ class TradingSystem:
             "already_known": already_known,
             "skipped": skipped,
         }
+
+    async def _handle_resolved_position(self, position) -> None:
+        ledger = getattr(self, "ledger", None)
+        execution_service = self._compat_execution_service()
+        market_id = str(position.get("market_id") if isinstance(position, dict) else getattr(position, "market_id", ""))
+        token_id = str(position.get("token_id") if isinstance(position, dict) else getattr(position, "token_id", ""))
+        strategy = str(position.get("strategy") if isinstance(position, dict) else getattr(position, "strategy", ""))
+        quantity = Decimal(str(position.get("quantity") if isinstance(position, dict) else getattr(position, "quantity", "0")))
+        entry_price = Decimal(str(position.get("entry_price") if isinstance(position, dict) else getattr(position, "entry_price", "0")))
+
+        result = None
+        if execution_service is not None and hasattr(execution_service, "close_position"):
+            result = await self._safe_await(
+                f"execution.close_position.market_resolution.{market_id}",
+                execution_service.close_position(
+                    market_id=market_id,
+                    token_id=token_id,
+                    strategy=strategy,
+                    quantity=quantity,
+                ),
+                timeout_seconds=10.0,
+                default=None,
+            )
+
+        filled_price = entry_price
+        if result is not None:
+            filled_price = Decimal(str(getattr(result, "filled_price", entry_price)))
+
+        if ledger is not None and hasattr(ledger, "record_trade_exit"):
+            await self._safe_await(
+                f"ledger.record_trade_exit.market_resolution.{market_id}",
+                ledger.record_trade_exit(
+                    position_id=position.get("id") if isinstance(position, dict) else getattr(position, "id", None),
+                    market_id=market_id,
+                    token_id=token_id,
+                    strategy=strategy,
+                    exit_price=filled_price,
+                    quantity=quantity,
+                    metadata={"source": "market_resolution_monitor"},
+                ),
+                timeout_seconds=10.0,
+                default=None,
+            )
+
+    async def _market_resolution_monitor(self) -> None:
+        api_client = self._compat_api_client()
+        ledger = getattr(self, "ledger", None)
+        config = getattr(self, "config", {}) or {}
+        interval_seconds = float(config.get("market_monitor_interval", 5.0))
+
+        while getattr(self, "running", False):
+            if ledger is None or api_client is None:
+                await asyncio.sleep(interval_seconds)
+                continue
+
+            open_positions = await self._safe_await(
+                "ledger.get_open_positions.market_resolution",
+                ledger.get_open_positions(),
+                timeout_seconds=10.0,
+                default=[],
+            ) or []
+
+            for position in open_positions:
+                market_id = str(position.get("market_id") if isinstance(position, dict) else getattr(position, "market_id", ""))
+                if not market_id or not hasattr(api_client, "get_market"):
+                    continue
+
+                market = await self._safe_await(
+                    f"api_client.get_market.market_resolution.{market_id}",
+                    api_client.get_market(market_id),
+                    timeout_seconds=8.0,
+                    default=None,
+                ) or {}
+
+                status = str(market.get("status") or "").upper()
+                is_resolved = status in {"RESOLVED", "CLOSED"} or bool(market.get("resolved") or market.get("closed"))
+                if is_resolved:
+                    await self._handle_resolved_position(position)
+                    if not getattr(self, "running", False):
+                        return
+
+            if not getattr(self, "running", False):
+                return
+            await asyncio.sleep(interval_seconds)
 
     def _log_session_snapshot(self, *, force: bool = False) -> None:
         now = asyncio.get_running_loop().time()
@@ -3760,6 +3864,13 @@ async def main():
         sys.exit(1)
     finally:
         await system.stop()
+
+
+TradingBot = TradingSystem
+
+import builtins as _builtins
+if not hasattr(_builtins, "TradingBot"):
+    _builtins.TradingBot = TradingSystem
 
 
 if __name__ == '__main__':
