@@ -144,7 +144,7 @@ python run_backtest.py --start 2026-01-01 --end 2026-01-10
 ### 4. Paper Trading (72 Hours Minimum)
 ```bash
 # Run in paper trading mode
-PAPER_TRADING=true python main_production.py
+python main.py --config config/production.yaml --mode paper
 
 # Monitor logs
 tail -f logs/trading_bot.log
@@ -153,8 +153,13 @@ tail -f logs/trading_bot.log
 ### 5. Live Trading (After Paper Trading Validation)
 ```bash
 # Run in live mode
-python main_production.py
+python main.py --config config/production.yaml --mode live
 ```
+
+Canonical runtime entry point: `main.py`.
+
+- `run.bat` and `run.ps1` both launch `main.py --config config/production.yaml`.
+- `main_production.py` is kept as a compatibility import alias for older docs/tests, not as the primary runtime path.
 
 ---
 
@@ -477,7 +482,7 @@ polymarket/
 ├── tests/
 │   ├── test_ledger.py           # Ledger unit tests (19)
 │   └── test_kelly_sizer.py      # Kelly unit tests (29)
-├── main_production.py           # Production orchestrator
+├── main_production.py           # Compatibility alias for main.TradingSystem
 ├── run_tests.py                 # Test runner
 ├── run_backtest.py              # Backtest runner
 └── README.md                    # This file
