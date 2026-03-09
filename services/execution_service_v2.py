@@ -344,7 +344,12 @@ class ExecutionServiceV2:
         self.precision_monitor = PrecisionMonitor()
 
         partition_threshold = int(self.config.get("partition_threshold_seconds", 15))
-        self.network_monitor = NetworkHealthMonitor(partition_threshold_seconds=partition_threshold)
+        shared_network_monitor = getattr(self.client, "network_monitor", None)
+        if isinstance(shared_network_monitor, NetworkHealthMonitor):
+            shared_network_monitor.state.partition_threshold_seconds = partition_threshold
+            self.network_monitor = shared_network_monitor
+        else:
+            self.network_monitor = NetworkHealthMonitor(partition_threshold_seconds=partition_threshold)
         
         self._monitor_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -353,7 +358,8 @@ class ExecutionServiceV2:
             "execution_service_initialized",
             max_retries=self.max_retries,
             timeout_seconds=self.timeout_seconds,
-            paper_trading=getattr(self.client, "paper_trading", False)
+            paper_trading=getattr(self.client, "paper_trading", False),
+            shared_network_monitor=isinstance(shared_network_monitor, NetworkHealthMonitor),
         )
 
     async def get_real_balance(self) -> Decimal:
@@ -562,7 +568,7 @@ class ExecutionServiceV2:
 
         with CorrelationContext.use(correlation_id):
             try:
-                if self.network_monitor.check_partition():
+                if (not is_paper_trading) and self.network_monitor.check_partition():
                     raise NetworkPartitionError("Trading halted: network partition detected")
                 if not token_id or not isinstance(token_id, str):
                     raise ValueError("Invalid token_id")

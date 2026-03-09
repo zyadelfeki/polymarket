@@ -420,6 +420,18 @@ class PolymarketClientV2:
     def set_auth_failure_handler(self, handler: Callable[[str], Awaitable[None]]) -> None:
         """Register async handler for critical auth failures."""
         self._auth_failure_handler = handler
+
+    def _derive_api_credentials(self) -> tuple[Any, str]:
+        """Derive API credentials across supported py-clob-client SDK variants."""
+        derive_api_key = getattr(self.client, "create_or_derive_api_key", None)
+        if callable(derive_api_key):
+            return derive_api_key(), "create_or_derive_api_key"
+
+        derive_api_creds = getattr(self.client, "create_or_derive_api_creds", None)
+        if callable(derive_api_creds):
+            return derive_api_creds(), "create_or_derive_api_creds"
+
+        raise AttributeError("No credential derivation method available on ClobClient")
     
     def _force_authentication(self):
         """
@@ -436,19 +448,17 @@ class PolymarketClientV2:
             return
         
         if not self.private_key or self.private_key == "your_private_key_here":
-            logger.warning("no_private_key_provided", mode="read_only")
+            logger.warning("no_private_key_readonly_mode")
             # Create read-only client
             try:
                 self.client = ClobClient(self.host)
+                logger.info("readonly_client_initialized")
             except Exception as e:
-                logger.error("failed_to_create_readonly_client", error=str(e))
+                logger.error("readonly_client_failed", error=str(e))
             return
         
         try:
-            logger.info("starting_forced_authentication", paper_trading=self.paper_trading)
-            
             # Step 1: Create client with private key
-            logger.debug("creating_clob_client_with_key")
             self.client = ClobClient(
                 host=self.host,
                 key=self.private_key,
@@ -460,51 +470,38 @@ class PolymarketClientV2:
             self.address = account.address
             if not self.wallet_address:
                 self.wallet_address = self.address
-            logger.info("wallet_address_derived", address=self.address)
             
             # Step 3: For LIVE mode, derive API credentials NOW
             if not self.paper_trading:
-                logger.info("live_mode_deriving_api_credentials_NOW")
-                
-                # CRITICAL: Call create_or_derive_api_key synchronously
                 try:
-                    logger.debug("calling_create_or_derive_api_key")
-                    creds = self.client.create_or_derive_api_key()
-                    
-                    logger.info(
-                        "api_key_derived_successfully",
-                        api_key_prefix=creds.api_key[:8] + "..." if hasattr(creds, 'api_key') else "unknown",
-                        has_secret=bool(hasattr(creds, 'secret')),
-                        has_passphrase=bool(hasattr(creds, 'passphrase'))
-                    )
-                    
-                    # Step 4: Reinitialize client WITH credentials
-                    logger.debug("reinitializing_client_with_credentials")
-                    self.client = ClobClient(
-                        host=self.host,
-                        key=self.private_key,
-                        chain_id=self.chain_id,
-                        creds=creds
-                    )
-                    
+                    creds, credential_method = self._derive_api_credentials()
+                    if credential_method == "create_or_derive_api_key":
+                        self.client = ClobClient(
+                            host=self.host,
+                            key=self.private_key,
+                            chain_id=self.chain_id,
+                            creds=creds
+                        )
+                    elif hasattr(self.client, "set_api_creds"):
+                        self.client.set_api_creds(creds)
+                    else:
+                        self.client = ClobClient(
+                            host=self.host,
+                            key=self.private_key,
+                            chain_id=self.chain_id,
+                            creds=creds
+                        )
+
                     self.authenticated = True
-                    logger.info("clob_client_authenticated_successfully", address=self.address)
-                    
-                except AttributeError:
-                    # Fallback: try create_or_derive_api_creds
-                    logger.warning("create_or_derive_api_key_not_found_trying_alt_method")
-                    try:
-                        api_creds_dict = self.client.create_or_derive_api_creds()
-                        self.client.set_api_creds(api_creds_dict)
-                        self.authenticated = True
-                        logger.info("clob_client_authenticated_via_alt_method", address=self.address)
-                    except Exception as e:
-                        logger.error("alt_auth_method_failed", error=str(e), error_type=type(e).__name__)
-                        self.authenticated = False
-                
+                    logger.info(
+                        "live_auth_success",
+                        address=self.address,
+                        credential_method=credential_method,
+                        proxy_address=self.proxy_address,
+                    )
                 except Exception as e:
                     logger.error(
-                        "api_credential_derivation_failed",
+                        "credential_derivation_failed",
                         error=str(e),
                         error_type=type(e).__name__,
                         address=self.address
@@ -512,15 +509,15 @@ class PolymarketClientV2:
                     self.authenticated = False
             else:
                 # Paper trading: no auth needed
-                logger.info("paper_trading_mode_no_auth_needed")
-                self.authenticated = True  # "Authenticated" for paper trading purposes
+                self.authenticated = True
+                logger.info("paper_mode_initialized", address=self.address)
             
             # Mark as ready to trade
-            self.can_trade = True
+            self.can_trade = self.paper_trading or self.authenticated
             
         except Exception as e:
             logger.error(
-                "client_initialization_failed",
+                "client_init_failed",
                 error=str(e),
                 error_type=type(e).__name__,
                 exc_info=True

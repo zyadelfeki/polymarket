@@ -105,7 +105,12 @@ class ExecutionService:
         self.order_semaphore = asyncio.Semaphore(5)  # Max 5 concurrent orders
 
         partition_threshold = int(config.get('partition_threshold_seconds', 15))
-        self.network_monitor = NetworkHealthMonitor(partition_threshold_seconds=partition_threshold)
+        shared_network_monitor = getattr(self.client, 'network_monitor', None)
+        if isinstance(shared_network_monitor, NetworkHealthMonitor):
+            shared_network_monitor.state.partition_threshold_seconds = partition_threshold
+            self.network_monitor = shared_network_monitor
+        else:
+            self.network_monitor = NetworkHealthMonitor(partition_threshold_seconds=partition_threshold)
         
         # Order tracking
         self.active_orders = {}  # order_id -> metadata

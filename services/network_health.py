@@ -55,10 +55,16 @@ else:
     logger = _FallbackLogger(__name__)
 
 
+DEFAULT_STARTUP_GRACE_SECONDS = 30
+
+
 @dataclass
 class NetworkPartitionState:
+    initialized_at: datetime
     last_successful_api_call: datetime
     partition_threshold_seconds: int
+    startup_grace_seconds: int = DEFAULT_STARTUP_GRACE_SECONDS
+    has_successful_api_call: bool = False
     is_partitioned: bool = False
     last_failure: Optional[str] = None
 
@@ -70,10 +76,23 @@ class NetworkPartitionError(RuntimeError):
 class NetworkHealthMonitor:
     """Detect network partitions before trading on stale data."""
 
-    def __init__(self, partition_threshold_seconds: int = 15):
+    def __init__(
+        self,
+        partition_threshold_seconds: int = 15,
+        startup_grace_seconds: int = DEFAULT_STARTUP_GRACE_SECONDS,
+    ):
+        now = self._utc_now()
         self.state = NetworkPartitionState(
-            last_successful_api_call=self._utc_now(),
+            initialized_at=now,
+            last_successful_api_call=now,
             partition_threshold_seconds=partition_threshold_seconds,
+            startup_grace_seconds=startup_grace_seconds,
+        )
+        logger.info(
+            "network_health_monitor_initialized",
+            threshold_seconds=partition_threshold_seconds,
+            startup_grace_seconds=startup_grace_seconds,
+            initialized_at=now.isoformat(),
         )
 
     @staticmethod
@@ -88,21 +107,32 @@ class NetworkHealthMonitor:
 
     def record_success(self) -> None:
         self.state.last_successful_api_call = self._utc_now()
+        self.state.has_successful_api_call = True
+        self.state.last_failure = None
         if self.state.is_partitioned:
             logger.info("network_recovered")
             self.state.is_partitioned = False
-            self.state.last_failure = None
 
     def record_failure(self, reason: Optional[str] = None) -> None:
         self.state.last_failure = reason
 
     def check_partition(self) -> bool:
-        elapsed = (self._utc_now() - self._normalize_utc(self.state.last_successful_api_call)).total_seconds()
+        now = self._utc_now()
+        if not self.state.has_successful_api_call:
+            startup_elapsed = (now - self._normalize_utc(self.state.initialized_at)).total_seconds()
+            if startup_elapsed <= self.state.startup_grace_seconds:
+                return False
+            elapsed = startup_elapsed
+        else:
+            elapsed = (now - self._normalize_utc(self.state.last_successful_api_call)).total_seconds()
+
         if elapsed > self.state.partition_threshold_seconds and not self.state.is_partitioned:
             logger.critical(
                 "network_partition_detected",
                 elapsed_seconds=elapsed,
                 threshold_seconds=self.state.partition_threshold_seconds,
+                startup_grace_seconds=self.state.startup_grace_seconds,
+                has_successful_api_call=self.state.has_successful_api_call,
                 last_failure=self.state.last_failure,
             )
             self.state.is_partitioned = True

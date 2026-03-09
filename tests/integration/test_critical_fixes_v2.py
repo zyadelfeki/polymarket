@@ -504,13 +504,14 @@ async def test_polymarket_client_v2_get_open_orders_returns_empty_list_when_unav
 @pytest.mark.asyncio
 async def test_network_partition_blocks_order_v2():
     class StubClient:
-        paper_trading = True
+        paper_trading = False
 
     class StubLedger:
         async def get_idempotency_record(self, *_):
             return None
 
     service = ExecutionServiceV2(StubClient(), StubLedger())
+    service.network_monitor.state.has_successful_api_call = True
     service.network_monitor.state.last_successful_api_call = datetime.utcnow() - timedelta(seconds=60)
 
     result = await service.place_order(
@@ -524,6 +525,41 @@ async def test_network_partition_blocks_order_v2():
 
     assert result.success is False
     assert result.error_code == "network_partition"
+
+
+@pytest.mark.asyncio
+async def test_network_partition_does_not_block_paper_order_v2():
+    class StubLedger:
+        async def get_idempotency_record(self, *_):
+            return None
+
+        async def append_order_audit_log(self, **_):
+            return None
+
+        async def record_order_created(self, **_):
+            return None
+
+        async def record_trade_entry(self, **_):
+            return "position_1"
+
+        async def get_equity(self):
+            return Decimal("1000")
+
+    client = PolymarketClientV2(paper_trading=True, retry_backoff_base=0)
+    service = ExecutionServiceV2(client, StubLedger())
+    service.network_monitor.state.has_successful_api_call = True
+    service.network_monitor.state.last_successful_api_call = datetime.utcnow() - timedelta(seconds=60)
+
+    result = await service.place_order(
+        strategy="test",
+        market_id="0x" + "a" * 64,
+        token_id="yes",
+        side="BUY",
+        quantity=Decimal("10"),
+        price=Decimal("0.50"),
+    )
+
+    assert result.success is True
 
 
 @pytest.mark.asyncio
