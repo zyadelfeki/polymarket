@@ -218,7 +218,7 @@ def test_reconcile_positions_calls_existing_reconcile_and_prints_summary(tmp_pat
     captured = capsys.readouterr()
 
     assert exit_code == 0
-    assert calls == {"initialized": 1, "reconciled": 1, "closed": 1}
+    assert calls == {"initialized": 2, "reconciled": 1, "closed": 2}
     assert "RECONCILIATION SUMMARY" in captured.out
     assert '"open_orders": 3' in captured.out
     assert '"resolved_while_offline": 1' in captured.out

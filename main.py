@@ -648,6 +648,8 @@ class TradingSystem:
         if self.ledger is None or self.api_client is None:
             return {
                 "exchange_open_orders": 0,
+                "orphaned_exchange_open_orders": 0,
+                "local_open_orders_missing_from_exchange": 0,
                 "imported": 0,
                 "already_known": 0,
                 "skipped": 0,
@@ -674,6 +676,13 @@ class TradingSystem:
             for order in local_open_orders
             if str(order.get("order_id") or "")
         }
+        exchange_order_ids = {
+            str(order.get("order_id") or "")
+            for order in exchange_open_orders
+            if str(order.get("order_id") or "")
+        }
+        orphaned_exchange_order_ids = sorted(exchange_order_ids - known_order_ids)
+        local_missing_exchange_order_ids = sorted(known_order_ids - exchange_order_ids)
 
         imported = 0
         already_known = 0
@@ -682,11 +691,25 @@ class TradingSystem:
         cancel_failures = 0
         left_open_after_failed_cancel = 0
 
+        for order_id in local_missing_exchange_order_ids:
+            logger.warning(
+                "startup_reconciliation_mismatch",
+                mismatch_class="local_open_order_missing_from_exchange_open_orders",
+                order_id=order_id,
+            )
+
         for order in exchange_open_orders:
             order_id = str(order.get("order_id") or "")
             market_id = str(order.get("market_id") or "")
             if not order_id or not market_id:
                 skipped += 1
+                logger.warning(
+                    "startup_exchange_open_order_skipped",
+                    mismatch_class="exchange_open_order_missing_from_local_tracking",
+                    order_id=order_id or None,
+                    market_id=market_id or None,
+                    reason="missing_order_id_or_market_id",
+                )
                 continue
 
             if order_id in known_order_ids:
@@ -697,6 +720,15 @@ class TradingSystem:
             price = Decimal(str(order.get("price") or "0"))
             if size <= 0 or price <= 0:
                 skipped += 1
+                logger.warning(
+                    "startup_exchange_open_order_skipped",
+                    mismatch_class="exchange_open_order_missing_from_local_tracking",
+                    order_id=order_id,
+                    market_id=market_id,
+                    reason="non_positive_size_or_price",
+                    size=str(size),
+                    price=str(price),
+                )
                 continue
 
             await self.ledger.import_exchange_open_order(
@@ -712,6 +744,13 @@ class TradingSystem:
             )
             known_order_ids.add(order_id)
             imported += 1
+            logger.warning(
+                "startup_reconciliation_mismatch",
+                mismatch_class="exchange_open_order_missing_from_local_tracking",
+                order_id=order_id,
+                market_id=market_id,
+                recovery_action="imported_then_cancel_attempted",
+            )
 
             cancel_error: Optional[str] = None
             cancel_ok = False
@@ -750,15 +789,21 @@ class TradingSystem:
         logger.info(
             "startup_open_order_reconciliation_complete",
             exchange_open_orders=len(exchange_open_orders),
+            orphaned_exchange_open_orders=len(orphaned_exchange_order_ids),
+            local_open_orders_missing_from_exchange=len(local_missing_exchange_order_ids),
             imported=imported,
             already_known=already_known,
             skipped=skipped,
             cancelled=cancelled,
             cancel_failures=cancel_failures,
             left_open_after_failed_cancel=left_open_after_failed_cancel,
+            orphaned_exchange_order_ids=orphaned_exchange_order_ids,
+            local_missing_exchange_order_ids=local_missing_exchange_order_ids,
         )
         return {
             "exchange_open_orders": len(exchange_open_orders),
+            "orphaned_exchange_open_orders": len(orphaned_exchange_order_ids),
+            "local_open_orders_missing_from_exchange": len(local_missing_exchange_order_ids),
             "imported": imported,
             "already_known": already_known,
             "skipped": skipped,
@@ -770,7 +815,14 @@ class TradingSystem:
     async def _reconcile_positions_on_startup(self) -> Dict[str, int]:
         api_client = self._compat_api_client()
         if self.ledger is None or api_client is None:
-            return {"exchange_positions": 0, "imported": 0, "already_known": 0, "skipped": 0}
+            return {
+                "exchange_positions": 0,
+                "exchange_positions_missing_from_local_ledger": 0,
+                "local_positions_missing_from_exchange": 0,
+                "imported": 0,
+                "already_known": 0,
+                "skipped": 0,
+            }
 
         exchange_positions = await self._safe_await(
             "api_client.get_open_positions.startup_reconcile",
@@ -792,6 +844,16 @@ class TradingSystem:
             )
             for position in local_positions
         }
+        exchange_keys = {
+            (
+                str(position.get("market_id") or ""),
+                str(position.get("token_id") or ""),
+            )
+            for position in exchange_positions
+            if str(position.get("market_id") or "") and str(position.get("token_id") or "")
+        }
+        exchange_missing_local_keys = sorted(exchange_keys - known_keys)
+        local_missing_exchange_keys = sorted(known_keys - exchange_keys)
 
         imported = 0
         already_known = 0
@@ -800,11 +862,26 @@ class TradingSystem:
         if record_position is None:
             record_position = getattr(self.ledger, "record_trade_entry", None)
 
+        for market_id, token_id in local_missing_exchange_keys:
+            logger.warning(
+                "startup_reconciliation_mismatch",
+                mismatch_class="local_position_missing_from_exchange_positions",
+                market_id=market_id,
+                token_id=token_id,
+            )
+
         for position in exchange_positions:
             market_id = str(position.get("market_id") or "")
             token_id = str(position.get("token_id") or "")
             if not market_id or not token_id:
                 skipped += 1
+                logger.warning(
+                    "startup_exchange_position_skipped",
+                    mismatch_class="exchange_position_missing_from_local_ledger",
+                    market_id=market_id or None,
+                    token_id=token_id or None,
+                    reason="missing_market_id_or_token_id",
+                )
                 continue
 
             position_key = (market_id, token_id)
@@ -821,6 +898,16 @@ class TradingSystem:
 
             if quantity <= 0 or entry_price <= 0 or record_position is None:
                 skipped += 1
+                logger.warning(
+                    "startup_exchange_position_skipped",
+                    mismatch_class="exchange_position_missing_from_local_ledger",
+                    market_id=market_id,
+                    token_id=token_id,
+                    reason="invalid_quantity_or_entry_price_or_recorder_missing",
+                    quantity=str(quantity),
+                    entry_price=str(entry_price),
+                    recorder_available=record_position is not None,
+                )
                 continue
 
             await self._safe_await(
@@ -837,16 +924,35 @@ class TradingSystem:
             )
             known_keys.add(position_key)
             imported += 1
+            logger.warning(
+                "startup_reconciliation_mismatch",
+                mismatch_class="exchange_position_missing_from_local_ledger",
+                market_id=market_id,
+                token_id=token_id,
+                recovery_action="record_reconciled_position",
+            )
 
         logger.info(
             "startup_position_reconciliation_complete",
             exchange_positions=len(exchange_positions),
+            exchange_positions_missing_from_local_ledger=len(exchange_missing_local_keys),
+            local_positions_missing_from_exchange=len(local_missing_exchange_keys),
             imported=imported,
             already_known=already_known,
             skipped=skipped,
+            exchange_positions_missing_from_local_ledger_keys=[
+                {"market_id": market_id, "token_id": token_id}
+                for market_id, token_id in exchange_missing_local_keys
+            ],
+            local_positions_missing_from_exchange_keys=[
+                {"market_id": market_id, "token_id": token_id}
+                for market_id, token_id in local_missing_exchange_keys
+            ],
         )
         return {
             "exchange_positions": len(exchange_positions),
+            "exchange_positions_missing_from_local_ledger": len(exchange_missing_local_keys),
+            "local_positions_missing_from_exchange": len(local_missing_exchange_keys),
             "imported": imported,
             "already_known": already_known,
             "skipped": skipped,
@@ -2728,8 +2834,15 @@ class TradingSystem:
                 recovered_pnl=str(recovered_pnl),
             )
 
-            await self._reconcile_missing_open_orders_on_startup()
-            await self._reconcile_positions_on_startup()
+            order_mismatch_summary = await self._reconcile_missing_open_orders_on_startup()
+            position_mismatch_summary = await self._reconcile_positions_on_startup()
+            logger.info(
+                "startup_reconciliation_mismatches_reviewed",
+                orphaned_exchange_open_orders=order_mismatch_summary.get("orphaned_exchange_open_orders", 0),
+                local_open_orders_missing_from_exchange=order_mismatch_summary.get("local_open_orders_missing_from_exchange", 0),
+                exchange_positions_missing_from_local_ledger=position_mismatch_summary.get("exchange_positions_missing_from_local_ledger", 0),
+                local_positions_missing_from_exchange=position_mismatch_summary.get("local_positions_missing_from_exchange", 0),
+            )
 
             # Refresh performance tracker after reconcile
             if self.performance_tracker is not None:
