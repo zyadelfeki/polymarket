@@ -615,3 +615,28 @@ class CharliePredictionGate:
             return {"probability": p_win, "confidence": sig["confidence"], "direction": direction}
         except Exception:
             return {"probability": 0.5, "confidence": 0.0, "direction": "NEUTRAL"}
+
+
+class CharliePredictionBooster:
+    def __init__(self, intelligence, min_confidence: float = 0.60):
+        self.intelligence = intelligence
+        self.min_confidence = float(min_confidence)
+
+    async def should_trade(self, latency_signal: dict) -> bool:
+        signal = await self.intelligence.get_signal()
+        direction = str(signal.get("lstm_direction", "")).upper()
+        confidence = float(signal.get("lstm_confidence", 0.0))
+        side = str(latency_signal.get("side", "")).upper()
+
+        if confidence < self.min_confidence:
+            return False
+
+        if side == "YES":
+            return direction == "UP"
+        if side == "NO":
+            return direction == "DOWN"
+
+        return False
+
+
+__all__ = ["TradeRecommendation", "CharliePredictionGate", "CharliePredictionBooster"]

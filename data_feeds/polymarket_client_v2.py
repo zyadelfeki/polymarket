@@ -373,12 +373,14 @@ class PolymarketClientV2:
 
                 if category == "auth" and status_code is not None:
                     should_retry = await self._handle_auth_error(status_code)
-                    if not should_retry:
-                        break
+                    if should_retry and attempt < self.max_retries:
+                        continue
+                    break
                 elif category in {"server", "network"}:
                     if attempt < self.max_retries:
                         await asyncio.sleep(self.retry_backoff_base * (2 ** attempt))
                         continue
+                    break
                 break
 
         if last_error is not None:
@@ -899,7 +901,7 @@ class PolymarketClientV2:
         await self._throttle()
 
         correlation_id = correlation_id or CorrelationContext.get()
-        side_str = side.value if isinstance(side, OrderSide) else str(side)
+        side_str = side.value if hasattr(side, "value") else str(side)
         normalized_side = side_str.strip().upper()
         if normalized_side in {"YES", "NO"}:
             normalized_side = "BUY"
