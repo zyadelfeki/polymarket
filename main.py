@@ -328,7 +328,13 @@ async def _get_rolling_features(
     if not rows:
         return 0.5, 0.0
 
-    pnls = [float(r["pnl"] if isinstance(r, dict) else r[0]) for r in rows]
+    DECIMAL_ZERO = Decimal("0")
+    DECIMAL_HALF = Decimal("0.5")
+    DECIMAL_EPSILON = Decimal("1e-9")
+    pnls = [
+        Decimal(str(r["pnl"] if isinstance(r, dict) else r[0]))
+        for r in rows
+    ]
 
     # rolling_win_rate: require a minimum sample count before trusting the rate.
     # Below WIN_MIN_SAMPLE trades the estimate is too noisy — hold at 0.5 neutral
@@ -336,23 +342,23 @@ async def _get_rolling_features(
     WIN_MIN_SAMPLE = 5
     win_slice = pnls[:n_win]
     rolling_win_rate = (
-        sum(1 for p in win_slice if p > 0) / len(win_slice)
+        Decimal(sum(1 for p in win_slice if p > DECIMAL_ZERO)) / Decimal(len(win_slice))
         if len(win_slice) >= WIN_MIN_SAMPLE
-        else 0.5  # insufficient history — stay neutral
+        else DECIMAL_HALF  # insufficient history — stay neutral
     )
 
     # rolling_pnl_z: most recent PnL vs the preceding n_pnl-1 peers (no self-contamination)
     pnl_slice = pnls[:n_pnl]
     if len(pnl_slice) >= 2:
         peers = pnl_slice[1:]  # exclude most recent (index 0 = newest in DESC order)
-        mu = sum(peers) / len(peers)
-        variance = sum((x - mu) ** 2 for x in peers) / len(peers)
-        sigma = variance ** 0.5 + 1e-9
+        mu = sum(peers, DECIMAL_ZERO) / Decimal(len(peers))
+        variance = sum(((x - mu) ** 2 for x in peers), DECIMAL_ZERO) / Decimal(len(peers))
+        sigma = variance.sqrt() + DECIMAL_EPSILON
         rolling_pnl_z = (pnl_slice[0] - mu) / sigma
     else:
-        rolling_pnl_z = 0.0
+        rolling_pnl_z = DECIMAL_ZERO
 
-    return rolling_win_rate, rolling_pnl_z
+    return float(rolling_win_rate), float(rolling_pnl_z)
 
 
 class TradingSystem:
@@ -2220,24 +2226,30 @@ class TradingSystem:
                 )
                 if _fill_price is not None and self.ledger is not None:
                     try:
-                        _expected = float(price)
-                        _filled   = float(_fill_price)
-                        _slip_bps = (_filled - _expected) / _expected * 10_000 if _expected else 0.0
+                        _expected = Decimal(str(price))
+                        _filled = Decimal(str(_fill_price))
+                        _slip_bps = (
+                            (_filled - _expected) / _expected * Decimal("10000")
+                            if _expected != Decimal("0")
+                            else Decimal("0")
+                        )
+                        _filled_db = float(_filled)
+                        _slip_bps_db = float(_slip_bps.quantize(Decimal("0.01")))
                         await self._safe_await(
                             "ledger.update_slippage",
                             self.ledger.execute(
                                 "UPDATE order_tracking SET filled_price=?, slippage_bps=?"
                                 " WHERE order_id=?",
-                                (_filled, round(_slip_bps, 2), exchange_order_id),
+                                (_filled_db, _slip_bps_db, exchange_order_id),
                             ),
                             timeout_seconds=3.0,
                         )
                         logger.info(
                             "slippage_recorded",
                             order_id=exchange_order_id,
-                            expected_price=_expected,
-                            filled_price=_filled,
-                            slippage_bps=round(_slip_bps, 2),
+                            expected_price=float(_expected),
+                            filled_price=_filled_db,
+                            slippage_bps=_slip_bps_db,
                         )
                     except Exception as _se:
                         logger.warning("slippage_record_failed", error=str(_se))
