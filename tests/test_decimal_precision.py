@@ -11,7 +11,7 @@ if ROOT_DIR not in sys.path:
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
 from services.execution_service_v2 import ExecutionServiceV2, OrderRequest
 from data_feeds.polymarket_client_v2 import OrderSide
-from logs.precision_monitor import PrecisionMonitor, PrecisionError
+from monitoring.precision_monitor import PrecisionMonitor, PrecisionError
 from utils.decimal_json import dumps as decimal_dumps, loads as decimal_loads
 from database.ledger_async import AsyncLedger
 from utils.decimal_helpers import safe_decimal, quantize_price, quantize_usdc, quantize_size, validate_precision, format_for_api

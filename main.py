@@ -1228,6 +1228,18 @@ class TradingSystem:
                     candidates,
                     key=lambda item: to_decimal(item.get("edge", "0")),
                 )
+                logger.info(
+                    "strategy_scan_candidates_summary",
+                    trigger=trigger,
+                    total_candidates=len(candidates),
+                )
+            else:
+                logger.info(
+                    "strategy_scan_zero_candidates",
+                    trigger=trigger,
+                    latency_arb_ran=(self.strategy_engine is not None),
+                    btc_scanner_ran=(self.btc_price_scanner is not None and self.charlie_gate is not None),
+                )
 
             if not opportunity:
                 logger.info("strategy_scan_complete", trigger=trigger, opportunity_found=False)

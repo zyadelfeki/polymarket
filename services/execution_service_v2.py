@@ -50,7 +50,7 @@ from services.idempotency import IdempotencyCache, IdempotencyKeyBuilder
 from execution.idempotency_manager import IdempotencyManager
 from services.validators import BoundaryValidator
 from services.correlation_context import CorrelationContext, inject_correlation
-from logs.precision_monitor import PrecisionMonitor, PrecisionError
+from monitoring.precision_monitor import PrecisionMonitor, PrecisionError
 from services.retry import RetryableOperation
 from utils.correlation_id import generate_correlation_id
 from services.network_health import NetworkHealthMonitor, NetworkPartitionError

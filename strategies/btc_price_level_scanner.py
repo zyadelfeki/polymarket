@@ -1,10 +1,33 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from utils.decimal_helpers import to_decimal
+
+
+class _LoggerShim:
+    """Mirrors latency_arbitrage_btc._LoggerShim — structlog-style calls via stdlib."""
+
+    def __init__(self, base: logging.Logger) -> None:
+        self._base = base
+
+    def debug(self, event: str, **kwargs) -> None:
+        self._base.debug("%s %s", event, kwargs or "")
+
+    def info(self, event: str, **kwargs) -> None:
+        self._base.info("%s %s", event, kwargs or "")
+
+    def warning(self, event: str, **kwargs) -> None:
+        self._base.warning("%s %s", event, kwargs or "")
+
+    def error(self, event: str, **kwargs) -> None:
+        self._base.error("%s %s", event, kwargs or "")
+
+
+logger = _LoggerShim(logging.getLogger(__name__))
 
 
 def _decimal_from_charlie(value: Any) -> Decimal:
@@ -32,12 +55,28 @@ class BTCPriceLevelScanner:
         max_days_to_expiry: int = 7,
     ) -> List[Dict[str, Any]]:
         if not self.enabled or charlie_gate is None or api_client is None:
+            logger.warning(
+                "btc_scanner_skip",
+                reason="disabled_or_missing_deps",
+                enabled=self.enabled,
+                charlie_gate_present=(charlie_gate is not None),
+                api_client_present=(api_client is not None),
+            )
             return []
 
         expiry_window_days = max_days_to_expiry or self.max_days_to_expiry
         markets = await self._fetch_markets(api_client)
+        logger.info("btc_scanner_fetch_complete", total_markets=len(markets))
         if not markets:
+            logger.warning("btc_scanner_no_markets", reason="empty_market_list_from_api")
             return []
+
+        after_price_level_filter = 0
+        after_expiry_filter = 0
+        after_id_question_filter = 0
+        after_price_fetch = 0
+        charlie_none_count = 0
+        edge_too_low_count = 0
 
         opportunities: List[Dict[str, Any]] = []
         for market in markets:
@@ -45,19 +84,25 @@ class BTCPriceLevelScanner:
                 continue
             if not self._looks_like_price_level_market(market):
                 continue
+            after_price_level_filter += 1
+
             if not self._resolves_within_window(market, expiry_window_days):
                 continue
+            after_expiry_filter += 1
 
             market_id = str(market.get("id") or market.get("condition_id") or market.get("market_id") or "").strip()
             question = str(market.get("question") or market.get("title") or "").strip()
             if not market_id or not question:
                 continue
+            after_id_question_filter += 1
 
             market_price = self._extract_market_price(market)
             if market_price is None:
                 market_price = await self._fetch_market_price(api_client, market_id)
             if market_price is None:
+                logger.debug("btc_scanner_market_skip", reason="no_price", market_id=market_id)
                 continue
+            after_price_fetch += 1
 
             recommendation = await charlie_gate.evaluate_market(
                 market_id=market_id,
@@ -68,13 +113,39 @@ class BTCPriceLevelScanner:
                 market_question=question,
             )
             if recommendation is None:
+                charlie_none_count += 1
+                logger.info(
+                    "btc_scanner_charlie_rejected",
+                    market_id=market_id,
+                    question=question[:80],
+                    hint="check charlie_coin_flip_rejected or edge_below_threshold in charlie logs",
+                )
                 continue
 
             edge = _decimal_from_charlie(recommendation.edge)
             if edge < self.min_edge:
+                edge_too_low_count += 1
+                logger.info(
+                    "btc_scanner_edge_too_low",
+                    market_id=market_id,
+                    edge=str(edge),
+                    min_edge=str(self.min_edge),
+                )
                 continue
 
             opportunities.append(self._build_opportunity(market, recommendation, market_price, question))
+
+        logger.info(
+            "btc_scanner_complete",
+            total_fetched=len(markets),
+            after_price_level_filter=after_price_level_filter,
+            after_expiry_filter=after_expiry_filter,
+            after_id_question_filter=after_id_question_filter,
+            after_price_fetch=after_price_fetch,
+            charlie_none_count=charlie_none_count,
+            edge_too_low_count=edge_too_low_count,
+            opportunities_found=len(opportunities),
+        )
 
         opportunities.sort(key=lambda item: to_decimal(item.get("edge", "0")), reverse=True)
         return opportunities
