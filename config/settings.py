@@ -20,7 +20,7 @@ class Settings:
     INITIAL_CAPITAL: Decimal = Decimal(os.getenv("INITIAL_CAPITAL", "15.00"))
     MICRO_CAPITAL_THRESHOLD: Decimal = Decimal(os.getenv("MICRO_CAPITAL_THRESHOLD", "50.00"))
     MAX_POSITION_SIZE_PCT: float = float(os.getenv("MAX_POSITION_SIZE_PCT", "20"))
-    MAX_AGGREGATE_EXPOSURE: Decimal = Decimal(os.getenv("MAX_AGGREGATE_EXPOSURE", "20.0"))
+    MAX_AGGREGATE_EXPOSURE: Decimal = Decimal(os.getenv("MAX_AGGREGATE_EXPOSURE", "9.00"))
     MAX_DRAWDOWN_PCT: float = float(os.getenv("MAX_DRAWDOWN_PCT", "15"))
     MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.03"))
     MIN_CONFIDENCE: float = float(os.getenv("MIN_CONFIDENCE", "0.70"))
@@ -91,13 +91,25 @@ class Settings:
         critical = [
             ("POLYMARKET_PRIVATE_KEY", cls.POLYMARKET_PRIVATE_KEY),
         ]
-        
+
         missing = [name for name, value in critical if not value]
-        
+
         if missing:
             logger.error(f"Missing critical config: {', '.join(missing)}")
             return False
-            
+
+        # Guard: aggregate exposure cap must be below total capital.
+        # An exposure cap >= INITIAL_CAPITAL means the cap is effectively disabled.
+        cap_limit = cls.INITIAL_CAPITAL * Decimal("0.70")
+        if cls.MAX_AGGREGATE_EXPOSURE >= cls.INITIAL_CAPITAL:
+            logger.critical(
+                f"MAX_AGGREGATE_EXPOSURE (${cls.MAX_AGGREGATE_EXPOSURE}) >= "
+                f"INITIAL_CAPITAL (${cls.INITIAL_CAPITAL}). "
+                f"Exposure cap is disabled — auto-capping to 70% of capital "
+                f"(${cap_limit:.2f})."
+            )
+            cls.MAX_AGGREGATE_EXPOSURE = cap_limit
+
         return True
     
     @classmethod
