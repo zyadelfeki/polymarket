@@ -142,7 +142,64 @@ class BTCPriceLevelScanner:
                 )
                 continue
 
+            # --- LLM layer: zero-latency cache read ----------------------------
+            # The background LLMWorker fills the cache at the model's own pace
+            # (~9 s per call).  The scanner only reads the cache — O(1), no
+            # blocking.  A cache miss is a silent pass-through; trading is never
+            # gated on LLM availability.
+            try:
+                from ai.llm_worker import get_cache as _get_llm_cache
+                _llm_result = await _get_llm_cache().get(market_id, question)
+                if _llm_result is not None:
+                    _anomaly, _coherence = _llm_result
+                    if _anomaly:
+                        logger.warning(
+                            "llm_anomaly_veto",
+                            market_id=market_id,
+                            question=question[:80],
+                        )
+                        charlie_none_count += 1
+                        continue
+                    if _coherence.vetoed:
+                        logger.warning(
+                            "llm_coherence_veto",
+                            market_id=market_id,
+                            reason=_coherence.reason,
+                            confidence=_coherence.confidence,
+                        )
+                        charlie_none_count += 1
+                        continue
+                    logger.info(
+                        "llm_cache_hit",
+                        market_id=market_id,
+                        coherent=_coherence.coherent,
+                    )
+            except Exception as _llm_err:
+                logger.warning("llm_layer_error", error=str(_llm_err), market_id=market_id)
+
             opportunities.append(self._build_opportunity(market, recommendation, market_price, question))
+
+            # Enqueue for background LLM inference (non-blocking, fire-and-forget).
+            # The worker will update the cache for the *next* scanner pass.
+            try:
+                import ai.llm_worker as _llm_worker_mod
+                if _llm_worker_mod._singleton_worker is not None:
+                    _btc_price_enq = (
+                        float(btc_extra_features.get("price", 0))
+                        if btc_extra_features else 0
+                    )
+                    _llm_worker_mod._singleton_worker.enqueue([{
+                        "market_id":   market_id,
+                        "question":    question,
+                        "market_price": float(market_price),
+                        "btc_price":   _btc_price_enq,
+                        "rsi":    float(btc_extra_features.get("rsi_14", 50)) if btc_extra_features else 50,
+                        "macd":   float(btc_extra_features.get("macd", 0)) if btc_extra_features else 0,
+                        "charlie_side": recommendation.side,
+                        "p_win":        float(recommendation.p_win),
+                    }])
+            except Exception:
+                pass  # worker unavailable — never block trading
 
         logger.info(
             "btc_scanner_complete",

@@ -2683,6 +2683,23 @@ class TradingSystem:
             except Exception as _smoke_exc:
                 logger.warning("calibration_smoke_test_failed", error=str(_smoke_exc))
 
+            # --- Background LLM worker (fail-open) ----------------------------
+            # Spawned last so all other components are live before the worker
+            # starts consuming the event loop.  If LLM startup fails, trading
+            # continues normally — the scanner will just get cache misses.
+            try:
+                import ai.llm_worker as _llm_worker_mod
+                from ai.llm_worker import LLMWorker
+                _llm_worker_mod._singleton_worker = LLMWorker()
+                asyncio.get_running_loop().create_task(
+                    _llm_worker_mod._singleton_worker.run()
+                )
+                logger.info("llm_worker_started")
+            except Exception as _llm_start_err:
+                logger.warning(
+                    "llm_worker_start_failed", error=str(_llm_start_err)
+                )
+
             logger.info("all_components_initialized")
             
         except Exception as e:
