@@ -154,3 +154,116 @@ async def test_llm_worker_enqueue_does_not_block():
             "p_win":        0.6,
         }])
     assert worker._queue.qsize() <= 500
+
+
+# ---------------------------------------------------------------------------
+# Regime guard tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_regime_guard_passthrough_on_failure():
+    """When LLM is unavailable, regime guard must return safe_to_trade=True."""
+    import time
+    import ai.regime_guard as rg
+    rg._regime_cache.clear()
+
+    with patch("ai.regime_guard.llm_query", new=AsyncMock(return_value=None)):
+        verdict = await rg.get_regime_verdict(
+            btc_price=84000.0, rsi=50.0, price_change_1h=0.0, atr_pct=1.0, open_positions=0
+        )
+
+    assert verdict.safe_to_trade is True
+    assert verdict.source == "passthrough"
+
+
+@pytest.mark.asyncio
+async def test_regime_guard_suppresses_on_high_confidence_risk_off():
+    """High-confidence RISK_OFF verdict must suppress scanning (safe_to_trade=False)."""
+    import ai.regime_guard as rg
+    rg._regime_cache.clear()
+
+    llm_response = {
+        "safe_to_trade": False,
+        "regime_label": "RISK_OFF",
+        "confidence": 0.85,
+        "reason": "flash crash detected",
+    }
+    with patch("ai.regime_guard.llm_query", new=AsyncMock(return_value=llm_response)):
+        verdict = await rg.get_regime_verdict(
+            btc_price=80000.0, rsi=25.0, price_change_1h=-4.5, atr_pct=3.5, open_positions=0
+        )
+
+    assert verdict.safe_to_trade is False
+    assert verdict.regime_label == "RISK_OFF"
+    assert verdict.source == "llm"
+
+
+@pytest.mark.asyncio
+async def test_regime_guard_passes_on_low_confidence():
+    """Low-confidence unsafe verdict must NOT suppress scan (threshold is 0.70)."""
+    import ai.regime_guard as rg
+    rg._regime_cache.clear()
+
+    llm_response = {
+        "safe_to_trade": False,
+        "regime_label": "RISK_OFF",
+        "confidence": 0.50,
+        "reason": "uncertain conditions",
+    }
+    with patch("ai.regime_guard.llm_query", new=AsyncMock(return_value=llm_response)):
+        verdict = await rg.get_regime_verdict(
+            btc_price=84000.0, rsi=45.0, price_change_1h=-1.0, atr_pct=1.5, open_positions=0
+        )
+
+    assert verdict.safe_to_trade is True
+
+
+# ---------------------------------------------------------------------------
+# Edge quality tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_edge_quality_passthrough_on_failure():
+    """When LLM is unavailable, score_edge_quality must return score=0.5, source='passthrough'."""
+    from ai.edge_explainer import score_edge_quality
+
+    with patch("ai.edge_explainer.llm_query", new=AsyncMock(return_value=None)):
+        result = await score_edge_quality(
+            question="Will BTC reach $85,000?",
+            btc_price=84000.0,
+            strike=85000.0,
+            minutes_to_expiry=60.0,
+            edge=0.08,
+            implied_prob=0.42,
+            confidence=0.70,
+        )
+
+    assert result.score == 0.5
+    assert result.source == "passthrough"
+
+
+# ---------------------------------------------------------------------------
+# Feedback loop tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_feedback_loop_record_does_not_raise(tmp_path):
+    """record_decision must complete without raising regardless of file state."""
+    import ai.feedback_loop as fl
+    fl.DECISIONS_FILE = tmp_path / "decisions.jsonl"
+
+    # Should not raise even on first call (file doesn't exist yet).
+    await fl.record_decision(
+        market_id="mkt_test_001",
+        question="Will BTC reach $85,000?",
+        charlie_side="YES",
+        p_win=0.62,
+        edge=0.08,
+        llm_coherent=True,
+        llm_coherence_confidence=0.80,
+        llm_is_trap=False,
+        llm_trap_confidence=None,
+        edge_quality_score=0.75,
+        regime_label="STABLE",
+        action="APPROVED",
+    )

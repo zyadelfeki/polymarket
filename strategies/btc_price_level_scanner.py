@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -79,6 +80,34 @@ class BTCPriceLevelScanner:
             feature_keys=list(btc_extra_features.keys()) if btc_extra_features else [],
         )
 
+        # --- Regime guard (once per cycle, cached 2 min) ----------------------
+        _verdict = None
+        try:
+            from ai.regime_guard import get_regime_verdict
+            _btc_price = float(btc_extra_features.get("price", 0)) if btc_extra_features else 0
+            _rsi = float(btc_extra_features.get("rsi_14", 50)) if btc_extra_features else 50
+            _price_1h = float(btc_extra_features.get("price_change_1h", 0)) if btc_extra_features else 0
+            _atr = float(btc_extra_features.get("atr_pct", 1.0)) if btc_extra_features else 1.0
+            _verdict = await get_regime_verdict(
+                _btc_price, _rsi, _price_1h, _atr,
+                open_positions=len(opportunities) if "opportunities" in dir() else 0,
+            )
+            if not _verdict.safe_to_trade:
+                logger.warning(
+                    "regime_guard_suppressed_scan",
+                    regime=_verdict.regime_label,
+                    confidence=_verdict.confidence,
+                    reason=_verdict.reason,
+                )
+                return []
+            logger.info(
+                "regime_guard_passed",
+                regime=_verdict.regime_label,
+                source=_verdict.source,
+            )
+        except ImportError:
+            pass
+
         after_price_level_filter = 0
         after_expiry_filter = 0
         after_id_question_filter = 0
@@ -147,11 +176,13 @@ class BTCPriceLevelScanner:
             # (~9 s per call).  The scanner only reads the cache — O(1), no
             # blocking.  A cache miss is a silent pass-through; trading is never
             # gated on LLM availability.
+            _cached = None
             try:
                 from ai.llm_worker import get_cache as _get_llm_cache
-                _llm_result = await _get_llm_cache().get(market_id, question)
-                if _llm_result is not None:
-                    _anomaly, _coherence = _llm_result
+                _cached = await _get_llm_cache().get(market_id, question)
+                if _cached is not None:
+                    _anomaly = _cached.get("anomaly")
+                    _coherence = _cached.get("coherence")
                     if _anomaly:
                         logger.warning(
                             "llm_anomaly_veto",
@@ -160,7 +191,7 @@ class BTCPriceLevelScanner:
                         )
                         charlie_none_count += 1
                         continue
-                    if _coherence.vetoed:
+                    if _coherence and _coherence.vetoed:
                         logger.warning(
                             "llm_coherence_veto",
                             market_id=market_id,
@@ -169,10 +200,13 @@ class BTCPriceLevelScanner:
                         )
                         charlie_none_count += 1
                         continue
+                    _eq = _cached.get("edge_quality")
                     logger.info(
-                        "llm_cache_hit",
+                        "llm_cache_hit_passed",
                         market_id=market_id,
-                        coherent=_coherence.coherent,
+                        coherent=(_coherence.coherent if _coherence else None),
+                        edge_quality_score=(_eq.score if _eq else None),
+                        edge_quality_flags=(_eq.flags if _eq else None),
                     )
             except Exception as _llm_err:
                 logger.warning("llm_layer_error", error=str(_llm_err), market_id=market_id)
@@ -188,18 +222,56 @@ class BTCPriceLevelScanner:
                         float(btc_extra_features.get("price", 0))
                         if btc_extra_features else 0
                     )
+                    _end_dt_enq = self._extract_market_datetime(market)
+                    _minutes_expiry = (
+                        int((_end_dt_enq - datetime.now(timezone.utc)).total_seconds() / 60)
+                        if _end_dt_enq else 30
+                    )
                     _llm_worker_mod._singleton_worker.enqueue([{
-                        "market_id":   market_id,
-                        "question":    question,
-                        "market_price": float(market_price),
-                        "btc_price":   _btc_price_enq,
-                        "rsi":    float(btc_extra_features.get("rsi_14", 50)) if btc_extra_features else 50,
-                        "macd":   float(btc_extra_features.get("macd", 0)) if btc_extra_features else 0,
-                        "charlie_side": recommendation.side,
-                        "p_win":        float(recommendation.p_win),
+                        "market_id":        market_id,
+                        "question":         question,
+                        "market_price":     float(market_price),
+                        "btc_price":        _btc_price_enq,
+                        "rsi":              float(btc_extra_features.get("rsi_14", 50)) if btc_extra_features else 50,
+                        "macd":             float(btc_extra_features.get("macd", 0)) if btc_extra_features else 0,
+                        "charlie_side":     recommendation.side,
+                        "p_win":            float(recommendation.p_win),
+                        "edge":             float(recommendation.edge),
+                        "confidence":       float(recommendation.confidence),
+                        "strike":           0,
+                        "minutes_to_expiry": _minutes_expiry,
                     }])
             except Exception:
                 pass  # worker unavailable — never block trading
+
+            # Fire-and-forget feedback log entry.
+            try:
+                from ai.feedback_loop import record_decision
+                asyncio.create_task(record_decision(
+                    market_id=market_id,
+                    question=question,
+                    charlie_side=str(recommendation.side),
+                    p_win=float(recommendation.p_win),
+                    edge=float(recommendation.edge),
+                    llm_coherent=(
+                        _cached.get("coherence").coherent
+                        if _cached and _cached.get("coherence") else None
+                    ),
+                    llm_coherence_confidence=(
+                        _cached.get("coherence").confidence
+                        if _cached and _cached.get("coherence") else None
+                    ),
+                    llm_is_trap=(_cached.get("anomaly") if _cached else None),
+                    llm_trap_confidence=None,
+                    edge_quality_score=(
+                        _cached.get("edge_quality").score
+                        if _cached and _cached.get("edge_quality") else None
+                    ),
+                    regime_label=(_verdict.regime_label if _verdict is not None else "UNKNOWN"),
+                    action="APPROVED",
+                ))
+            except Exception:
+                pass
 
         logger.info(
             "btc_scanner_complete",

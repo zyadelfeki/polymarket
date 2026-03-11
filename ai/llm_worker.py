@@ -134,7 +134,24 @@ class LLMWorker:
                 market_price=market_price,
             )
 
-            await _cache.set(market_id, question, (anomaly, coherence))
+            from ai.edge_explainer import score_edge_quality
+            strike = float(candidate.get("strike") or 0)
+            minutes_to_expiry = float(candidate.get("minutes_to_expiry", 30))
+            edge_quality = await score_edge_quality(
+                question=question,
+                btc_price=btc_price,
+                strike=strike,
+                minutes_to_expiry=minutes_to_expiry,
+                edge=p_win - market_price,  # rough edge proxy available here
+                implied_prob=market_price,
+                confidence=p_win,
+            )
+
+            await _cache.set(market_id, question, {
+                "anomaly": anomaly,
+                "coherence": coherence,
+                "edge_quality": edge_quality,
+            })
             logger.debug("llm_worker_cache_updated", market_id=market_id)
 
         except Exception as exc:

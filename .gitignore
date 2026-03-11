@@ -42,6 +42,9 @@ data/*.db
 *.log
 logs/
 
+# AI decision log
+ai/decisions.jsonl
+
 # IDE
 .vscode/
 .idea/
