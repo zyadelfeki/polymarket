@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from utils.decimal_helpers import to_decimal
+from data_feeds.binance_features import get_all_features as _get_binance_features
 
 
 class _LoggerShim:
@@ -71,6 +72,13 @@ class BTCPriceLevelScanner:
             logger.warning("btc_scanner_no_markets", reason="empty_market_list_from_api")
             return []
 
+        btc_extra_features = _get_binance_features("BTC")
+        logger.info(
+            "btc_scanner_binance_features_fetched",
+            features_available=(btc_extra_features is not None),
+            feature_keys=list(btc_extra_features.keys()) if btc_extra_features else [],
+        )
+
         after_price_level_filter = 0
         after_expiry_filter = 0
         after_id_question_filter = 0
@@ -111,6 +119,7 @@ class BTCPriceLevelScanner:
                 timeframe=self.default_timeframe,
                 bankroll=equity,
                 market_question=question,
+                extra_features=btc_extra_features,
             )
             if recommendation is None:
                 charlie_none_count += 1
