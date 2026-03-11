@@ -1,11 +1,12 @@
 import os
 import asyncio
 from dotenv import load_dotenv
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs
 
 async def main():
     load_dotenv(override=True)
+
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs
     
     key = os.getenv("POLYMARKET_PRIVATE_KEY")
     if not key:

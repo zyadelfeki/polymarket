@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- Added a startup Charlie contract probe so Polymarket now fails loud if the imported Charlie signal schema or contract version drifts.
+- Removed Charlie float-to-Decimal ingress on secondary execution/scanner paths by coercing through `Decimal(str(...))` at the boundary.
+- Lowered `max_entry_price_abs` to `0.35` in production config to allow lower-priced asymmetric entries.
+- Clarified the NumPy dependency pin to keep the resolver below 2.x for the current scikit-learn-compatible stack.
+
 ## [1.0.0] - Production Release - 2026-01-11
 
 ### 🎉 MAJOR MILESTONE: APPROVED FOR PAPER TRADING

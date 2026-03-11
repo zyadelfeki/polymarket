@@ -19,42 +19,44 @@ structlog.configure(
 # Import the client
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
 
-print("=" * 60)
-print("POLYMARKET CLIENT V2 AUTHENTICATION TEST")
-print("=" * 60)
-print()
 
-# Test 1: Paper Trading Mode (no auth needed)
-print("[TEST 1] Paper Trading Mode")
-print("-" * 60)
-client_paper = PolymarketClientV2(
-    private_key="your_private_key_here",  # Fake key
-    paper_trading=True
-)
-print(f"✓ Client created")
-print(f"  - Authenticated: {client.authenticated}")
-print(f"  - Can Trade: {client.can_trade}")
-print(f"  - Has Client: {bool(client.client)}")
-print(f"  - Address: {client.address}")
-print()
+def main() -> None:
+    print("=" * 60)
+    print("POLYMARKET CLIENT V2 AUTHENTICATION TEST")
+    print("=" * 60)
+    print()
 
-# Test 2: Live mode with NO key (should fail gracefully)
-print("Testing LIVE mode without private key...")
-from data_feeds.polymarket_client_v2 import PolymarketClientV2
+    print("[TEST 1] Paper Trading Mode")
+    print("-" * 60)
+    client_paper = PolymarketClientV2(
+        private_key="your_private_key_here",
+        paper_trading=True,
+    )
+    print("✓ Client created")
+    print(f"  - Authenticated: {client_paper.authenticated}")
+    print(f"  - Can Trade: {client_paper.can_trade}")
+    print(f"  - Has Client: {bool(client_paper.client)}")
+    print(f"  - Address: {client_paper.address}")
+    print()
 
-client = PolymarketClientV2(
-    private_key=None,
-    paper_trading=False
-)
+    print("Testing LIVE mode without private key...")
+    client_live = PolymarketClientV2(
+        private_key=None,
+        paper_trading=False,
+    )
 
-print(f"Authenticated: {client.authenticated}")
-print(f"Can Trade: {client.can_trade}")
-print(f"Has Client: {bool(client.client)}")
-print(f"Address: {client.address}")
+    print(f"Authenticated: {client_live.authenticated}")
+    print(f"Can Trade: {client_live.can_trade}")
+    print(f"Has Client: {bool(client_live.client)}")
+    print(f"Address: {client_live.address}")
 
-print("\n✓ Nuclear authentication test complete!")
-print("\nSummary:")
-print(f"  - SDK Available: {bool(client.client) if 'client' in dir() else 'N/A'}")
-print(f"  - Paper Trading: {client.paper_trading if 'client' in dir() else 'N/A'}")
-print(f"  - Authenticated: {client.authenticated if hasattr(client, 'authenticated') else 'N/A'}")
-print("\nThe `client_not_initialized` error should be GONE when you run live mode with a real private key.")
+    print("\n✓ Nuclear authentication test complete!")
+    print("\nSummary:")
+    print(f"  - SDK Available: {bool(client_live.client)}")
+    print(f"  - Paper Trading: {client_live.paper_trading}")
+    print(f"  - Authenticated: {client_live.authenticated}")
+    print("\nThe `client_not_initialized` error should be GONE when you run live mode with a real private key.")
+
+
+if __name__ == "__main__":
+    main()

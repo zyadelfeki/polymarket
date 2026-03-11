@@ -73,6 +73,12 @@ class _LoggerShim:
 logger = _LoggerShim(logging.getLogger(__name__))
 
 
+def _decimal_from_runtime(value) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
 TIMEFRAMES = {
     "15min": {"slug": "15m", "duration_seconds": 900, "priority": 3},
     "hourly": {"slug": "1h", "duration_seconds": 3600, "priority": 1},
@@ -128,6 +134,7 @@ class LatencyArbitrageEngine:
         self.min_orderbook_size = from_config(cfg.get("min_orderbook_size", "10"))
         self.enforce_orderbook_validation = bool(cfg.get("enforce_orderbook_validation", False))
         self.max_spread_bps = float(cfg.get("max_spread_bps", 500))  # skip markets wider than 5%
+        self.probability_move_multiplier = from_config(cfg.get("probability_move_multiplier", "10"))
         self.peak_hours_only = bool(cfg.get("peak_hours_only", False))
         self.use_dynamic_edge_thresholds = bool(cfg.get("use_dynamic_edge_thresholds", False))
         edge_thresholds_cfg = cfg.get("edge_thresholds") or {
@@ -268,7 +275,7 @@ class LatencyArbitrageEngine:
             return None
 
         price_change_pct = (current_price_dec - start_price_dec) / start_price_dec
-        scaled_move = price_change_pct * Decimal("5")
+        scaled_move = price_change_pct * self.probability_move_multiplier
         true_prob_up = max(Decimal("0.01"), min(Decimal("0.99"), Decimal("0.5") + scaled_move))
         true_prob_down = Decimal("1.0") - true_prob_up
 
@@ -514,22 +521,23 @@ class LatencyArbitrageEngine:
             if self.orderbook_is_valid(summary):
                 self.scan_stats["live_markets"] += 1
                 spread_bps = None
+                spread = None
                 try:
-                    best_bid = to_decimal(summary.get("best_bid"))
-                    best_ask = to_decimal(summary.get("best_ask"))
+                    best_bid = _decimal_from_runtime(summary.get("best_bid"))
+                    best_ask = _decimal_from_runtime(summary.get("best_ask"))
+                    spread = best_ask - best_bid
                     if best_bid > 0:
-                        spread_bps = float(((best_ask - best_bid) / best_bid) * Decimal("10000"))
+                        spread_bps = float((spread / best_bid) * Decimal("10000"))
                 except Exception:
                     spread_bps = None
+                    spread = None
                 logger.info(
                     "live_market_detected",
                     asset=market_asset,
                     timeframe=timeframe,
                     bid=str(summary.get("best_bid")),
                     ask=str(summary.get("best_ask")),
-                    spread=str(
-                        to_decimal(summary.get("best_ask")) - to_decimal(summary.get("best_bid"))
-                    ),
+                    spread=str(spread) if spread is not None else None,
                 )
                 logger.info(
                     "spread_calculation",
@@ -1074,7 +1082,7 @@ class LatencyArbitrageEngine:
                 )
                 true_prob_up = Decimal(str(prediction.get("probability", "0.5")))
                 true_prob_down = Decimal("1.0") - true_prob_up
-                charlie_confidence = to_decimal(prediction.get("confidence", "0.5"))
+                charlie_confidence = Decimal(str(prediction.get("confidence", "0.5")))
             else:
                 if price_change > 0:
                     true_prob_up, true_prob_down = Decimal("0.60"), Decimal("0.40")
@@ -1576,8 +1584,8 @@ class LatencyArbitrageEngine:
             return False
 
         try:
-            best_bid_dec = to_decimal(best_bid)
-            best_ask_dec = to_decimal(best_ask)
+            best_bid_dec = _decimal_from_runtime(best_bid)
+            best_ask_dec = _decimal_from_runtime(best_ask)
         except Exception:
             return False
 
@@ -1589,8 +1597,8 @@ class LatencyArbitrageEngine:
         bid_size = orderbook.get("bid_size", Decimal("0"))
         ask_size = orderbook.get("ask_size", Decimal("0"))
         try:
-            bid_size_dec = to_decimal(bid_size)
-            ask_size_dec = to_decimal(ask_size)
+            bid_size_dec = _decimal_from_runtime(bid_size)
+            ask_size_dec = _decimal_from_runtime(ask_size)
         except Exception:
             return False
 

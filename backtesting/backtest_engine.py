@@ -234,33 +234,42 @@ class BacktestEngine:
         """
         events = []
         
-        market_snapshots = historical_data.get('market_snapshots', [])
-        price_ticks = historical_data.get('price_ticks', [])
-        
-        # Create scan triggers every 15 seconds
+        market_snapshots = sorted(
+            historical_data.get('market_snapshots', []),
+            key=lambda snapshot: snapshot['timestamp'],
+        )
+        price_ticks = sorted(
+            historical_data.get('price_ticks', []),
+            key=lambda tick: tick['timestamp'],
+        )
+
+        market_index = 0
+        price_index = 0
+        recent_markets: List[Dict] = []
+        latest_prices: Dict[str, Decimal] = {}
+
+        # Create scan triggers every 15 seconds using incremental cursors.
+        # Re-filtering the full history at each step makes 7-day mock runs
+        # effectively quadratic and stalls validation.
         current = start_date
         while current <= end_date:
-            # Get markets available at this time
-            available_markets = [
-                m for m in market_snapshots
-                if m['timestamp'] <= current
-            ]
-            
-            # Get prices available at this time
-            available_prices = {
-                p['symbol']: Decimal(str(p['price']))
-                for p in price_ticks
-                if p['timestamp'] <= current
-            }
-            
-            if available_markets and available_prices:
+            while market_index < len(market_snapshots) and market_snapshots[market_index]['timestamp'] <= current:
+                recent_markets.append(market_snapshots[market_index])
+                market_index += 1
+
+            while price_index < len(price_ticks) and price_ticks[price_index]['timestamp'] <= current:
+                tick = price_ticks[price_index]
+                latest_prices[tick['symbol']] = Decimal(str(tick['price']))
+                price_index += 1
+
+            if recent_markets and latest_prices:
                 events.append({
                     'timestamp': current,
                     'type': 'scan_trigger',
-                    'markets': available_markets[-50:],  # Last 50 markets
-                    'prices': available_prices
+                    'markets': recent_markets[-50:],
+                    'prices': dict(latest_prices),
                 })
-            
+
             current += timedelta(seconds=15)
         
         # Add market update events

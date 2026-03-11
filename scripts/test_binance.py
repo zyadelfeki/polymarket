@@ -4,7 +4,7 @@ sys.path.append('.')
 
 from data_feeds.binance_websocket import BinanceWebSocketFeed
 
-async def test_binance():
+async def run_binance():
     print("\n" + "="*60)
     print("TESTING BINANCE WEBSOCKET")
     print("="*60 + "\n")
@@ -53,5 +53,5 @@ async def test_binance():
     return True
 
 if __name__ == "__main__":
-    result = asyncio.run(test_binance())
+    result = asyncio.run(run_binance())
     sys.exit(0 if result else 1)

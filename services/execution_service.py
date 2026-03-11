@@ -14,6 +14,7 @@ Never allows silent failures. Every order is logged and tracked.
 """
 
 import asyncio
+import inspect
 import logging
 from typing import Dict, Optional, List
 from decimal import Decimal
@@ -29,6 +30,12 @@ from exports.positions_publisher import build_positions_from_ledger, PolymarketP
 from shared.risk_aggregator import Position, UnifiedRiskAggregator
 
 logger = logging.getLogger(__name__)
+
+
+async def _maybe_await(value):
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 @dataclass
 class OrderResult:
@@ -228,7 +235,7 @@ class ExecutionService:
                 if metadata and isinstance(metadata, dict):
                     correlation_id = str(metadata.get("correlation_id", ""))
 
-                position_id = await self.ledger.record_trade_entry(
+                position_id = await _maybe_await(self.ledger.record_trade_entry(
                     order_id=order_id,
                     strategy=strategy,
                     market_id=market_id,
@@ -238,7 +245,7 @@ class ExecutionService:
                     price=filled_price,
                     correlation_id=correlation_id,
                     metadata=metadata,
-                )
+                ))
 
                 latency_ms = int((time.monotonic() - start_time) * 1000)
                 logger.info(
@@ -378,7 +385,7 @@ class ExecutionService:
                     correlation_id = str(metadata.get("correlation_id", ""))
 
                 # Record in ledger
-                position_id = await self.ledger.record_trade_entry(
+                position_id = await _maybe_await(self.ledger.record_trade_entry(
                     order_id=order_id,
                     strategy=strategy,
                     market_id=market_id,
@@ -388,7 +395,7 @@ class ExecutionService:
                     price=filled_price,
                     correlation_id=correlation_id,
                     metadata=metadata,
-                )
+                ))
                 
                 latency_ms = int((time.monotonic() - start_time) * 1000)
                 
@@ -705,13 +712,13 @@ class ExecutionService:
         
         if order_result.success:
             # Record exit in ledger
-            self.ledger.record_trade_exit(
+            await _maybe_await(self.ledger.record_trade_exit(
                 position_id=position_id,
                 exit_price=order_result.filled_price,
                 fees=order_result.fees,
                 exit_reason=exit_reason,
                 order_id=order_result.order_id
-            )
+            ))
         
         return order_result
     

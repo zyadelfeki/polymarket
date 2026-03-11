@@ -5,7 +5,7 @@ sys.path.append('.')
 from data_feeds.polymarket_client import PolymarketClient
 from config.settings import settings
 
-async def test_polymarket():
+async def run_polymarket():
     print("\n" + "="*60)
     print("TESTING POLYMARKET CLIENT")
     print("="*60 + "\n")
@@ -66,5 +66,5 @@ async def test_polymarket():
     return True
 
 if __name__ == "__main__":
-    result = asyncio.run(test_polymarket())
+    result = asyncio.run(run_polymarket())
     sys.exit(0 if result else 1)

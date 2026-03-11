@@ -15,6 +15,7 @@ from logs.precision_monitor import PrecisionMonitor, PrecisionError
 from utils.decimal_json import dumps as decimal_dumps, loads as decimal_loads
 from database.ledger_async import AsyncLedger
 from utils.decimal_helpers import safe_decimal, quantize_price, quantize_usdc, quantize_size, validate_precision, format_for_api
+from strategies.btc_price_level_scanner import _decimal_from_charlie
 
 
 VALID_MARKET_ID = "0x" + "c" * 64
@@ -153,3 +154,8 @@ def test_validate_precision_bounds_and_api_format():
     assert validate_precision(Decimal("0.123456789012345678")) is True
     assert validate_precision(Decimal("0.1234567890123456789")) is False
     assert format_for_api(Decimal("10.500000000000000000")) == "10.5"
+
+
+def test_charlie_float_ingress_uses_string_decimal_coercion():
+    value = _decimal_from_charlie(0.6154)
+    assert value == Decimal("0.6154")

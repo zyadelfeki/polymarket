@@ -41,6 +41,7 @@ from risk.circuit_breaker_v2 import CircuitBreakerV2
 from security.secrets_manager import SecretsManager, get_secrets_manager
 from validation.models import TradingConfig
 from strategies.latency_arbitrage_btc import LatencyArbitrageEngine as MultiTimeframeLatencyArbitrageEngine
+from strategies.btc_price_level_scanner import BTCPriceLevelScanner
 from utils.decimal_helpers import quantize_quantity, to_decimal, from_config
 
 # Charlie integration — new modules
@@ -328,13 +329,7 @@ async def _get_rolling_features(
     if not rows:
         return 0.5, 0.0
 
-    DECIMAL_ZERO = Decimal("0")
-    DECIMAL_HALF = Decimal("0.5")
-    DECIMAL_EPSILON = Decimal("1e-9")
-    pnls = [
-        Decimal(str(r["pnl"] if isinstance(r, dict) else r[0]))
-        for r in rows
-    ]
+    pnls = [float(r["pnl"] if isinstance(r, dict) else r[0]) for r in rows]
 
     # rolling_win_rate: require a minimum sample count before trusting the rate.
     # Below WIN_MIN_SAMPLE trades the estimate is too noisy — hold at 0.5 neutral
@@ -342,23 +337,23 @@ async def _get_rolling_features(
     WIN_MIN_SAMPLE = 5
     win_slice = pnls[:n_win]
     rolling_win_rate = (
-        Decimal(sum(1 for p in win_slice if p > DECIMAL_ZERO)) / Decimal(len(win_slice))
+        sum(1 for p in win_slice if p > 0) / len(win_slice)
         if len(win_slice) >= WIN_MIN_SAMPLE
-        else DECIMAL_HALF  # insufficient history — stay neutral
+        else 0.5  # insufficient history — stay neutral
     )
 
     # rolling_pnl_z: most recent PnL vs the preceding n_pnl-1 peers (no self-contamination)
     pnl_slice = pnls[:n_pnl]
     if len(pnl_slice) >= 2:
         peers = pnl_slice[1:]  # exclude most recent (index 0 = newest in DESC order)
-        mu = sum(peers, DECIMAL_ZERO) / Decimal(len(peers))
-        variance = sum(((x - mu) ** 2 for x in peers), DECIMAL_ZERO) / Decimal(len(peers))
-        sigma = variance.sqrt() + DECIMAL_EPSILON
+        mu = sum(peers) / len(peers)
+        variance = sum((x - mu) ** 2 for x in peers) / len(peers)
+        sigma = variance ** 0.5 + 1e-9
         rolling_pnl_z = (pnl_slice[0] - mu) / sigma
     else:
-        rolling_pnl_z = DECIMAL_ZERO
+        rolling_pnl_z = 0.0
 
-    return float(rolling_win_rate), float(rolling_pnl_z)
+    return rolling_win_rate, rolling_pnl_z
 
 
 class TradingSystem:
@@ -408,6 +403,7 @@ class TradingSystem:
         self.health_monitor: Optional[HealthMonitorV2] = None
         self.circuit_breaker: Optional[CircuitBreakerV2] = None
         self.strategy_engine: Optional[MultiTimeframeLatencyArbitrageEngine] = None
+        self.btc_price_scanner: Optional[BTCPriceLevelScanner] = None
         self.strategy_scan_lock = asyncio.Lock()
         self.last_strategy_scan_at = 0.0
 
@@ -654,8 +650,6 @@ class TradingSystem:
         if self.ledger is None or self.api_client is None:
             return {
                 "exchange_open_orders": 0,
-                "orphaned_exchange_open_orders": 0,
-                "local_open_orders_missing_from_exchange": 0,
                 "imported": 0,
                 "already_known": 0,
                 "skipped": 0,
@@ -682,13 +676,6 @@ class TradingSystem:
             for order in local_open_orders
             if str(order.get("order_id") or "")
         }
-        exchange_order_ids = {
-            str(order.get("order_id") or "")
-            for order in exchange_open_orders
-            if str(order.get("order_id") or "")
-        }
-        orphaned_exchange_order_ids = sorted(exchange_order_ids - known_order_ids)
-        local_missing_exchange_order_ids = sorted(known_order_ids - exchange_order_ids)
 
         imported = 0
         already_known = 0
@@ -697,25 +684,11 @@ class TradingSystem:
         cancel_failures = 0
         left_open_after_failed_cancel = 0
 
-        for order_id in local_missing_exchange_order_ids:
-            logger.warning(
-                "startup_reconciliation_mismatch",
-                mismatch_class="local_open_order_missing_from_exchange_open_orders",
-                order_id=order_id,
-            )
-
         for order in exchange_open_orders:
             order_id = str(order.get("order_id") or "")
             market_id = str(order.get("market_id") or "")
             if not order_id or not market_id:
                 skipped += 1
-                logger.warning(
-                    "startup_exchange_open_order_skipped",
-                    mismatch_class="exchange_open_order_missing_from_local_tracking",
-                    order_id=order_id or None,
-                    market_id=market_id or None,
-                    reason="missing_order_id_or_market_id",
-                )
                 continue
 
             if order_id in known_order_ids:
@@ -726,15 +699,6 @@ class TradingSystem:
             price = Decimal(str(order.get("price") or "0"))
             if size <= 0 or price <= 0:
                 skipped += 1
-                logger.warning(
-                    "startup_exchange_open_order_skipped",
-                    mismatch_class="exchange_open_order_missing_from_local_tracking",
-                    order_id=order_id,
-                    market_id=market_id,
-                    reason="non_positive_size_or_price",
-                    size=str(size),
-                    price=str(price),
-                )
                 continue
 
             await self.ledger.import_exchange_open_order(
@@ -750,13 +714,6 @@ class TradingSystem:
             )
             known_order_ids.add(order_id)
             imported += 1
-            logger.warning(
-                "startup_reconciliation_mismatch",
-                mismatch_class="exchange_open_order_missing_from_local_tracking",
-                order_id=order_id,
-                market_id=market_id,
-                recovery_action="imported_then_cancel_attempted",
-            )
 
             cancel_error: Optional[str] = None
             cancel_ok = False
@@ -795,21 +752,15 @@ class TradingSystem:
         logger.info(
             "startup_open_order_reconciliation_complete",
             exchange_open_orders=len(exchange_open_orders),
-            orphaned_exchange_open_orders=len(orphaned_exchange_order_ids),
-            local_open_orders_missing_from_exchange=len(local_missing_exchange_order_ids),
             imported=imported,
             already_known=already_known,
             skipped=skipped,
             cancelled=cancelled,
             cancel_failures=cancel_failures,
             left_open_after_failed_cancel=left_open_after_failed_cancel,
-            orphaned_exchange_order_ids=orphaned_exchange_order_ids,
-            local_missing_exchange_order_ids=local_missing_exchange_order_ids,
         )
         return {
             "exchange_open_orders": len(exchange_open_orders),
-            "orphaned_exchange_open_orders": len(orphaned_exchange_order_ids),
-            "local_open_orders_missing_from_exchange": len(local_missing_exchange_order_ids),
             "imported": imported,
             "already_known": already_known,
             "skipped": skipped,
@@ -821,14 +772,7 @@ class TradingSystem:
     async def _reconcile_positions_on_startup(self) -> Dict[str, int]:
         api_client = self._compat_api_client()
         if self.ledger is None or api_client is None:
-            return {
-                "exchange_positions": 0,
-                "exchange_positions_missing_from_local_ledger": 0,
-                "local_positions_missing_from_exchange": 0,
-                "imported": 0,
-                "already_known": 0,
-                "skipped": 0,
-            }
+            return {"exchange_positions": 0, "imported": 0, "already_known": 0, "skipped": 0}
 
         exchange_positions = await self._safe_await(
             "api_client.get_open_positions.startup_reconcile",
@@ -850,16 +794,6 @@ class TradingSystem:
             )
             for position in local_positions
         }
-        exchange_keys = {
-            (
-                str(position.get("market_id") or ""),
-                str(position.get("token_id") or ""),
-            )
-            for position in exchange_positions
-            if str(position.get("market_id") or "") and str(position.get("token_id") or "")
-        }
-        exchange_missing_local_keys = sorted(exchange_keys - known_keys)
-        local_missing_exchange_keys = sorted(known_keys - exchange_keys)
 
         imported = 0
         already_known = 0
@@ -868,26 +802,11 @@ class TradingSystem:
         if record_position is None:
             record_position = getattr(self.ledger, "record_trade_entry", None)
 
-        for market_id, token_id in local_missing_exchange_keys:
-            logger.warning(
-                "startup_reconciliation_mismatch",
-                mismatch_class="local_position_missing_from_exchange_positions",
-                market_id=market_id,
-                token_id=token_id,
-            )
-
         for position in exchange_positions:
             market_id = str(position.get("market_id") or "")
             token_id = str(position.get("token_id") or "")
             if not market_id or not token_id:
                 skipped += 1
-                logger.warning(
-                    "startup_exchange_position_skipped",
-                    mismatch_class="exchange_position_missing_from_local_ledger",
-                    market_id=market_id or None,
-                    token_id=token_id or None,
-                    reason="missing_market_id_or_token_id",
-                )
                 continue
 
             position_key = (market_id, token_id)
@@ -904,16 +823,6 @@ class TradingSystem:
 
             if quantity <= 0 or entry_price <= 0 or record_position is None:
                 skipped += 1
-                logger.warning(
-                    "startup_exchange_position_skipped",
-                    mismatch_class="exchange_position_missing_from_local_ledger",
-                    market_id=market_id,
-                    token_id=token_id,
-                    reason="invalid_quantity_or_entry_price_or_recorder_missing",
-                    quantity=str(quantity),
-                    entry_price=str(entry_price),
-                    recorder_available=record_position is not None,
-                )
                 continue
 
             await self._safe_await(
@@ -930,35 +839,16 @@ class TradingSystem:
             )
             known_keys.add(position_key)
             imported += 1
-            logger.warning(
-                "startup_reconciliation_mismatch",
-                mismatch_class="exchange_position_missing_from_local_ledger",
-                market_id=market_id,
-                token_id=token_id,
-                recovery_action="record_reconciled_position",
-            )
 
         logger.info(
             "startup_position_reconciliation_complete",
             exchange_positions=len(exchange_positions),
-            exchange_positions_missing_from_local_ledger=len(exchange_missing_local_keys),
-            local_positions_missing_from_exchange=len(local_missing_exchange_keys),
             imported=imported,
             already_known=already_known,
             skipped=skipped,
-            exchange_positions_missing_from_local_ledger_keys=[
-                {"market_id": market_id, "token_id": token_id}
-                for market_id, token_id in exchange_missing_local_keys
-            ],
-            local_positions_missing_from_exchange_keys=[
-                {"market_id": market_id, "token_id": token_id}
-                for market_id, token_id in local_missing_exchange_keys
-            ],
         )
         return {
             "exchange_positions": len(exchange_positions),
-            "exchange_positions_missing_from_local_ledger": len(exchange_missing_local_keys),
-            "local_positions_missing_from_exchange": len(local_missing_exchange_keys),
             "imported": imported,
             "already_known": already_known,
             "skipped": skipped,
@@ -1261,7 +1151,7 @@ class TradingSystem:
             )
 
     async def _run_strategy_scan(self, trigger: str) -> None:
-        if not self.strategy_engine:
+        if not self.strategy_engine and not self.btc_price_scanner:
             return
 
         now = asyncio.get_running_loop().time()
@@ -1277,26 +1167,67 @@ class TradingSystem:
                 self.health_server.record_scan()
             logger.info("strategy_scan_begin", trigger=trigger)
 
-            try:
-                opportunity = await asyncio.wait_for(
-                    self.strategy_engine.scan_opportunities(),
-                    timeout=self.strategy_scan_timeout_seconds,
+            candidates: List[Dict[str, Any]] = []
+
+            if self.strategy_engine:
+                try:
+                    opportunity = await asyncio.wait_for(
+                        self.strategy_engine.scan_opportunities(),
+                        timeout=self.strategy_scan_timeout_seconds,
+                    )
+                    if opportunity:
+                        candidates.append(opportunity)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "strategy_scan_timeout",
+                        trigger=trigger,
+                        strategy="latency_arb",
+                        timeout_seconds=self.strategy_scan_timeout_seconds,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "strategy_scan_failed",
+                        trigger=trigger,
+                        strategy="latency_arb",
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
+
+            if self.btc_price_scanner and self.charlie_gate and self.api_client and self.ledger:
+                try:
+                    equity = await self.ledger.get_equity()
+                    scanner_opportunities = await asyncio.wait_for(
+                        self.btc_price_scanner.scan(
+                            charlie_gate=self.charlie_gate,
+                            api_client=self.api_client,
+                            equity=to_decimal(equity),
+                        ),
+                        timeout=self.strategy_scan_timeout_seconds,
+                    )
+                    if scanner_opportunities:
+                        candidates.extend(scanner_opportunities)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "strategy_scan_timeout",
+                        trigger=trigger,
+                        strategy="btc_price_scanner",
+                        timeout_seconds=self.strategy_scan_timeout_seconds,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "strategy_scan_failed",
+                        trigger=trigger,
+                        strategy="btc_price_scanner",
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
+
+            opportunity = None
+            if candidates:
+                opportunity = max(
+                    candidates,
+                    key=lambda item: to_decimal(item.get("edge", "0")),
                 )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "strategy_scan_timeout",
-                    trigger=trigger,
-                    timeout_seconds=self.strategy_scan_timeout_seconds,
-                )
-                return
-            except Exception as e:
-                logger.error(
-                    "strategy_scan_failed",
-                    trigger=trigger,
-                    error=str(e),
-                    error_type=type(e).__name__,
-                )
-                return
 
             if not opportunity:
                 logger.info("strategy_scan_complete", trigger=trigger, opportunity_found=False)
@@ -2226,30 +2157,24 @@ class TradingSystem:
                 )
                 if _fill_price is not None and self.ledger is not None:
                     try:
-                        _expected = Decimal(str(price))
-                        _filled = Decimal(str(_fill_price))
-                        _slip_bps = (
-                            (_filled - _expected) / _expected * Decimal("10000")
-                            if _expected != Decimal("0")
-                            else Decimal("0")
-                        )
-                        _filled_db = float(_filled)
-                        _slip_bps_db = float(_slip_bps.quantize(Decimal("0.01")))
+                        _expected = float(price)
+                        _filled   = float(_fill_price)
+                        _slip_bps = (_filled - _expected) / _expected * 10_000 if _expected else 0.0
                         await self._safe_await(
                             "ledger.update_slippage",
                             self.ledger.execute(
                                 "UPDATE order_tracking SET filled_price=?, slippage_bps=?"
                                 " WHERE order_id=?",
-                                (_filled_db, _slip_bps_db, exchange_order_id),
+                                (_filled, round(_slip_bps, 2), exchange_order_id),
                             ),
                             timeout_seconds=3.0,
                         )
                         logger.info(
                             "slippage_recorded",
                             order_id=exchange_order_id,
-                            expected_price=float(_expected),
-                            filled_price=_filled_db,
-                            slippage_bps=_slip_bps_db,
+                            expected_price=_expected,
+                            filled_price=_filled,
+                            slippage_bps=round(_slip_bps, 2),
                         )
                     except Exception as _se:
                         logger.warning("slippage_record_failed", error=str(_se))
@@ -2602,11 +2527,16 @@ class TradingSystem:
                 allowed_regimes=charlie_regimes,
                 signal_timeout=charlie_timeout,
             )
+            await self._await_step(
+                "charlie_gate.verify_contract_health",
+                self.charlie_gate.verify_contract_health(),
+            )
             logger.info(
                 "component_construct_success",
                 component="charlie_gate",
                 min_edge=str(charlie_min_edge),
                 min_confidence=str(charlie_min_conf),
+                contract_version=getattr(self.charlie_gate, "contract_version_expected", None),
                 coin_flip_reject_band_abs=str(
                     getattr(self.charlie_gate, "_coin_flip_reject_band_abs", Decimal("0.03"))
                 ),
@@ -2650,6 +2580,15 @@ class TradingSystem:
                 logger.info("component_construct_success", component="latency_arb_strategy")
             else:
                 logger.warning("strategy_disabled", strategy="latency_arb")
+
+            btc_price_scanner_cfg = self.config.get('strategies', {}).get('btc_price_scanner', {})
+            btc_price_scanner_enabled = bool(btc_price_scanner_cfg.get('enabled', False))
+            if btc_price_scanner_enabled:
+                logger.info("component_construct_begin", component="btc_price_scanner")
+                self.btc_price_scanner = BTCPriceLevelScanner(config=btc_price_scanner_cfg)
+                logger.info("component_construct_success", component="btc_price_scanner")
+            else:
+                logger.warning("strategy_disabled", strategy="btc_price_scanner")
 
             # 13. Portfolio State — cached position/exposure snapshot for risk budget checks
             budget = GLOBAL_RISK_BUDGET
@@ -2846,15 +2785,8 @@ class TradingSystem:
                 recovered_pnl=str(recovered_pnl),
             )
 
-            order_mismatch_summary = await self._reconcile_missing_open_orders_on_startup()
-            position_mismatch_summary = await self._reconcile_positions_on_startup()
-            logger.info(
-                "startup_reconciliation_mismatches_reviewed",
-                orphaned_exchange_open_orders=order_mismatch_summary.get("orphaned_exchange_open_orders", 0),
-                local_open_orders_missing_from_exchange=order_mismatch_summary.get("local_open_orders_missing_from_exchange", 0),
-                exchange_positions_missing_from_local_ledger=position_mismatch_summary.get("exchange_positions_missing_from_local_ledger", 0),
-                local_positions_missing_from_exchange=position_mismatch_summary.get("local_positions_missing_from_exchange", 0),
-            )
+            await self._reconcile_missing_open_orders_on_startup()
+            await self._reconcile_positions_on_startup()
 
             # Refresh performance tracker after reconcile
             if self.performance_tracker is not None:

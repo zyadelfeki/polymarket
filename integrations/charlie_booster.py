@@ -40,7 +40,7 @@ import sys
 import os
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 import structlog
 
 from models.calibration import calibrate_p_win
@@ -64,6 +64,107 @@ _ofi_calc = OFICalculator(window_seconds=180)
 # ---------------------------------------------------------------------------
 
 _get_signal_for_market = None
+
+EXPECTED_CHARLIE_CONTRACT_VERSION = "1.0"
+_REQUIRED_SIGNAL_FIELDS = {
+    "contract_version",
+    "p_win",
+    "confidence",
+    "regime",
+    "technical_regime",
+    "lstm_direction",
+    "lstm_confidence",
+}
+_ALLOWED_REGIMES = {"BULLISH", "BEARISH", "NEUTRAL"}
+_ALLOWED_TECHNICAL_REGIMES = {
+    "TRENDING",
+    "MEAN_REVERTING",
+    "HIGH_VOL",
+    "LOW_VOL",
+    "UNKNOWN",
+}
+_ALLOWED_LSTM_DIRECTIONS = {"UP", "DOWN"}
+
+
+class CharlieContractError(RuntimeError):
+    """Raised when Charlie violates the signal contract expected by Polymarket."""
+
+
+def _coerce_probability(signal: Dict[str, Any], key: str) -> float:
+    value = signal.get(key)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise CharlieContractError(f"Charlie signal field '{key}' must be numeric, got {value!r}") from exc
+    if not 0.0 <= numeric <= 1.0:
+        raise CharlieContractError(f"Charlie signal field '{key}' must be within [0, 1], got {numeric!r}")
+    return numeric
+
+
+def _validate_charlie_signal_shape(signal: dict) -> dict:
+    if not isinstance(signal, dict):
+        raise CharlieContractError(f"Charlie signal must be a dict, got {type(signal).__name__}")
+
+    missing = sorted(_REQUIRED_SIGNAL_FIELDS.difference(signal.keys()))
+    if missing:
+        raise CharlieContractError(f"Charlie signal missing required fields: {', '.join(missing)}")
+
+    contract_version = str(signal.get("contract_version", "")).strip()
+    if contract_version != EXPECTED_CHARLIE_CONTRACT_VERSION:
+        raise CharlieContractError(
+            "Charlie contract version mismatch: "
+            f"expected {EXPECTED_CHARLIE_CONTRACT_VERSION}, got {contract_version or 'missing'}"
+        )
+
+    regime = str(signal.get("regime", "")).upper()
+    if regime not in _ALLOWED_REGIMES:
+        raise CharlieContractError(f"Charlie regime must be one of {_ALLOWED_REGIMES}, got {regime!r}")
+
+    technical_regime = str(signal.get("technical_regime", "")).upper()
+    if technical_regime not in _ALLOWED_TECHNICAL_REGIMES:
+        raise CharlieContractError(
+            f"Charlie technical_regime must be one of {_ALLOWED_TECHNICAL_REGIMES}, got {technical_regime!r}"
+        )
+
+    lstm_direction = str(signal.get("lstm_direction", "")).upper()
+    if lstm_direction not in _ALLOWED_LSTM_DIRECTIONS:
+        raise CharlieContractError(
+            f"Charlie lstm_direction must be one of {_ALLOWED_LSTM_DIRECTIONS}, got {lstm_direction!r}"
+        )
+
+    normalized = dict(signal)
+    normalized["contract_version"] = contract_version
+    normalized["p_win"] = _coerce_probability(signal, "p_win")
+    normalized["confidence"] = _coerce_probability(signal, "confidence")
+    normalized["lstm_confidence"] = _coerce_probability(signal, "lstm_confidence")
+    normalized["regime"] = regime
+    normalized["technical_regime"] = technical_regime
+    normalized["lstm_direction"] = lstm_direction
+    return normalized
+
+
+async def _request_charlie_signal(
+    *,
+    market_id: str,
+    symbol: str,
+    timeframe: str,
+    extra_features: Optional[Dict] = None,
+) -> dict:
+    if _get_signal_for_market is None:
+        raise CharlieContractError("Charlie API is unavailable")
+
+    try:
+        return await _get_signal_for_market(
+            market_id=market_id,
+            symbol=symbol,
+            timeframe=timeframe,
+            extra_features=extra_features,
+        )
+    except TypeError as exc:
+        message = str(exc)
+        if "market_id" not in message and "unexpected keyword" not in message:
+            raise
+    return await _get_signal_for_market(symbol, timeframe, extra_features=extra_features)
 
 
 def _load_charlie_api():
@@ -168,12 +269,37 @@ class CharliePredictionGate:
         self._min_confidence = min_confidence
         self._allowed_regimes = allowed_regimes  # None = allow all regimes
         self._signal_timeout = signal_timeout
+        self.contract_version_expected = EXPECTED_CHARLIE_CONTRACT_VERSION
         if coin_flip_reject_band_abs is None:
             coin_flip_reject_band_abs = Decimal(
                 os.getenv("CHARLIE_COIN_FLIP_REJECT_BAND_ABS", "0.03")
             )
         self._coin_flip_reject_band_abs = Decimal(str(coin_flip_reject_band_abs))
         _load_charlie_api()
+
+    async def verify_contract_health(
+        self,
+        *,
+        symbol: str = "BTC",
+        timeframe: str = "15m",
+    ) -> dict:
+        """Fail loud at startup if Charlie cannot satisfy the integration contract."""
+        signal = await asyncio.wait_for(
+            _request_charlie_signal(
+                market_id="startup_contract_probe",
+                symbol=symbol,
+                timeframe=timeframe,
+            ),
+            timeout=self._signal_timeout,
+        )
+        normalized = _validate_charlie_signal_shape(signal)
+        logger.info(
+            "charlie_contract_healthcheck_passed",
+            contract_version=normalized["contract_version"],
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        return normalized
 
     # ------------------------------------------------------------------ public
 
@@ -267,9 +393,15 @@ class CharliePredictionGate:
         # --- 1. Fetch Charlie signal ----------------------------------------
         try:
             signal = await asyncio.wait_for(
-                _get_signal_for_market(symbol, timeframe, extra_features=extra_features),
+                _request_charlie_signal(
+                    market_id=market_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    extra_features=extra_features,
+                ),
                 timeout=self._signal_timeout,
             )
+            signal = _validate_charlie_signal_shape(signal)
         except asyncio.TimeoutError:
             logger.warning(
                 "charlie_gate_rejected",
@@ -287,6 +419,14 @@ class CharliePredictionGate:
                 market_id=market_id,
                 error=str(exc),
                 p_win=None,
+            )
+            return None
+        except CharlieContractError as exc:
+            logger.error(
+                "charlie_gate_rejected",
+                reason="invalid_signal_contract",
+                market_id=market_id,
+                error=str(exc),
             )
             return None
 
@@ -639,4 +779,9 @@ class CharliePredictionBooster:
         return False
 
 
-__all__ = ["TradeRecommendation", "CharliePredictionGate", "CharliePredictionBooster"]
+__all__ = [
+    "CharlieContractError",
+    "TradeRecommendation",
+    "CharliePredictionGate",
+    "CharliePredictionBooster",
+]

@@ -313,8 +313,8 @@ class ExecutionServiceV2:
         
         self.config = config or {}
         self.max_retries = self.config.get('max_retries', 3)
-        self.timeout_seconds = to_decimal(self.config.get('timeout_seconds', '30'))
-        self.fill_check_interval = to_decimal(self.config.get('fill_check_interval', '2.0'))
+        self.timeout_seconds = Decimal(str(self.config.get('timeout_seconds', '30')))
+        self.fill_check_interval = Decimal(str(self.config.get('fill_check_interval', '2.0')))
         self.max_order_age_seconds = self.config.get('max_order_age_seconds', 300)
 
         # Auto-block threshold: if realised slippage on a successful fill exceeds
@@ -541,10 +541,17 @@ class ExecutionServiceV2:
     
     async def stop(self):
         """Stop background tasks."""
+        tasks = []
         if self._monitor_task:
             self._monitor_task.cancel()
+            tasks.append(self._monitor_task)
+            self._monitor_task = None
         if self._cleanup_task:
             self._cleanup_task.cancel()
+            tasks.append(self._cleanup_task)
+            self._cleanup_task = None
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("execution_service_stopped")
     
     async def place_order(
@@ -559,7 +566,7 @@ class ExecutionServiceV2:
         metadata: Optional[Dict] = None,
         correlation_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
-        max_slippage_bps: int = 50,
+        max_slippage_bps: Optional[int] = None,
         record_in_ledger: bool = True
     ) -> OrderResult:
         start_time = time.time()
@@ -568,7 +575,7 @@ class ExecutionServiceV2:
 
         with CorrelationContext.use(correlation_id):
             try:
-                if (not is_paper_trading) and self.network_monitor.check_partition():
+                if self.network_monitor.check_partition():
                     raise NetworkPartitionError("Trading halted: network partition detected")
                 if not token_id or not isinstance(token_id, str):
                     raise ValueError("Invalid token_id")
@@ -897,6 +904,7 @@ class ExecutionServiceV2:
                     timeout=to_timeout_float(self.timeout_seconds),
                     target_price=price,
                     max_slippage_bps=max_slippage_bps,
+                    side=side_str,
                     correlation_id=correlation_id,
                     idempotency_key=idempotency_key
                 )
@@ -1047,15 +1055,20 @@ class ExecutionServiceV2:
         order_state: OrderState,
         timeout: float,
         target_price: Decimal,
-        max_slippage_bps: int,
+        max_slippage_bps: Optional[int],
+        side: str,
         correlation_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
     ) -> bool:
         start_time = time.time()
-
-        max_slippage = Decimal(str(max_slippage_bps)) / Decimal("10000")
-        max_fill_price = target_price * (Decimal("1") + max_slippage)
-        min_fill_price = target_price * (Decimal("1") - max_slippage)
+        max_fill_price = None
+        min_fill_price = None
+        if max_slippage_bps is not None:
+            max_slippage = Decimal(str(max_slippage_bps)) / Decimal("10000")
+            if side == "BUY":
+                max_fill_price = target_price * (Decimal("1") + max_slippage)
+            else:
+                min_fill_price = target_price * (Decimal("1") - max_slippage)
         
         while (time.time() - start_time) < timeout:
             status_response = await self.client.get_order_status(order_state.order_id)
@@ -1076,7 +1089,9 @@ class ExecutionServiceV2:
                             fee=Decimal(str(fill_data.get('fee', 0))),
                             timestamp=datetime.now(timezone.utc)
                         )
-                        if fill.price > max_fill_price or fill.price < min_fill_price:
+                        violates_buy = max_fill_price is not None and fill.price > max_fill_price
+                        violates_sell = min_fill_price is not None and fill.price < min_fill_price
+                        if violates_buy or violates_sell:
                             logger.error(
                                 "slippage_violation",
                                 **inject_correlation({
@@ -1197,7 +1212,7 @@ class ExecutionServiceV2:
         position_id: int,
         exit_reason: str,
         exit_price: Optional[Decimal] = None,
-        max_slippage_bps: int = 50,
+        max_slippage_bps: Optional[int] = None,
     ) -> OrderResult:
         correlation_id = generate_correlation_id()
 
@@ -1274,7 +1289,8 @@ class ExecutionServiceV2:
                         order,
                         timeout=to_timeout_float(Decimal("0.1")),
                         target_price=order.request.price,
-                        max_slippage_bps=50,
+                        max_slippage_bps=None,
+                        side=order.request.side.value,
                         correlation_id=order.request.metadata.get("correlation_id") if order.request.metadata else None,
                         idempotency_key=order.request.metadata.get("idempotency_key") if order.request.metadata else None,
                     )

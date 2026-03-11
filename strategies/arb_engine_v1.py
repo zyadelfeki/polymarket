@@ -274,7 +274,7 @@ class ArbitrageEngine:
             "BTC-price-2025": "btc_price_q1_2025",
             "ETH-price-2025": "eth_price_q1_2025",
         }
-        return mapping.get(poly_market_id)
+        return mapping.get(poly_market_id, poly_market_id)
 
     def get_stats(self) -> Dict:
         """Get performance statistics."""

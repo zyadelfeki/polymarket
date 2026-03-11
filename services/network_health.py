@@ -119,10 +119,15 @@ class NetworkHealthMonitor:
     def check_partition(self) -> bool:
         now = self._utc_now()
         if not self.state.has_successful_api_call:
-            startup_elapsed = (now - self._normalize_utc(self.state.initialized_at)).total_seconds()
-            if startup_elapsed <= self.state.startup_grace_seconds:
-                return False
-            elapsed = startup_elapsed
+            normalized_last_success = self._normalize_utc(self.state.last_successful_api_call)
+            initialized_at = self._normalize_utc(self.state.initialized_at)
+            if normalized_last_success < initialized_at:
+                elapsed = (now - normalized_last_success).total_seconds()
+            else:
+                startup_elapsed = (now - initialized_at).total_seconds()
+                if startup_elapsed <= self.state.startup_grace_seconds:
+                    return False
+                elapsed = startup_elapsed
         else:
             elapsed = (now - self._normalize_utc(self.state.last_successful_api_call)).total_seconds()
 

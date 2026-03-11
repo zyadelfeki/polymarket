@@ -5,6 +5,7 @@ SUB-SECOND EXECUTION - The difference between 30% and 300% monthly returns
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from decimal import Decimal
 from typing import Dict, Optional, Any
@@ -21,6 +22,12 @@ from execution.order_types import OrderResult
 logger = logging.getLogger(__name__)
 
 
+def _decimal_from_runtime(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
 class UltraFastExecutor:
     def __init__(
         self,
@@ -33,21 +40,22 @@ class UltraFastExecutor:
         self.execution = execution_service
         self.ledger = ledger
         self.idempotency = IdempotencyManager(db_path=":memory:", cache_ttl=300)
-        max_aggregate_exposure = to_decimal(getattr(settings, "MAX_AGGREGATE_EXPOSURE", "20.0"))
+        max_aggregate_exposure = Decimal(str(getattr(settings, "MAX_AGGREGATE_EXPOSURE", "20.0")))
         self.kelly = kelly_sizer or AdaptiveKellySizer(
             config={
                 "kelly_fraction": "0.25",
                 "max_bet_pct": settings.MAX_POSITION_SIZE_PCT,
                 "min_edge": settings.MIN_EDGE_THRESHOLD,
                 "max_aggregate_exposure": max_aggregate_exposure,
-                "min_bet_size": to_decimal(settings.MIN_BET_SIZE),
+                "min_bet_size": Decimal(str(settings.MIN_BET_SIZE)),
+                "micro_capital_threshold": Decimal(str(settings.MICRO_CAPITAL_THRESHOLD)),
             }
         )
         self.charlie = charlie_booster
 
         cfg = config or {}
-        self.order_timeout_seconds = to_decimal(cfg.get("order_timeout_seconds", "0.5"))
-        self.limit_price_buffer = to_decimal(cfg.get("limit_price_buffer", "0.01"))
+        self.order_timeout_seconds = Decimal(str(cfg.get("order_timeout_seconds", "0.5")))
+        self.limit_price_buffer = Decimal(str(cfg.get("limit_price_buffer", "0.01")))
         default_trade_pct = Decimal(str(settings.MAX_POSITION_SIZE_PCT)) / Decimal("100")
         self.max_trade_pct = Decimal(str(cfg.get("max_trade_pct", default_trade_pct)))
 
@@ -63,7 +71,7 @@ class UltraFastExecutor:
         if bet_size <= 0:
             return None
 
-        market_price = quantize_price(to_decimal(opportunity["market_price"]))
+        market_price = quantize_price(_decimal_from_runtime(opportunity["market_price"]))
         limit_price = quantize_price(market_price * (Decimal("1") + self.limit_price_buffer))
         quantity = quantize_quantity(bet_size / limit_price)
 
@@ -184,16 +192,28 @@ class UltraFastExecutor:
         }
 
     async def calculate_bet_size(self, opportunity: Dict, capital: Decimal) -> Decimal:
-        edge = to_decimal(opportunity.get("edge", "0"))
-        market_price = to_decimal(opportunity.get("market_price"))
-        true_prob = to_decimal(opportunity.get("true_prob", "0.5"))
+        bankroll = _decimal_from_runtime(capital)
+        live_equity_getter = getattr(self.ledger, "get_equity", None)
+        if callable(live_equity_getter):
+            # Sizing must use the live ledger equity, not a stale startup snapshot.
+            try:
+                live_equity = live_equity_getter()
+                if inspect.isawaitable(live_equity):
+                    live_equity = await live_equity
+                bankroll = _decimal_from_runtime(live_equity)
+            except Exception:
+                pass
+
+        edge = _decimal_from_runtime(opportunity.get("edge", "0"))
+        market_price = _decimal_from_runtime(opportunity.get("market_price"))
+        true_prob = _decimal_from_runtime(opportunity.get("true_prob", "0.5"))
 
         win_probability = true_prob if opportunity.get("side") == "YES" else (Decimal("1") - true_prob)
         payout_odds = Decimal("1") / market_price
 
         exposure = await self._current_aggregate_exposure()
         result = self.kelly.calculate_bet_size(
-            bankroll=capital,
+            bankroll=bankroll,
             win_probability=win_probability,
             payout_odds=payout_odds,
             edge=edge,
@@ -201,19 +221,19 @@ class UltraFastExecutor:
             market_price=market_price,
         )
 
-        bet_size = result.size if hasattr(result, "size") else to_decimal(result)
+        bet_size = result.size if hasattr(result, "size") else _decimal_from_runtime(result)
 
         if self.charlie:
-            charlie_confidence = to_decimal(
+            charlie_confidence = _decimal_from_runtime(
                 opportunity.get("charlie_confidence", self.charlie.last_confidence)
             )
             multiplier = self.charlie.calculate_kelly_multiplier(
                 charlie_confidence,
                 edge,
             )
-            bet_size = bet_size * to_decimal(multiplier)
+            bet_size = bet_size * _decimal_from_runtime(multiplier)
 
-        max_bet = capital * self.max_trade_pct
+        max_bet = bankroll * self.max_trade_pct
         if bet_size > max_bet:
             bet_size = max_bet
 
@@ -221,8 +241,8 @@ class UltraFastExecutor:
 
     @staticmethod
     def calculate_kelly(win_prob: Decimal, payout_odds: Decimal) -> Decimal:
-        win_prob_dec = to_decimal(win_prob)
-        payout_odds_dec = to_decimal(payout_odds)
+        win_prob_dec = _decimal_from_runtime(win_prob)
+        payout_odds_dec = _decimal_from_runtime(payout_odds)
         if payout_odds_dec <= Decimal("1"):
             return Decimal("0")
         b = payout_odds_dec - Decimal("1")

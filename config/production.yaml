@@ -30,7 +30,7 @@ secrets:
 trading:
   # Paper trading mode
   paper_trading: true
-  max_entry_price_abs: "0.65"
+  max_entry_price_abs: "0.35"
   
   # Initial capital
   initial_capital: 10000.00
@@ -81,7 +81,7 @@ runtime_controls:
     max_active_entries_per_market: 1
     allow_add_on: false
     min_price_improvement_abs: "0.05"
-  max_entry_price_abs: "0.65"
+  max_entry_price_abs: "0.35"
   calibration:
     fail_closed: true
     min_positive_coef: 0.0
@@ -218,6 +218,13 @@ strategies:
     enforce_orderbook_validation: true
     min_orderbook_size: "10.0"
     peak_hours_only: false
+
+  btc_price_scanner:
+    enabled: true
+    max_days_to_expiry: 7
+    min_edge: "0.05"
+    market_limit: 200
+    timeframe: 15m
     use_dynamic_edge_thresholds: true
     edge_thresholds:
       15min: "0.03"

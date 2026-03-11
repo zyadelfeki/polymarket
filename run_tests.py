@@ -27,6 +27,10 @@ from io import StringIO
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
+
+def _status_label(ok: bool, success_text: str, failure_text: str) -> str:
+    return success_text if ok else failure_text
+
 def run_tests(module_name=None, verbose=False):
     """
     Run tests and return results.
@@ -109,22 +113,22 @@ def print_summary(result, coverage_info):
     passed = total_tests - failures - errors - skipped
     
     print(f"\nTests Run: {total_tests}")
-    print(f"  ✅ Passed: {passed}")
-    print(f"  ❌ Failed: {failures}")
-    print(f"  ⚠️  Errors: {errors}")
-    print(f"  ⏭️  Skipped: {skipped}")
+    print(f"  {_status_label(passed > 0, '[PASS]', '[INFO]')} Passed: {passed}")
+    print(f"  {_status_label(failures == 0, '[PASS]', '[FAIL]')} Failed: {failures}")
+    print(f"  {_status_label(errors == 0, '[PASS]', '[FAIL]')} Errors: {errors}")
+    print(f"  [INFO] Skipped: {skipped}")
     
     success_rate = (passed / total_tests * 100) if total_tests > 0 else 0
     print(f"\nSuccess Rate: {success_rate:.1f}%")
     
     if failures > 0:
-        print("\n❌ FAILURES:")
+        print("\nFAILURES:")
         for test, traceback in result.failures:
             print(f"  - {test}")
             print(f"    {traceback.split(chr(10))[0]}")
     
     if errors > 0:
-        print("\n⚠️  ERRORS:")
+        print("\nERRORS:")
         for test, traceback in result.errors:
             print(f"  - {test}")
             print(f"    {traceback.split(chr(10))[0]}")
@@ -141,9 +145,9 @@ def print_summary(result, coverage_info):
     print(f"Estimated Coverage: {estimated_coverage:.1f}%")
     
     if estimated_coverage < 80:
-        print("\n⚠️  WARNING: Coverage below 80% target")
+        print("\n[WARN] Coverage below 80% target")
     else:
-        print("\n✅ Coverage meets 80% target")
+        print("\n[PASS] Coverage meets 80% target")
     
     print("\n" + "="*60)
     
@@ -160,7 +164,7 @@ def print_summary(result, coverage_info):
     
     all_passed = True
     for check_name, passed in checks:
-        status = "✅ PASS" if passed else "❌ FAIL"
+        status = "[PASS]" if passed else "[FAIL]"
         print(f"{status} | {check_name}")
         if not passed:
             all_passed = False
@@ -168,9 +172,9 @@ def print_summary(result, coverage_info):
     print("="*60)
     
     if all_passed:
-        print("\n✅ ALL CHECKS PASSED - TEST SUITE PRODUCTION READY")
+        print("\n[PASS] ALL CHECKS PASSED - TEST SUITE PRODUCTION READY")
     else:
-        print("\n❌ SOME CHECKS FAILED - FIX BEFORE DEPLOYMENT")
+        print("\n[FAIL] SOME CHECKS FAILED - FIX BEFORE DEPLOYMENT")
     
     print("\n")
     

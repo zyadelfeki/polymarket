@@ -130,7 +130,7 @@ async def temp_db():
 @pytest_asyncio.fixture
 async def ledger(temp_db):
     """Create async ledger instance."""
-    ledger = AsyncLedger(db_path=temp_db, pool_size=3)
+    ledger = AsyncLedger(db_path=temp_db, pool_size=1)
     await ledger.pool.initialize()
     yield ledger
     await ledger.close()

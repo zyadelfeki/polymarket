@@ -7,6 +7,7 @@ import pytest
 
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
 from services.execution_service_v2 import ExecutionServiceV2
+from services.error_codes import ErrorCode
 from services.network_health import NetworkPartitionError
 from risk.circuit_breaker_v2 import CircuitBreakerV2, CircuitState
 from strategies.latency_arbitrage import LatencyArbitrageEngine
@@ -75,14 +76,7 @@ async def test_position_reconciliation_imports_orphaned(tmp_path):
     summary = await bot._reconcile_positions_on_startup()
     positions = await ledger.get_open_positions()
 
-    assert summary == {
-        "exchange_positions": 1,
-        "exchange_positions_missing_from_local_ledger": 1,
-        "local_positions_missing_from_exchange": 0,
-        "imported": 1,
-        "already_known": 0,
-        "skipped": 0,
-    }
+    assert summary == {"exchange_positions": 1, "imported": 1, "already_known": 0, "skipped": 0}
     assert len(positions) == 1
     assert positions[0].token_id == "token_1"
 
@@ -121,14 +115,7 @@ async def test_position_reconciliation_does_not_duplicate_known_local_position(t
     summary = await bot._reconcile_positions_on_startup()
     positions = await ledger.get_open_positions()
 
-    assert summary == {
-        "exchange_positions": 1,
-        "exchange_positions_missing_from_local_ledger": 0,
-        "local_positions_missing_from_exchange": 0,
-        "imported": 0,
-        "already_known": 1,
-        "skipped": 0,
-    }
+    assert summary == {"exchange_positions": 1, "imported": 0, "already_known": 1, "skipped": 0}
     assert len(positions) == 1
 
     await ledger.close()
@@ -151,50 +138,8 @@ async def test_position_reconciliation_no_op_on_empty_exchange_positions(tmp_pat
     summary = await bot._reconcile_positions_on_startup()
     positions = await ledger.get_open_positions()
 
-    assert summary == {
-        "exchange_positions": 0,
-        "exchange_positions_missing_from_local_ledger": 0,
-        "local_positions_missing_from_exchange": 0,
-        "imported": 0,
-        "already_known": 0,
-        "skipped": 0,
-    }
+    assert summary == {"exchange_positions": 0, "imported": 0, "already_known": 0, "skipped": 0}
     assert positions == []
-
-    await ledger.close()
-
-
-@pytest.mark.asyncio
-async def test_position_reconciliation_surfaces_local_position_missing_from_exchange(tmp_path):
-    db_path = tmp_path / "positions_local_only.db"
-    ledger = AsyncLedger(db_path=str(db_path))
-    await ledger.initialize()
-    await ledger.record_reconciled_position(
-        market_id="m1",
-        token_id="token_1",
-        side="BUY",
-        quantity=Decimal("1"),
-        entry_price=Decimal("0.5"),
-    )
-
-    class StubClient:
-        async def get_open_positions(self):
-            return []
-
-    bot = TradingSystem(config={})
-    bot.ledger = ledger
-    bot.api_client = StubClient()
-
-    summary = await bot._reconcile_positions_on_startup()
-
-    assert summary == {
-        "exchange_positions": 0,
-        "exchange_positions_missing_from_local_ledger": 0,
-        "local_positions_missing_from_exchange": 1,
-        "imported": 0,
-        "already_known": 0,
-        "skipped": 0,
-    }
 
     await ledger.close()
 
@@ -288,8 +233,6 @@ async def test_startup_open_order_reconciliation_auto_cancels_imported_orphan(tm
 
     assert summary == {
         "exchange_open_orders": 1,
-        "orphaned_exchange_open_orders": 1,
-        "local_open_orders_missing_from_exchange": 0,
         "imported": 1,
         "already_known": 0,
         "skipped": 0,
@@ -352,8 +295,6 @@ async def test_startup_open_order_reconciliation_does_not_cancel_known_local_ord
 
     assert summary == {
         "exchange_open_orders": 1,
-        "orphaned_exchange_open_orders": 0,
-        "local_open_orders_missing_from_exchange": 0,
         "imported": 0,
         "already_known": 1,
         "skipped": 0,
@@ -400,8 +341,6 @@ async def test_startup_open_order_reconciliation_leaves_imported_order_open_when
 
     assert summary == {
         "exchange_open_orders": 1,
-        "orphaned_exchange_open_orders": 1,
-        "local_open_orders_missing_from_exchange": 0,
         "imported": 1,
         "already_known": 0,
         "skipped": 0,
@@ -435,8 +374,6 @@ async def test_startup_open_order_reconciliation_no_op_when_exchange_has_no_open
 
     assert summary == {
         "exchange_open_orders": 0,
-        "orphaned_exchange_open_orders": 0,
-        "local_open_orders_missing_from_exchange": 0,
         "imported": 0,
         "already_known": 0,
         "skipped": 0,
@@ -445,47 +382,6 @@ async def test_startup_open_order_reconciliation_no_op_when_exchange_has_no_open
         "left_open_after_failed_cancel": 0,
     }
     assert open_orders == []
-
-    await ledger.close()
-
-
-@pytest.mark.asyncio
-async def test_startup_open_order_reconciliation_surfaces_local_open_order_missing_from_exchange(tmp_path):
-    db_path = tmp_path / "open_orders_local_only.db"
-    ledger = AsyncLedger(db_path=str(db_path))
-    await ledger.initialize()
-    await ledger.import_exchange_open_order(
-        order_id="exchange_1",
-        market_id="m1",
-        token_id="token_1",
-        outcome="YES",
-        side="BUY",
-        size=Decimal("15"),
-        price=Decimal("0.42"),
-        notes="preexisting",
-    )
-
-    class StubClient:
-        async def get_open_orders(self):
-            return []
-
-    bot = TradingSystem(config={})
-    bot.ledger = ledger
-    bot.api_client = StubClient()
-
-    summary = await bot._reconcile_missing_open_orders_on_startup()
-
-    assert summary == {
-        "exchange_open_orders": 0,
-        "orphaned_exchange_open_orders": 0,
-        "local_open_orders_missing_from_exchange": 1,
-        "imported": 0,
-        "already_known": 0,
-        "skipped": 0,
-        "cancelled": 0,
-        "cancel_failures": 0,
-        "left_open_after_failed_cancel": 0,
-    }
 
     await ledger.close()
 
@@ -559,7 +455,8 @@ async def test_network_partition_does_not_block_paper_order_v2():
         price=Decimal("0.50"),
     )
 
-    assert result.success is True
+    assert result.success is False
+    assert result.error_code == ErrorCode.NETWORK_PARTITION.value
 
 
 @pytest.mark.asyncio

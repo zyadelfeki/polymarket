@@ -21,6 +21,7 @@ Standards:
 """
 
 import aiosqlite
+from aiosqlite import core as aiosqlite_core
 import asyncio
 import os
 import json
@@ -357,15 +358,6 @@ class PositionData:
     hold_time_seconds: float
 
 
-@dataclass
-class AccountBalance:
-    """Account balance data"""
-    account_id: int
-    account_name: str
-    account_type: str
-    balance: Decimal
-
-
 class ConnectionPool:
     """
     Async SQLite connection pool.
@@ -379,7 +371,9 @@ class ConnectionPool:
         self.pool_size = pool_size
         self.connections: asyncio.Queue = asyncio.Queue(maxsize=pool_size)
         self._initialized = False
+        self._closed = False
         self.lock = asyncio.Lock()
+        self._all_connections = set()
         
         # CRITICAL: Ensure database directory exists
         if self.db_path not in (':memory:', '') and not self.db_path.startswith('file:'):
@@ -476,12 +470,12 @@ class ConnectionPool:
 
             # CRITICAL FIX: Create temporary connection for schema initialization
             # This ensures schema is visible to all subsequent connections
-            temp_conn = await aiosqlite.connect(
-                self.db_path,
-                isolation_level=None
-            )
-            
+            temp_conn = None
             try:
+                temp_conn = await aiosqlite.connect(
+                    self.db_path,
+                    isolation_level=None
+                )
                 # Enable WAL mode and foreign keys
                 await temp_conn.execute("PRAGMA foreign_keys = ON")
                 await temp_conn.execute("PRAGMA journal_mode = WAL")
@@ -949,7 +943,6 @@ class ConnectionPool:
                     error_type=type(e).__name__,
                     exc_info=True
                 )
-                await temp_conn.close()
                 raise
             
             finally:
@@ -957,7 +950,7 @@ class ConnectionPool:
                 # is safely persisted and new connections will see it.
                 # For :memory: DBs: do NOT close temp_conn here; we add it to
                 # the pool below so the schema is preserved.
-                if not _is_memory_db:
+                if temp_conn is not None and not _is_memory_db:
                     await temp_conn.close()
 
             # CRITICAL FIX: Small delay to ensure filesystem sync (especially on Windows)
@@ -970,6 +963,7 @@ class ConnectionPool:
                 # Re-use the schema-holding connection as the pool connection.
                 # Opening new connections to ':memory:' would yield fresh empty
                 # databases, losing all schema created above.
+                self._all_connections.add(temp_conn)
                 await self.connections.put(temp_conn)
                 logger.debug("connection_0_added_memory_reuse",
                              table_count="verified_during_schema_init")
@@ -984,29 +978,44 @@ class ConnectionPool:
                         reason="each :memory: connection is isolated; pool capped at 1",
                     )
             else:
-                for i in range(self.pool_size):
-                    conn = await aiosqlite.connect(
-                        self.db_path,
-                        isolation_level=None
-                    )
-                    await conn.execute("PRAGMA foreign_keys = ON")
-                    await conn.execute("PRAGMA journal_mode = WAL")
-                    
-                    # Verify this connection can see tables
-                    cursor = await conn.execute(
-                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
-                    )
-                    table_count = (await cursor.fetchone())[0]
-                    
-                    if table_count == 0:
-                        await conn.close()
-                        raise RuntimeError(
-                            f"Connection {i} cannot see database tables! "
-                            "This indicates a critical race condition."
+                created_connections: List[aiosqlite.Connection] = []
+                try:
+                    for i in range(self.pool_size):
+                        conn = await aiosqlite.connect(
+                            self.db_path,
+                            isolation_level=None
                         )
-                    
-                    await self.connections.put(conn)
-                    logger.debug(f"connection_{i}_added", table_count=table_count)
+                        await conn.execute("PRAGMA foreign_keys = ON")
+                        await conn.execute("PRAGMA journal_mode = WAL")
+                        
+                        # Verify this connection can see tables
+                        cursor = await conn.execute(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+                        )
+                        table_count = (await cursor.fetchone())[0]
+                        
+                        if table_count == 0:
+                            await conn.close()
+                            raise RuntimeError(
+                                f"Connection {i} cannot see database tables! "
+                                "This indicates a critical race condition."
+                            )
+                        
+                        created_connections.append(conn)
+                        self._all_connections.add(conn)
+                        await self.connections.put(conn)
+                        logger.debug(f"connection_{i}_added", table_count=table_count)
+                except Exception:
+                    while not self.connections.empty():
+                        queued_conn = await self.connections.get()
+                        if queued_conn in created_connections:
+                            created_connections.remove(queued_conn)
+                        self._all_connections.discard(queued_conn)
+                        await queued_conn.close()
+                    for conn in created_connections:
+                        self._all_connections.discard(conn)
+                        await conn.close()
+                    raise
             
             self._initialized = True
             logger.info(
@@ -1017,19 +1026,56 @@ class ConnectionPool:
     
     async def acquire(self) -> aiosqlite.Connection:
         """Acquire connection from pool."""
+        if self._closed:
+            raise RuntimeError("Connection pool is closed")
         if not self._initialized:
             await self.initialize()
         return await self.connections.get()
     
     async def release(self, conn: aiosqlite.Connection):
         """Release connection back to pool."""
+        if self._closed:
+            self._all_connections.discard(conn)
+            await conn.close()
+            return
         await self.connections.put(conn)
     
     async def close_all(self):
         """Close all connections."""
+        if self._closed:
+            return
+
+        self._closed = True
+
         while not self.connections.empty():
-            conn = await self.connections.get()
-            await conn.close()
+            await self.connections.get()
+
+        connections_to_close = list(self._all_connections)
+        self._all_connections.clear()
+        for conn in connections_to_close:
+            thread = getattr(conn, "_thread", None)
+            tx_queue = getattr(conn, "_tx", None)
+            raw_connection = getattr(conn, "_connection", None)
+            if thread is not None and tx_queue is not None and raw_connection is not None:
+                conn._running = False
+
+                def close_and_stop():
+                    if conn._connection is not None:
+                        conn._connection.close()
+                        conn._connection = None
+                    return aiosqlite_core._STOP_RUNNING_SENTINEL
+
+                tx_queue.put_nowait((None, close_and_stop))
+                await asyncio.to_thread(thread.join, 1.0)
+            else:
+                await conn.close()
+
+        # aiosqlite finishes worker-thread shutdown asynchronously after the
+        # close future resolves; yield once so pytest doesn't tear the loop down
+        # before those callbacks drain on Windows.
+        await asyncio.sleep(0.05)
+
+        self._initialized = False
         
         logger.info("connection_pool_closed")
 
@@ -1084,6 +1130,9 @@ class AsyncLedger:
         self.cache_misses = 0
         self.total_query_time_ms = 0.0
         self._write_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+        self._closed = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @staticmethod
     def _normalize_utc_text(value: Any) -> str:
@@ -1159,8 +1208,16 @@ class AsyncLedger:
     
     async def initialize(self):
         """Explicitly initialize database schema and connection pool."""
+        self._loop = asyncio.get_running_loop()
         await self.pool.initialize()
         logger.info("async_ledger_ready")
+
+    async def __aenter__(self):
+        await self.initialize()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
     
     async def _execute_query(
         self,
@@ -1196,32 +1253,35 @@ class AsyncLedger:
             cursor = await conn.execute(query, params)
 
             result = None
-            if fetch_one:
-                result = await cursor.fetchone()
-                if result and cursor.description:
-                    columns = [col[0] for col in cursor.description]
-                    converted = self._convert_row(result, columns)
-                    if as_dict:
-                        result = dict(zip(columns, converted))
-                    else:
-                        result = converted
-            elif fetch_all:
-                result = await cursor.fetchall()
-                if result and cursor.description:
-                    columns = [col[0] for col in cursor.description]
-                    if as_dict:
-                        result = [
-                            dict(zip(columns, self._convert_row(row, columns)))
-                            for row in result
-                        ]
-                    else:
-                        result = [
-                            self._convert_row(row, columns)
-                            for row in result
-                        ]
-            
-            if commit:
-                await conn.commit()
+            try:
+                if fetch_one:
+                    result = await cursor.fetchone()
+                    if result and cursor.description:
+                        columns = [col[0] for col in cursor.description]
+                        converted = self._convert_row(result, columns)
+                        if as_dict:
+                            result = dict(zip(columns, converted))
+                        else:
+                            result = converted
+                elif fetch_all:
+                    result = await cursor.fetchall()
+                    if result and cursor.description:
+                        columns = [col[0] for col in cursor.description]
+                        if as_dict:
+                            result = [
+                                dict(zip(columns, self._convert_row(row, columns)))
+                                for row in result
+                            ]
+                        else:
+                            result = [
+                                self._convert_row(row, columns)
+                                for row in result
+                            ]
+
+                if commit:
+                    await conn.commit()
+            finally:
+                await cursor.close()
             
             # Metrics
             query_time_ms = (time.time() - start_time) * 1000
@@ -1419,16 +1479,19 @@ class AsyncLedger:
                     (f"Trade {side} {quantity} @ {price}", "TRADE", strategy, order_id)
                 )
                 tx_id = cursor.lastrowid
+                await cursor.close()
 
                 cursor = await conn.execute(
                     "SELECT id FROM accounts WHERE account_name = 'Positions' LIMIT 1"
                 )
                 positions_account = (await cursor.fetchone())[0]
+                await cursor.close()
 
                 cursor = await conn.execute(
                     "SELECT id FROM accounts WHERE account_name = 'Cash' LIMIT 1"
                 )
                 cash_account = (await cursor.fetchone())[0]
+                await cursor.close()
 
                 await conn.execute(
                     "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
@@ -1463,6 +1526,7 @@ class AsyncLedger:
                     )
                 )
                 position_id = cursor.lastrowid
+                await cursor.close()
 
                 await conn.execute(
                     """
@@ -1577,6 +1641,7 @@ class AsyncLedger:
                     (position_id,)
                 )
                 row = await cursor.fetchone()
+                await cursor.close()
                 if not row:
                     raise ValueError("position_not_found")
 
@@ -1598,26 +1663,31 @@ class AsyncLedger:
                     (f"Exit {side} position {position_id}", "TRADE_EXIT", strategy, exit_order_id or str(position_id))
                 )
                 tx_id = cursor.lastrowid
+                await cursor.close()
 
                 cursor = await conn.execute(
                     "SELECT id FROM accounts WHERE account_name = 'Positions' LIMIT 1"
                 )
                 positions_account = (await cursor.fetchone())[0]
+                await cursor.close()
 
                 cursor = await conn.execute(
                     "SELECT id FROM accounts WHERE account_name = 'Cash' LIMIT 1"
                 )
                 cash_account = (await cursor.fetchone())[0]
+                await cursor.close()
 
                 cursor = await conn.execute(
                     "SELECT id FROM accounts WHERE account_name = 'Trading Revenue' LIMIT 1"
                 )
                 revenue_account = (await cursor.fetchone())[0]
+                await cursor.close()
 
                 cursor = await conn.execute(
                     "SELECT id FROM accounts WHERE account_name = 'Trading Loss' LIMIT 1"
                 )
                 loss_account = (await cursor.fetchone())[0]
+                await cursor.close()
 
                 await conn.execute(
                     "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
@@ -1721,12 +1791,15 @@ class AsyncLedger:
                     (description, "DEPOSIT", "SYSTEM", "INITIAL_DEPOSIT")
                 )
                 txn_id = cursor.lastrowid
+                await cursor.close()
 
                 cursor = await conn.execute("SELECT id FROM accounts WHERE account_name = 'Cash'")
                 cash_account = (await cursor.fetchone())[0]
+                await cursor.close()
 
                 cursor = await conn.execute("SELECT id FROM accounts WHERE account_name = 'Owner Equity'")
                 equity_account = (await cursor.fetchone())[0]
+                await cursor.close()
 
                 await conn.execute(
                     "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
@@ -2615,13 +2688,28 @@ class AsyncLedger:
 
     async def close(self):
         """Close ledger and cleanup resources."""
-        await self.pool.close_all()
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            await self.pool.close_all()
         
         logger.info(
             "async_ledger_closed",
             queries_executed=self.queries_executed,
             cache_hit_rate=self.cache_hits / max(1, self.cache_hits + self.cache_misses)
         )
+
+    def __del__(self):
+        if self._closed:
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(self.close()))
+        except Exception:
+            pass
 
     @asynccontextmanager
     async def transaction(self):

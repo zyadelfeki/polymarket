@@ -44,7 +44,7 @@ rich>=13.7.0,<14.0.0           # Terminal dashboard rendering
 # ==================================================================
 # DATA PROCESSING
 # ==================================================================
-numpy>=1.24.0,<2.0.0           # Numerical computing
+numpy>=1.24.0,<2.0.0           # Hard pin below 2.x: avoid accidental scikit-learn resolver upgrades that break the test/runtime stack
 pandas>=2.1.0,<3.0.0           # Data analysis (optional)
 
 # ==================================================================

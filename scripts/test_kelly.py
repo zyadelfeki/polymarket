@@ -4,7 +4,7 @@ sys.path.append('.')
 from decimal import Decimal
 from risk.kelly_sizer import AdaptiveKellySizer
 
-def test_kelly_sizer():
+def run_kelly_sizer():
     print("\n" + "="*60)
     print("TESTING ADAPTIVE KELLY SIZER")
     print("="*60 + "\n")
@@ -27,7 +27,6 @@ def test_kelly_sizer():
             win_probability=tc["win_prob"],
             payout_odds=tc["payout"],
             edge=tc["edge"],
-            volatility_regime="normal"
         )
         
         print(f"{tc['name']}:")
@@ -49,7 +48,6 @@ def test_kelly_sizer():
         win_probability=0.70,
         payout_odds=2.0,
         edge=0.20,
-        volatility_regime="normal"
     )
     print(f"  Bet size increased to: ${bet_after_wins:.2f}")
     print()
@@ -65,7 +63,6 @@ def test_kelly_sizer():
         win_probability=0.70,
         payout_odds=2.0,
         edge=0.20,
-        volatility_regime="normal"
     )
     print(f"  Bet size reduced to: ${bet_after_losses:.2f}")
     print()
@@ -77,5 +74,5 @@ def test_kelly_sizer():
     return True
 
 if __name__ == "__main__":
-    result = test_kelly_sizer()
+    result = run_kelly_sizer()
     sys.exit(0 if result else 1)

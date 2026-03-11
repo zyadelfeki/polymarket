@@ -18,7 +18,9 @@ class Settings:
     ALCHEMY_API_KEY: str = os.getenv("ALCHEMY_API_KEY", "")
     
     INITIAL_CAPITAL: Decimal = Decimal(os.getenv("INITIAL_CAPITAL", "15.00"))
+    MICRO_CAPITAL_THRESHOLD: Decimal = Decimal(os.getenv("MICRO_CAPITAL_THRESHOLD", "50.00"))
     MAX_POSITION_SIZE_PCT: float = float(os.getenv("MAX_POSITION_SIZE_PCT", "20"))
+    MAX_AGGREGATE_EXPOSURE: Decimal = Decimal(os.getenv("MAX_AGGREGATE_EXPOSURE", "20.0"))
     MAX_DRAWDOWN_PCT: float = float(os.getenv("MAX_DRAWDOWN_PCT", "15"))
     MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.03"))
     MIN_CONFIDENCE: float = float(os.getenv("MIN_CONFIDENCE", "0.70"))
@@ -104,6 +106,7 @@ class Settings:
         logger.info("POLYMARKET BOT V2 - PRODUCTION CONFIG")
         logger.info("="*60)
         logger.info(f"Capital: ${cls.INITIAL_CAPITAL}")
+        logger.info(f"Micro Threshold: ${cls.MICRO_CAPITAL_THRESHOLD}")
         logger.info(f"Paper Trading: {cls.PAPER_TRADING}")
         logger.info(f"Max Position: {cls.MAX_POSITION_SIZE_PCT}%")
         logger.info(f"Max Drawdown: {cls.MAX_DRAWDOWN_PCT}%")

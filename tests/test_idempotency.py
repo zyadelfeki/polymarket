@@ -4,6 +4,7 @@ from decimal import Decimal
 import asyncio
 
 import pytest
+import pytest_asyncio
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
@@ -17,12 +18,13 @@ from database.ledger_async import AsyncLedger
 VALID_MARKET_ID = "0x" + "d" * 64
 
 
-@pytest.fixture(autouse=True)
+@pytest_asyncio.fixture(autouse=True)
 async def cleanup_after_test():
     """Cleanup async resources after each test to prevent hanging."""
     yield
     # Cancel all pending tasks
-    tasks = [t for t in asyncio.all_tasks() if not t.done()]
+    current_task = asyncio.current_task()
+    tasks = [t for t in asyncio.all_tasks() if not t.done() and t is not current_task]
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)

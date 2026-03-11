@@ -515,15 +515,16 @@ class Ledger:
                 (txn_id,)
             )
             total = Decimal(str(cursor.fetchone()[0] or "0"))
-            if abs(total) > Decimal("0"):
+            if total != Decimal("0"):
                 adjustment = -total
                 adjustment_account = revenue_id if adjustment < 0 else loss_id
+                adjustment_amount = str(adjustment) if Decimal(_format_amount(adjustment)) == Decimal("0.00") else _format_amount(adjustment)
                 conn.execute(
                     """
                     INSERT INTO transaction_lines (transaction_id, account_id, amount)
                     VALUES (?, ?, ?)
                     """,
-                    (txn_id, adjustment_account, _format_amount(adjustment))
+                    (txn_id, adjustment_account, adjustment_amount)
                 )
 
             conn.execute(

@@ -100,18 +100,23 @@ class LatencyArbitrageEngine:
         self.polymarket_client = polymarket_client
         self.execution = execution_service
         self.circuit_breaker = circuit_breaker
+
+        def _decimal_from_config(value) -> Decimal:
+            if isinstance(value, Decimal):
+                return value
+            return Decimal(str(value))
         
         # Configuration
         self.config = config or {}
         self.market_id = self.config.get('market_id', 'btc_to_100k')
         self.token_id = self.config.get('token_id')
-        self.min_spread_bps = to_decimal(self.config.get('min_spread_bps', '50'))  # 0.5%
-        self.max_spread_bps = to_decimal(self.config.get('max_spread_bps', '500'))  # 5% (sanity)
-        self.max_position_pct = to_decimal(self.config.get('max_position_pct', '10.0'))  # 10% of equity
-        self.poll_interval = to_decimal(self.config.get('poll_interval', '2.0'))  # Poll Polymarket every 2s
-        self.btc_target = to_decimal(self.config.get('btc_target', '100000'))  # Target price
-        self.fee_rate = to_decimal(self.config.get('fee_rate', '0.02'))
-        self.min_profit_buffer_pct = to_decimal(self.config.get('min_profit_buffer_pct', '0.05'))
+        self.min_spread_bps = _decimal_from_config(self.config.get('min_spread_bps', '50'))  # 0.5%
+        self.max_spread_bps = _decimal_from_config(self.config.get('max_spread_bps', '500'))  # 5% (sanity)
+        self.max_position_pct = _decimal_from_config(self.config.get('max_position_pct', '10.0'))  # 10% of equity
+        self.poll_interval = _decimal_from_config(self.config.get('poll_interval', '2.0'))  # Poll Polymarket every 2s
+        self.btc_target = _decimal_from_config(self.config.get('btc_target', '100000'))  # Target price
+        self.fee_rate = _decimal_from_config(self.config.get('fee_rate', '0.02'))
+        self.min_profit_buffer_pct = _decimal_from_config(self.config.get('min_profit_buffer_pct', '0.05'))
         self.health_pause_seconds = int(self.config.get('health_pause_seconds', 3600))
         
         # State
