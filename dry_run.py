@@ -1,407 +1,148 @@
 #!/usr/bin/env python3
 """
-Dry Run: Single Loop Execution
+Dry Run: Pre-launch smoke test — BTCPriceLevelScanner path.
 
-Shows actual logs from:
-  Binance Tick -> Signal Generation -> Risk Check -> Execution -> Ledger
+Runs exactly 2 scan cycles with PAPER_TRADING=true.
+Per cycle:
+  1. circuit_breaker.is_trading_allowed() — gate must pass before scanning
+  2. BTCPriceLevelScanner.scan() — finds opportunities via Charlie gate
+  3. Every opportunity found is printed; no orders are ever placed.
 
-This is what the senior engineer wants to see.
+Pass criteria:
+  - Both cycles complete without exception
+  - is_trading_allowed() is called once per cycle
+  - No place_bet / place_order calls anywhere in this script
 """
 
 import asyncio
-from datetime import datetime
-from decimal import Decimal
+import os
+
+# Force paper-trading mode before any other imports load Settings.
+os.environ["PAPER_TRADING"] = "true"
+
+import logging
 import sys
+from decimal import Decimal
 from pathlib import Path
-import structlog
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from data_feeds.binance_websocket_v2 import BinanceWebSocketV2
+from config.settings import Settings
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
-from database.ledger_async import AsyncLedger
-from services.execution_service_v2 import ExecutionServiceV2
-from risk.circuit_breaker_v2 import CircuitBreakerV2
+from integrations.charlie_booster import CharliePredictionGate
+from risk.circuit_breaker import CircuitBreaker
+from strategies.btc_price_level_scanner import BTCPriceLevelScanner
 
-structlog.configure(
-    processors=[
-        structlog.stdlib.add_log_level,
-        structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S.%f", utc=True),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.dev.ConsoleRenderer()
-    ],
-    wrapper_class=structlog.stdlib.BoundLogger,
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    cache_logger_on_first_use=True,
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
 )
+logger = logging.getLogger("dry_run")
 
-logger = structlog.get_logger(__name__)
+NUM_CYCLES = 2
 
 
-class DryRun:
-    """Single execution loop demonstrating the full flow."""
-    
-    def __init__(self):
-        self.ledger = None
-        self.api_client = None
-        self.execution = None
-        self.circuit_breaker = None
-        self.websocket = None
-        
-        self.tick_count = 0
-        self.max_ticks = 3
-        self.test_complete = asyncio.Event()
-    
-    async def initialize(self):
-        """Initialize all components."""
-        logger.info("=" * 60)
-        logger.info("DRY RUN INITIALIZATION")
-        logger.info("=" * 60)
-        
-        # 1. Ledger
-        logger.info("Initializing ledger...")
-        self.ledger = AsyncLedger(db_path=":memory:", pool_size=5)
-        
-        # CRITICAL: Explicitly initialize schema BEFORE any queries
-        await self.ledger.initialize()
-        
-        # Initial capital
-        initial_capital = Decimal('10000')
-        await self.ledger.record_deposit(initial_capital, "Initial capital")
-        
-        equity = await self.ledger.get_equity()
-        logger.info(
-            "ledger_initialized",
-            initial_capital=float(initial_capital),
-            current_equity=float(equity)
-        )
-        
-        # 2. API Client
-        logger.info("Initializing API client...")
-        self.api_client = PolymarketClientV2(
-            private_key=None,
-            paper_trading=True,
-            rate_limit=10.0
-        )
-        logger.info("api_client_initialized", paper_trading=True)
-        
-        # 3. Circuit Breaker
-        logger.info("Initializing circuit breaker...")
-        self.circuit_breaker = CircuitBreakerV2(
-            initial_equity=equity,
-            max_drawdown_pct=15.0,
-            max_loss_streak=5,
-            daily_loss_limit_pct=10.0
-        )
-        logger.info(
-            "circuit_breaker_initialized",
-            initial_equity=float(equity),
-            max_drawdown_pct=15.0
-        )
-        
-        # 4. Execution Service
-        logger.info("Initializing execution service...")
-        self.execution = ExecutionServiceV2(
-            polymarket_client=self.api_client,
-            ledger=self.ledger
-        )
-        await self.execution.start()
-        logger.info("execution_service_initialized")
-        
-        # 5. WebSocket
-        logger.info("Initializing Binance WebSocket...")
-        self.websocket = BinanceWebSocketV2(
-            symbols=['BTC'],
-            on_price_update=self._on_price_update
-        )
-        await self.websocket.start()
-        logger.info("binance_websocket_connected", symbols=['BTC'])
-        
-        logger.info("=" * 60)
-        logger.info("ALL COMPONENTS INITIALIZED")
-        logger.info("=" * 60)
-    
-    async def _on_price_update(self, symbol: str, price_data):
-        """Main strategy loop triggered by price updates."""
-        if symbol != 'BTC':
-            return
-        
-        self.tick_count += 1
-        
-        if self.tick_count > self.max_ticks:
-            if not self.test_complete.is_set():
-                self.test_complete.set()
-            return
-        
-        logger.info("\n" + "=" * 60)
-        logger.info(f"TICK #{self.tick_count} - BINANCE PRICE UPDATE")
-        logger.info("=" * 60)
-        
-        # STEP 1: Binance Tick
-        logger.info(
-            "binance_price_received",
-            symbol=symbol,
-            price=float(price_data.price),
-            timestamp=price_data.timestamp.isoformat()
-        )
-        
+async def main() -> None:
+    SEP = "=" * 60
+
+    print(SEP)
+    print("POLYMARKET DRY RUN  (PAPER_TRADING=true)")
+    print(f"Cycles to run : {NUM_CYCLES}")
+    print(f"Strategy      : BTCPriceLevelScanner")
+    print(f"Real orders   : NONE")
+    print(SEP)
+
+    # --- Component setup -------------------------------------------------------
+    equity: Decimal = Settings.INITIAL_CAPITAL
+
+    api_client = PolymarketClientV2(
+        private_key=None,
+        paper_trading=True,
+        rate_limit=8.0,
+    )
+    charlie_gate = CharliePredictionGate(kelly_sizer=None)
+    scanner = BTCPriceLevelScanner()
+    circuit_breaker = CircuitBreaker(initial_capital=equity)
+
+    logger.info(
+        "components_ready  equity=%s  paper_trading=%s",
+        equity,
+        api_client.paper_trading,
+    )
+
+    # Defensive assertion: confirm paper_trading flag is set before we run.
+    assert api_client.paper_trading, "BUG: api_client.paper_trading must be True in dry run"
+
+    # --- Cycle loop ------------------------------------------------------------
+    total_opportunities: int = 0
+
+    for cycle in range(1, NUM_CYCLES + 1):
+        print(f"\n{SEP}")
+        print(f"CYCLE {cycle}/{NUM_CYCLES}")
+        print(SEP)
+
+        # Gate 1: circuit breaker (required every cycle)
+        allowed = circuit_breaker.is_trading_allowed()
+        logger.info("circuit_breaker_check  cycle=%d  allowed=%s  reason=%s",
+                    cycle, allowed, circuit_breaker.breaker_reason)
+        if not allowed:
+            logger.warning(
+                "cycle_skipped  cycle=%d  reason=%s", cycle, circuit_breaker.breaker_reason
+            )
+            continue
+
+        # Gate 2: scan for opportunities
         try:
-            # STEP 2: Signal Generation
-            logger.info("\n--- SIGNAL GENERATION ---")
-            
-            signal = {
-                'action': 'BUY',
-                'market_id': 'market_btc_100k',
-                'token_id': 'token_yes',
-                'side': 'YES',
-                'confidence': 0.75,
-                'target_price': Decimal('0.52'),
-                'quantity': Decimal('50')
-            }
-            
-            logger.info(
-                "signal_generated",
-                action=signal['action'],
-                market=signal['market_id'],
-                side=signal['side'],
-                confidence=signal['confidence'],
-                target_price=float(signal['target_price']),
-                quantity=float(signal['quantity'])
+            opportunities = await scanner.scan(
+                charlie_gate=charlie_gate,
+                api_client=api_client,
+                equity=equity,
+                max_days_to_expiry=7,
             )
-            
-            # STEP 3: Risk Check
-            logger.info("\n--- RISK CHECK ---")
-            
-            current_equity = await self.ledger.get_equity()
-            can_trade = await self.circuit_breaker.can_trade(current_equity)
-            
-            logger.info(
-                "circuit_breaker_check",
-                can_trade=can_trade,
-                state=self.circuit_breaker.state.value,
-                current_equity=float(current_equity)
-            )
-            
-            if not can_trade:
-                logger.warning(
-                    "trade_blocked_by_circuit_breaker",
-                    reason="Circuit breaker is OPEN",
-                    status=self.circuit_breaker.get_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("scan_error  cycle=%d  error=%s", cycle, exc, exc_info=True)
+            continue
+
+        if not opportunities:
+            logger.info("no_opportunities_found  cycle=%d", cycle)
+        else:
+            logger.info("opportunities_found  cycle=%d  count=%d", cycle, len(opportunities))
+            for idx, opp in enumerate(opportunities, start=1):
+                market_id = opp.get("market_id", "unknown")
+                question = opp.get("question", "")[:80]
+                confidence = opp.get("confidence", "?")
+                edge = opp.get("edge", "?")
+                side = opp.get("true_outcome") or opp.get("side", "?")
+                print(
+                    f"  [{cycle}.{idx}] market={market_id}  side={side}"
+                    f"  confidence={confidence}  edge={edge}"
+                    f"  q={question!r}"
                 )
-                return
-            
-            # Position sizing
-            position_value = signal['quantity'] * signal['target_price']
-            max_position_size = current_equity * Decimal('0.10')
-            
-            if position_value > max_position_size:
-                logger.warning(
-                    "position_size_exceeded",
-                    position_value=float(position_value),
-                    max_allowed=float(max_position_size),
-                    action="skipping trade"
-                )
-                return
-            
-            logger.info(
-                "risk_check_passed",
-                position_value=float(position_value),
-                max_allowed=float(max_position_size)
-            )
-            
-            # STEP 4: Order Execution
-            logger.info("\n--- ORDER EXECUTION ---")
-            
-            result = await self.execution.place_order(
-                strategy="latency_arb",
-                market_id=signal['market_id'],
-                token_id=signal['token_id'],
-                side=signal['side'],
-                quantity=signal['quantity'],
-                price=signal['target_price'],
-                metadata={
-                    'trigger_price': float(price_data.price),
-                    'confidence': signal['confidence'],
-                    'tick': self.tick_count
-                }
-            )
-            
-            if result.success:
-                logger.info(
-                    "order_executed_successfully",
-                    order_id=result.order_id,
-                    status=result.status.value,
-                    filled_quantity=float(result.filled_quantity),
-                    average_price=float(result.filled_price) if result.filled_price else None,
-                    fees=float(result.fees)
-                )
-            else:
-                logger.error(
-                    "order_execution_failed",
-                    error=result.error
-                )
-                return
-            
-            # STEP 5: Ledger Update
-            logger.info("\n--- LEDGER UPDATE ---")
-            
-            updated_equity = await self.ledger.get_equity()
-            positions = await self.ledger.get_open_positions()
-            
-            logger.info(
-                "ledger_updated",
-                equity=float(updated_equity),
-                open_positions=len(positions),
-                pnl=float(updated_equity - current_equity)
-            )
-            
-            if positions:
-                latest_position = positions[-1]
-                logger.info(
-                    "position_opened",
-                    position_id=latest_position.id,
-                    market=latest_position.market_id,
-                    quantity=float(latest_position.quantity),
-                    entry_price=float(latest_position.entry_price)
-                )
-            
-            # STEP 6: Update Circuit Breaker
-            simulated_pnl = Decimal('5.50')
-            await self.circuit_breaker.record_trade_result(
-                updated_equity,
-                simulated_pnl
-            )
-            
-            logger.info(
-                "circuit_breaker_updated",
-                pnl=float(simulated_pnl),
-                status=self.circuit_breaker.get_status()
-            )
-            
-            logger.info("=" * 60)
-            logger.info(f"TICK #{self.tick_count} COMPLETE\n")
-            
-        except Exception as e:
-            logger.error(
-                "tick_processing_failed",
-                tick=self.tick_count,
-                error=str(e),
-                error_type=type(e).__name__,
-                exc_info=True
-            )
-    
-    async def run(self):
-        """Run dry run test."""
-        logger.info("\n" + "=" * 60)
-        logger.info("STARTING DRY RUN")
-        logger.info("=" * 60)
-        logger.info(f"Processing {self.max_ticks} Binance ticks...\n")
-        
-        try:
-            await asyncio.wait_for(
-                self.test_complete.wait(),
-                timeout=60.0
-            )
-        except asyncio.TimeoutError:
-            logger.warning("dry_run_timeout", message="No price updates received in 60s")
-        
-        await self._print_summary()
-    
-    async def _print_summary(self):
-        """Print execution summary."""
-        logger.info("\n" + "=" * 60)
-        logger.info("DRY RUN SUMMARY")
-        logger.info("=" * 60)
-        
-        equity = await self.ledger.get_equity()
-        positions = await self.ledger.get_open_positions()
-        orders = list(self.execution.orders.values())
-        
-        logger.info(
-            "final_state",
-            ticks_processed=self.tick_count,
-            orders_placed=len(orders),
-            open_positions=len(positions),
-            final_equity=float(equity),
-            profit_loss=float(equity - Decimal('10000'))
-        )
-        
-        cb_status = self.circuit_breaker.get_status()
-        logger.info(
-            "circuit_breaker_final_status",
-            state=cb_status['state'],
-            trades=cb_status['total_trades'],
-            wins=cb_status['winning_trades'],
-            losses=cb_status['losing_trades']
-        )
-        
-        logger.info("=" * 60)
-        logger.info("DRY RUN COMPLETE")
-        logger.info("=" * 60)
-    
-    async def cleanup(self):
-        """Cleanup components."""
-        logger.info("\nCleaning up...")
-        
-        if self.execution:
-            await self.execution.stop()
-        
-        if self.websocket:
-            await self.websocket.stop()
-        
-        if self.api_client:
-            await self.api_client.close()
-        
-        if self.ledger:
-            await self.ledger.close()
-        
-        logger.info("Cleanup complete")
+
+        total_opportunities += len(opportunities)
+
+        # No order placement here — smoke test confirms circuit breaker is
+        # called and scanner runs cleanly.  place_bet is never invoked.
+
+    # --- Summary ---------------------------------------------------------------
+    print(f"\n{SEP}")
+    print("DRY RUN SUMMARY")
+    print(SEP)
+    print(f"  Cycles run          : {NUM_CYCLES}")
+    print(f"  Total opportunities : {total_opportunities}")
+    print(f"  Real orders placed  : 0")
+    print(f"  PAPER_TRADING env   : {os.environ.get('PAPER_TRADING')}")
+    print(SEP)
+    logger.info("dry_run_complete  cycles=%d  opportunities=%d  orders=0",
+                NUM_CYCLES, total_opportunities)
 
 
-async def main():
-    """Run dry run."""
-    dry_run = DryRun()
-    
-    try:
-        await dry_run.initialize()
-        await dry_run.run()
-    
-    except KeyboardInterrupt:
-        logger.info("Dry run interrupted by user")
-    
-    except Exception as e:
-        logger.error(
-            "dry_run_failed",
-            error=str(e),
-            error_type=type(e).__name__,
-            exc_info=True
-        )
-    
-    finally:
-        await dry_run.cleanup()
 
-
-if __name__ == '__main__':
-    print("\n" + "=" * 60)
-    print("POLYMARKET DRY RUN")
-    print("=" * 60)
-    print("\nThis demonstrates the full execution flow:")
-    print("  1. Binance WebSocket Tick")
-    print("  2. Signal Generation")
-    print("  3. Risk Check (Circuit Breaker)")
-    print("  4. Order Execution")
-    print("  5. Ledger Update")
-    print("\nStarting in 3 seconds...\n")
-    
-    asyncio.run(asyncio.sleep(2))
-    
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\nDry run terminated by user.")
-    
-    print("\n" + "=" * 60)
-    print("DRY RUN COMPLETE")
-    print("="*60 + "\n")
+        print("\nDry run interrupted by user.")
+
