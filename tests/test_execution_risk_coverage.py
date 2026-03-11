@@ -104,5 +104,111 @@ async def test_executor_calculate_bet_size_and_kelly():
     assert bet_size > Decimal("0")
 
 
+# ---------------------------------------------------------------------------
+# Circuit-breaker gate on TradeExecutor
+# ---------------------------------------------------------------------------
+
+def test_trade_executor_requires_circuit_breaker():
+    """TradeExecutor must refuse to instantiate without a circuit_breaker."""
+    from unittest.mock import MagicMock
+    from execution.trade_executor import TradeExecutor
+
+    with pytest.raises(RuntimeError, match="circuit_breaker required"):
+        TradeExecutor(
+            polymarket_client=MagicMock(),
+            bankroll_tracker=MagicMock(),
+            kelly_sizer=MagicMock(),
+            db=MagicMock(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_trade_blocked_when_circuit_breaker_tripped():
+    """execute_trade must return False and never call place_bet when breaker is open."""
+    from unittest.mock import MagicMock, AsyncMock
+    from execution.trade_executor import TradeExecutor
+
+    mock_polymarket = AsyncMock()
+    mock_polymarket.place_bet = AsyncMock(return_value=True)
+
+    mock_kelly = MagicMock()
+    mock_kelly.calculate_bet_size.return_value = 1.50
+
+    mock_bankroll = MagicMock()
+    mock_db = MagicMock()
+    mock_db.log_trade.return_value = 1
+
+    mock_breaker = MagicMock()
+    mock_breaker.is_trading_allowed.return_value = False
+    mock_breaker.breaker_reason = "Max drawdown exceeded: 20.0%"
+
+    executor = TradeExecutor(
+        polymarket_client=mock_polymarket,
+        bankroll_tracker=mock_bankroll,
+        kelly_sizer=mock_kelly,
+        db=mock_db,
+        circuit_breaker=mock_breaker,
+    )
+
+    opportunity = {
+        "market_id": "test_market",
+        "side": "YES",
+        "confidence": 0.75,
+        "edge": 0.10,
+        "market_price": 0.50,
+    }
+
+    result = await executor.execute_trade(opportunity)
+
+    assert result is False
+    mock_polymarket.place_bet.assert_not_called()
+    mock_breaker.is_trading_allowed.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_trade_records_after_placement():
+    """execute_trade must call circuit_breaker.record_trade after a successful bet."""
+    from unittest.mock import MagicMock, AsyncMock, call
+    from execution.trade_executor import TradeExecutor
+
+    mock_polymarket = AsyncMock()
+    mock_polymarket.place_bet = AsyncMock(return_value=True)
+
+    mock_kelly = MagicMock()
+    mock_kelly.calculate_bet_size.return_value = 2.00
+
+    mock_bankroll = MagicMock()
+    mock_db = MagicMock()
+    mock_db.log_trade.return_value = 42
+
+    mock_breaker = MagicMock()
+    mock_breaker.is_trading_allowed.return_value = True
+
+    executor = TradeExecutor(
+        polymarket_client=mock_polymarket,
+        bankroll_tracker=mock_bankroll,
+        kelly_sizer=mock_kelly,
+        db=mock_db,
+        circuit_breaker=mock_breaker,
+    )
+
+    opportunity = {
+        "market_id": "test_market",
+        "side": "YES",
+        "confidence": 0.80,
+        "edge": 0.12,
+        "market_price": 0.50,
+    }
+
+    result = await executor.execute_trade(opportunity)
+
+    assert result is True
+    mock_breaker.record_trade.assert_called_once()
+    call_kwargs = mock_breaker.record_trade.call_args
+    # profit should be negative (capital at risk)
+    profit_arg = call_kwargs[1].get("profit") or call_kwargs[0][0]
+    assert profit_arg < Decimal("0"), "record_trade profit must be negative on trade open"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

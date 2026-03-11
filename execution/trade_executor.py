@@ -1,4 +1,5 @@
 import asyncio
+from decimal import Decimal
 from typing import Dict, Optional
 import logging
 from datetime import datetime
@@ -6,14 +7,23 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 class TradeExecutor:
-    def __init__(self, polymarket_client, bankroll_tracker, kelly_sizer, db):
+    def __init__(self, polymarket_client, bankroll_tracker, kelly_sizer, db, circuit_breaker=None):
+        if circuit_breaker is None:
+            raise RuntimeError("circuit_breaker required")
         self.polymarket = polymarket_client
         self.bankroll = bankroll_tracker
         self.kelly = kelly_sizer
         self.db = db
+        self.circuit_breaker = circuit_breaker
         self.execution_queue = asyncio.Queue()
     
     async def execute_trade(self, opportunity: Dict) -> bool:
+        if not self.circuit_breaker.is_trading_allowed():
+            logger.warning(
+                f"Trade blocked by circuit breaker: {self.circuit_breaker.breaker_reason}"
+            )
+            return False
+
         market_id = opportunity['market_id']
         side = opportunity.get('true_outcome', opportunity.get('side', 'YES'))
         confidence = opportunity['confidence']
@@ -58,6 +68,9 @@ class TradeExecutor:
             trade_record['db_id'] = trade_id
             trade_record['trade_id'] = f"trade_{trade_id}"
             self.bankroll.add_trade(trade_record)
+            self.circuit_breaker.record_trade(
+                profit=-Decimal(str(bet_size)), win=False
+            )
             
             logger.info(f"✅ Trade executed successfully | ID: {trade_id}")
             return True
