@@ -137,6 +137,44 @@ async def test_llm_cache_ttl_expiry():
     assert await cache.get("mkt_002", "Will BTC reach $90k?") is None
 
 
+# ---------------------------------------------------------------------------
+# Task 4 — LLMCache backward-compat: any value type must survive a round-trip
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_llm_cache_stores_tuple_and_dict_without_coercion():
+    """
+    Cache must store and return any value type without coercing it.
+
+    Legacy producers stored 2-tuples (vetoed, confidence).
+    Current producers store dicts {anomaly, coherence, edge_quality}.
+    Both must survive a round-trip so a rolling deploy never serves garbled data.
+    """
+    from ai.llm_cache import LLMCache
+
+    cache = LLMCache()
+
+    # --- 2-tuple (legacy format) ---
+    await cache.set("mkt_legacy", "Will BTC reach $85k?", (False, None))
+    legacy_result = await cache.get("mkt_legacy", "Will BTC reach $85k?")
+    assert legacy_result == (False, None), (
+        f"2-tuple round-trip failed: got {legacy_result!r}"
+    )
+
+    # --- dict (current format written by LLMWorker) ---
+    current_payload = {"anomaly": False, "coherence": None, "edge_quality": None}
+    await cache.set("mkt_current", "Will BTC reach $85k?", current_payload)
+    current_result = await cache.get("mkt_current", "Will BTC reach $85k?")
+    assert current_result == current_payload, (
+        f"Dict round-trip failed: got {current_result!r}"
+    )
+
+    # --- question-hash guard: same key, different question must miss ---
+    assert await cache.get("mkt_current", "Will ETH reach $5k?") is None, (
+        "Cache must not serve an entry whose question hash does not match"
+    )
+
+
 @pytest.mark.asyncio
 async def test_llm_worker_enqueue_does_not_block():
     """Enqueueing past maxsize must not raise; queue stays within maxsize."""
@@ -240,6 +278,40 @@ async def test_edge_quality_passthrough_on_failure():
 
     assert result.score == 0.5
     assert result.source == "passthrough"
+
+
+# ---------------------------------------------------------------------------
+# Feedback loop tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_regime_guard_no_double_fire():
+    """Two concurrent calls that both see a cache miss must fire LLM exactly once."""
+    import asyncio as _asyncio
+    import ai.regime_guard as rg
+    rg._regime_cache.clear()
+
+    call_count = 0
+
+    async def _controlled_llm(prompt, *, expect_json=False):
+        nonlocal call_count
+        call_count += 1
+        # Small delay so both coroutines can overlap before the first returns
+        await _asyncio.sleep(0.05)
+        return {"safe_to_trade": True, "regime_label": "STABLE", "confidence": 0.9, "reason": "test"}
+
+    with patch("ai.regime_guard.llm_query", new=_controlled_llm):
+        results = await _asyncio.gather(
+            rg.get_regime_verdict(btc_price=84000.0, rsi=50.0, price_change_1h=0.0, atr_pct=1.0, open_positions=0),
+            rg.get_regime_verdict(btc_price=84000.0, rsi=50.0, price_change_1h=0.0, atr_pct=1.0, open_positions=0),
+        )
+
+    # The lock must ensure only one real LLM call fires
+    assert call_count == 1, f"Expected 1 LLM call but got {call_count}"
+    # Both callers must get a valid verdict
+    for v in results:
+        assert v.safe_to_trade is True
+        assert v.regime_label == "STABLE"
 
 
 # ---------------------------------------------------------------------------

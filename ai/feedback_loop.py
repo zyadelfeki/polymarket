@@ -48,7 +48,7 @@ async def record_decision(
         "outcome": None,  # filled in by resolve()
         "pnl": None,      # filled in by resolve()
     }
-    asyncio.get_event_loop().run_in_executor(None, _append_line, json.dumps(record))
+    asyncio.get_running_loop().run_in_executor(None, _append_line, json.dumps(record))
 
 
 def _append_line(line: str) -> None:
@@ -65,7 +65,7 @@ async def resolve_decision(market_id: str, outcome: str, pnl: float) -> None:
     Rewrites the last matching unresolved record in-place (in memory then full rewrite).
     Only called if file is small enough (< 10 MB) — skip otherwise.
     """
-    asyncio.get_event_loop().run_in_executor(None, _resolve_sync, market_id, outcome, pnl)
+    asyncio.get_running_loop().run_in_executor(None, _resolve_sync, market_id, outcome, pnl)
 
 
 def _resolve_sync(market_id: str, outcome: str, pnl: float) -> None:

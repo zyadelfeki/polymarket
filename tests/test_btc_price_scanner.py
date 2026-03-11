@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -132,3 +133,31 @@ async def test_btc_price_scanner_skips_irrelevant_non_btc_market():
 
     assert opportunities == []
     assert gate.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Task 3 — Binance features must expose all keys required by regime_guard
+# ---------------------------------------------------------------------------
+
+def test_binance_features_includes_regime_guard_keys():
+    """
+    get_candle_features() must return price, rsi_14, price_change_1h, and atr_pct.
+    These are required by regime_guard.get_regime_verdict(); without them the
+    LLM always receives zeros and the regime analysis is meaningless.
+    """
+    from data_feeds.binance_features import get_candle_features
+
+    # 30 candles is enough to compute all features (need ≥ 27 for EMA-26)
+    fake_closes = [84000.0 + float(i) * 10 for i in range(30)]
+
+    with patch("data_feeds.binance_features._fetch_candles", return_value=fake_closes):
+        features = get_candle_features("BTC")
+
+    assert features is not None, "get_candle_features must return a dict for valid data"
+    required_keys = {"price", "rsi_14", "price_change_1h", "atr_pct"}
+    missing = required_keys - features.keys()
+    assert not missing, f"Missing regime guard keys in binance_features: {missing}"
+
+    # Sanity-check values are non-trivially default
+    assert features["price"] > 0, "price must be the last close, not zero"
+    assert features["atr_pct"] > 0, "atr_pct must be positive"

@@ -228,6 +228,27 @@ def get_candle_features(asset: str) -> Optional[Dict[str, float]]:
         ]
         vol_20d = _std(log_returns) if len(log_returns) >= 2 else None
 
+        # --- Regime guard keys ---
+        # Current price (last close from the candle series)
+        price = last_close
+
+        # 1-hour price change: 4 × 15m candles back
+        price_1h_ago = closes[-5] if len(closes) >= 5 else closes[0]
+        price_change_1h = ((last_close - price_1h_ago) / price_1h_ago * 100.0
+                           if price_1h_ago != 0.0 else 0.0)
+
+        # ATR% over last 14 candles as a volatility proxy.
+        # Requires high/low candle data; we approximate using close-to-close range.
+        # True ATR needs raw klines, but close std ÷ mean gives a comparable signal.
+        atr_window = closes[-15:] if len(closes) >= 15 else closes
+        if len(atr_window) >= 2:
+            ranges = [abs(atr_window[i] - atr_window[i - 1]) for i in range(1, len(atr_window))]
+            atr_raw = sum(ranges) / len(ranges)
+            mean_price = sum(atr_window) / len(atr_window)
+            atr_pct = (atr_raw / mean_price * 100.0) if mean_price != 0.0 else 1.0
+        else:
+            atr_pct = 1.0
+
         features = {
             k: v for k, v in {
                 "rsi_14": rsi_val,
@@ -235,6 +256,9 @@ def get_candle_features(asset: str) -> Optional[Dict[str, float]]:
                 "price_vs_sma20": price_vs_sma20,
                 "price_vs_sma50": price_vs_sma50,
                 "volatility_20d": vol_20d,
+                "price": price,
+                "price_change_1h": price_change_1h,
+                "atr_pct": atr_pct,
             }.items()
             if v is not None
         }
@@ -248,6 +272,9 @@ def get_candle_features(asset: str) -> Optional[Dict[str, float]]:
             symbol=symbol,
             rsi_14=round(features.get("rsi_14", 0), 2),
             macd=round(features.get("macd", 0), 6),
+            price=round(features.get("price", 0), 2),
+            price_change_1h=round(features.get("price_change_1h", 0), 4),
+            atr_pct=round(features.get("atr_pct", 0), 4),
             price_vs_sma20=round(features.get("price_vs_sma20", 0), 6),
             price_vs_sma50=round(features.get("price_vs_sma50", 0), 6),
             volatility_20d=round(features.get("volatility_20d", 0), 6),

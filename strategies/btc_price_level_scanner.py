@@ -223,10 +223,13 @@ class BTCPriceLevelScanner:
                         if btc_extra_features else 0
                     )
                     _end_dt_enq = self._extract_market_datetime(market)
-                    _minutes_expiry = (
-                        int((_end_dt_enq - datetime.now(timezone.utc)).total_seconds() / 60)
-                        if _end_dt_enq else 30
-                    )
+                    if _end_dt_enq:
+                        _minutes_expiry = int(
+                            (_end_dt_enq - datetime.now(timezone.utc)).total_seconds() / 60
+                        )
+                    else:
+                        logger.debug("minutes_to_expiry_unavailable", market_id=market_id)
+                        _minutes_expiry = 30
                     _llm_worker_mod._singleton_worker.enqueue([{
                         "market_id":        market_id,
                         "question":         question,

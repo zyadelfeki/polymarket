@@ -6,6 +6,7 @@ Result is cached for REGIME_CACHE_TTL_SECONDS. LLM failure = PASS.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any, Dict
@@ -39,6 +40,11 @@ _SUPPRESS_CONFIDENCE_THRESHOLD = 0.70
 # Module-level cache: simple dict avoids a global singleton class
 _regime_cache: Dict[str, Any] = {}
 
+# Prevents concurrent LLM calls before the first cache entry is populated.
+# Without this, two scan cycles starting simultaneously both see a cache miss
+# and both fire the ~9.6s Phi-3 call at the same time.
+_regime_lock = asyncio.Lock()
+
 
 @dataclass
 class RegimeVerdict:
@@ -71,46 +77,55 @@ async def get_regime_verdict(
     """
     now = time.monotonic()
 
+    # Fast path: return cached result without acquiring the lock
     cached_entry = _regime_cache.get("verdict")
     expires_at = _regime_cache.get("expires_at", 0.0)
     if cached_entry is not None and now < expires_at:
         return cached_entry
 
-    prompt = _REGIME_PROMPT_TEMPLATE.format(
-        btc_price=btc_price,
-        rsi=rsi,
-        price_change_1h=price_change_1h,
-        atr_pct=atr_pct,
-        open_positions=open_positions,
-    )
+    async with _regime_lock:
+        # Re-check after acquiring the lock — another coroutine may have populated
+        # the cache while we were waiting, making a second LLM call unnecessary.
+        cached_entry = _regime_cache.get("verdict")
+        expires_at = _regime_cache.get("expires_at", 0.0)
+        if cached_entry is not None and now < expires_at:
+            return cached_entry
 
-    raw = await llm_query(prompt, expect_json=True)
-
-    if not isinstance(raw, dict):
-        _regime_cache["verdict"] = _PASSTHROUGH
-        _regime_cache["expires_at"] = now + REGIME_CACHE_TTL_SECONDS
-        return _PASSTHROUGH
-
-    try:
-        llm_safe = bool(raw.get("safe_to_trade", True))
-        label = str(raw.get("regime_label", "UNKNOWN"))
-        confidence = float(raw.get("confidence", 0.0))
-        reason = str(raw.get("reason", ""))
-
-        # Only suppress when confidence is high enough to trust the veto
-        if not llm_safe and confidence < _SUPPRESS_CONFIDENCE_THRESHOLD:
-            llm_safe = True
-
-        verdict = RegimeVerdict(
-            safe_to_trade=llm_safe,
-            regime_label=label,
-            confidence=confidence,
-            reason=reason,
-            source="llm",
+        prompt = _REGIME_PROMPT_TEMPLATE.format(
+            btc_price=btc_price,
+            rsi=rsi,
+            price_change_1h=price_change_1h,
+            atr_pct=atr_pct,
+            open_positions=open_positions,
         )
-    except Exception:
-        verdict = _PASSTHROUGH
 
-    _regime_cache["verdict"] = verdict
-    _regime_cache["expires_at"] = now + REGIME_CACHE_TTL_SECONDS
-    return verdict
+        raw = await llm_query(prompt, expect_json=True)
+
+        if not isinstance(raw, dict):
+            _regime_cache["verdict"] = _PASSTHROUGH
+            _regime_cache["expires_at"] = now + REGIME_CACHE_TTL_SECONDS
+            return _PASSTHROUGH
+
+        try:
+            llm_safe = bool(raw.get("safe_to_trade", True))
+            label = str(raw.get("regime_label", "UNKNOWN"))
+            confidence = float(raw.get("confidence", 0.0))
+            reason = str(raw.get("reason", ""))
+
+            # Only suppress when confidence is high enough to trust the veto
+            if not llm_safe and confidence < _SUPPRESS_CONFIDENCE_THRESHOLD:
+                llm_safe = True
+
+            verdict = RegimeVerdict(
+                safe_to_trade=llm_safe,
+                regime_label=label,
+                confidence=confidence,
+                reason=reason,
+                source="llm",
+            )
+        except Exception:
+            verdict = _PASSTHROUGH
+
+        _regime_cache["verdict"] = verdict
+        _regime_cache["expires_at"] = now + REGIME_CACHE_TTL_SECONDS
+        return verdict
