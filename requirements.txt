@@ -97,7 +97,7 @@ click>=8.1.0,<9.0.0            # CLI framework (optional)
 # ==================================================================
 # NOTIFICATIONS (Optional)
 # ==================================================================
-python-telegram-bot>=20.7,<21.0  # Telegram bot API (optional)
+python-telegram-bot>=21.0,<23.0  # Telegram bot API (optional)
 
 # ==================================================================
 # PLATFORM SPECIFIC
