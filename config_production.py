@@ -8,7 +8,7 @@ from decimal import Decimal
 # risk budget (max_exposure_pct=0.50) to compute sizes 100x too small vs a
 # $1,000+ bankroll.  Update this to your real balance before starting.
 # ---------------------------------------------------------------------------
-STARTING_CAPITAL = Decimal("13.98")  # TODO: replace with real deployed capital
+STARTING_CAPITAL = Decimal("17.95")  # TODO: replace with real deployed capital
 
 # ---------------------------------------------------------------------------
 # Charlie signal gate configuration
