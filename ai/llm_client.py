@@ -1,7 +1,7 @@
 """
 Local LLM client — Phi-3 Mini 3.8B via ollama (localhost:11434).
 Hardware: i3-8100, 16 GB DDR4, GTX 1050 Ti 4 GB VRAM.
-Hard timeout: 3 seconds. Failure = None, never raises.
+Hard timeout: 15 seconds. Failure = None, never raises.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import aiohttp
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "phi3:3.8b"
-TIMEOUT_SECONDS = 3.0
+TIMEOUT_SECONDS = 15.0
 
 
 async def llm_query(
