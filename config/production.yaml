@@ -94,6 +94,11 @@ runtime_controls:
     enabled: true
     seed_static_blocklist: true
     auto_review_after_days: 7
+  # Sniper feature flag.
+  # Keep false until a real Charlie p_win is injected on the sniper path.
+  # Setting true with the 0.5 placeholder active will make last-second size
+  # decisions on a coin-flip prior — guaranteed to bleed money.
+  sniper_enabled: false
   session_snapshot_interval_seconds: 60
 
 # ==================================================================

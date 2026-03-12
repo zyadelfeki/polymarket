@@ -455,7 +455,14 @@ class TradingSystem:
         self._last_session_snapshot_at: float = 0.0
         self._paper_session_start: Optional[str] = None
         self.last_discovered_markets = []
-        self.market_sniper = MarketSniper()
+        # Sniper is only instantiated when explicitly enabled in config.
+        # sniper_enabled must be True AND a real Charlie p_win must be wired
+        # before enabling — using the 0.5 placeholder will bleed money.
+        _sniper_enabled = (
+            config.get("runtime_controls", {})
+            .get("sniper_enabled", False)
+        )
+        self.market_sniper = MarketSniper() if _sniper_enabled else None
         self.binance_trade_feed: Optional[BinanceTradeFeed] = None
         startup_config = config.get('startup', {})
 
@@ -3001,7 +3008,10 @@ class TradingSystem:
                     except Exception as _oracle_exc:
                         logger.warning("oracle_scan_failed", error=str(_oracle_exc))
 
-                    # Last-second sniper check — log only
+                    # Last-second sniper — only runs when sniper_enabled: true in
+                    # production.yaml AND a real Charlie p_win has been wired.
+                    # Currently disabled (sniper_enabled: false).  Do NOT re-enable
+                    # with the Decimal("0.5") placeholder — inject a real p_win first.
                     if self.market_sniper:
                         for _mkt in self.last_discovered_markets:
                             try:
@@ -3016,12 +3026,10 @@ class TradingSystem:
                                         _mkt_price = Decimal(
                                             str(_mkt.get("market_price") or "0.50")
                                         )
-                                        # TODO(sniper): wire real Charlie p_win here once the
-                                        # signal is available on the sniper path.  Using 0.5
-                                        # means should_snipe() operates on a coin-flip prior,
-                                        # silently affecting size decisions.  Either inject a
-                                        # real signal or gate behind a feature flag.
-                                        _p_win = Decimal("0.5")  # placeholder — see TODO above
+                                        # Wire real Charlie p_win here before enabling.
+                                        # The 0.5 placeholder below is a coin-flip prior and
+                                        # must not reach should_snipe() in production.
+                                        _p_win = Decimal("0.5")  # BLOCKED: replace before enabling
                                         if self.market_sniper.should_snipe(
                                             _mkt, _p_win, _mkt_price
                                         ):

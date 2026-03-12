@@ -29,7 +29,9 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Tunable thresholds
 # ---------------------------------------------------------------------------
-MIN_TRADES_TO_EVALUATE = 5    # need at least 5 settled trades before judging
+MIN_TRADES_TO_EVALUATE = 3    # need at least 3 settled trades before judging
+                              # (lowered from 5 on 2026-03-12: 5 allowed up to 4
+                              # losing trades on a new bad market before blocking)
 MAX_LOSS_RATE = 0.80          # block if losing more than 80% of settled trades
 MIN_PNL_THRESHOLD = -200.0    # block if total PnL on this market < -$200
 

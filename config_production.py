@@ -1,6 +1,14 @@
 from decimal import Decimal
 
-STARTING_CAPITAL = Decimal("13.98")
+# ---------------------------------------------------------------------------
+# ⚠️  ACTION REQUIRED BEFORE ANY LIVE RUN
+# STARTING_CAPITAL must equal your actual deployed bankroll.
+# Current value ($13.98) is a stale residual balance captured 2026-03-06 and
+# is NOT a valid capital figure.  Using it will cause Kelly and the global
+# risk budget (max_exposure_pct=0.50) to compute sizes 100x too small vs a
+# $1,000+ bankroll.  Update this to your real balance before starting.
+# ---------------------------------------------------------------------------
+STARTING_CAPITAL = Decimal("13.98")  # TODO: replace with real deployed capital
 
 # ---------------------------------------------------------------------------
 # Charlie signal gate configuration
@@ -75,6 +83,17 @@ LOGGING_CONFIG = {
     "backup_count": 5,
     "console_output": True,
 }
+
+# ---------------------------------------------------------------------------
+# OFI graduation tracking
+# OFI_POLICY_ACTIVE = False — OFI features are computed and logged every order
+# but never used as a gate.  Graduation requires:
+#   1. Collect ≥30 days of OFI observations alongside trade outcomes.
+#   2. Run offline Sharpe comparison: with vs without OFI filter.
+#   3. If OFI Sharpe improvement ≥0.1 and p-value <0.05, flip to True.
+# Milestone owner: assign before 2026-04-01 or remove the dead code path.
+# ---------------------------------------------------------------------------
+OFI_POLICY_ACTIVE = False  # keep False until offline Sharpe test is complete
 
 SAFETY_CONFIG = {
     "enable_kill_switch_check": True,
