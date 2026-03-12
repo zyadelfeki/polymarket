@@ -2373,6 +2373,31 @@ class TradingSystem:
                     deposited=str(shortfall),
                     new_target=str(initial_capital),
                 )
+            elif paper_trading and equity > initial_capital:
+                # In paper mode the DB may carry a stale balance from a prior
+                # session that was seeded with a different initial_capital (e.g.
+                # $10,000 from a dev run vs the real $17.95 micro-capital config).
+                # A balance that is wildly above initial_capital causes Kelly sizer
+                # to compute position sizes orders of magnitude too large and
+                # silences micro_capital_gate entirely.
+                #
+                # SAFETY: this branch is paper-only.  In live mode we NEVER auto-
+                # adjust the ledger — real P&L history must never be overwritten.
+                excess = equity - initial_capital
+                await self._await_step(
+                    "ledger.record_withdrawal.paper_reset",
+                    self.ledger.record_withdrawal(
+                        excess,
+                        f"Paper session reset: stale equity {equity} → initial_capital {initial_capital}"
+                    ),
+                )
+                logger.warning(
+                    "paper_equity_reset",
+                    previous_equity=str(equity),
+                    withdrawn=str(excess),
+                    new_target=str(initial_capital),
+                    reason="stale_balance_from_prior_paper_run",
+                )
 
             if paper_trading:
                 # Paper mode: force-close stale OPEN positions from prior paper runs

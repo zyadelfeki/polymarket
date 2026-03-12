@@ -1835,6 +1835,87 @@ class AsyncLedger:
             finally:
                 await self.pool.release(conn)
 
+    async def record_withdrawal(self, amount: Decimal, description: str = "Withdrawal") -> int:
+        """
+        Record a cash withdrawal using double-entry accounting.
+
+        This is the exact inverse of record_deposit:
+        - DEBIT: Owner Equity account (equity decreases)
+        - CREDIT: Cash account (asset decreases)
+
+        Intended use: paper-trading session reset — remove stale balance
+        from a prior paper run before seeding correct initial_capital.
+        Must NEVER be called in live mode to adjust real balances.
+
+        Args:
+            amount: Withdrawal amount (positive Decimal — will be subtracted)
+            description: Description for the audit trail
+
+        Returns:
+            transaction_id: The ID of the created transaction
+        """
+        amount = Decimal(str(amount))
+        if amount <= Decimal("0"):
+            raise ValueError(f"Withdrawal amount must be positive, got {amount}")
+
+        async with self._write_lock:
+            conn = await self.pool.acquire()
+            try:
+                await conn.execute("BEGIN")
+                cursor = await conn.execute(
+                    """
+                    INSERT INTO transactions (description, transaction_type, strategy, reference_id, timestamp)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (description, "WITHDRAWAL", "SYSTEM", "PAPER_RESET")
+                )
+                txn_id = cursor.lastrowid
+                await cursor.close()
+
+                cursor = await conn.execute("SELECT id FROM accounts WHERE account_name = 'Cash'")
+                cash_account = (await cursor.fetchone())[0]
+                await cursor.close()
+
+                cursor = await conn.execute("SELECT id FROM accounts WHERE account_name = 'Owner Equity'")
+                equity_account = (await cursor.fetchone())[0]
+                await cursor.close()
+
+                # CREDIT Cash (asset decreases — negative entry)
+                await conn.execute(
+                    "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
+                    (txn_id, cash_account, str(-amount))
+                )
+
+                # DEBIT Owner Equity (equity decreases — positive entry reverses credit from deposit)
+                await conn.execute(
+                    "INSERT INTO transaction_lines (transaction_id, account_id, amount) VALUES (?, ?, ?)",
+                    (txn_id, equity_account, str(amount))
+                )
+
+                await conn.execute(
+                    "INSERT INTO audit_log (operation, entity_type, entity_id, details) VALUES (?, ?, ?, ?)",
+                    (
+                        "CREATE",
+                        "TRANSACTION",
+                        txn_id,
+                        decimal_dumps({"amount": amount, "type": "WITHDRAWAL"})
+                    )
+                )
+
+                await conn.execute("COMMIT")
+
+                self.equity_cache.clear()
+                self.position_cache.clear()
+
+                return txn_id
+
+            except Exception:
+                await conn.execute("ROLLBACK")
+                raise
+
+            finally:
+                await self.pool.release(conn)
+
     async def close_stale_positions(self) -> int:
         """
         Mark all currently OPEN positions as STALE_CLOSED on bot startup.
