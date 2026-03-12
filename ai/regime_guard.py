@@ -7,13 +7,20 @@ Result is cached for REGIME_CACHE_TTL_SECONDS. LLM failure = PASS.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Dict
 
 from ai.llm_client import llm_query
 
-REGIME_CACHE_TTL_SECONDS = 120  # re-evaluate every 2 minutes
+logger = logging.getLogger(__name__)
+
+# Cache TTL lowered 120 → 60 s (2026-03-12).
+# With a 15 s scan cycle, 120 s meant one LLM verdict controlled 8 consecutive
+# cycles: a recovered flash-crash would still suppress trades for up to 110 s.
+# 60 s = ~4 cycles — a reasonable amortisation that still avoids per-cycle LLM calls.
+REGIME_CACHE_TTL_SECONDS = 60
 
 _REGIME_PROMPT_TEMPLATE = """\
 [INST] You are a macro market analyst. Answer with ONLY valid JSON.
@@ -77,10 +84,20 @@ async def get_regime_verdict(
     """
     now = time.monotonic()
 
-    # Fast path: return cached result without acquiring the lock
+    # Fast path: return cached result without acquiring the lock.
+    # Logs a DEBUG line so operators can confirm the guard is running live
+    # vs returning a stale cached verdict.
     cached_entry = _regime_cache.get("verdict")
     expires_at = _regime_cache.get("expires_at", 0.0)
     if cached_entry is not None and now < expires_at:
+        cache_age = now - (expires_at - REGIME_CACHE_TTL_SECONDS)
+        logger.debug(
+            "regime_cache_hit regime=%s safe=%s confidence=%.2f age=%.1fs",
+            cached_entry.regime_label,
+            cached_entry.safe_to_trade,
+            cached_entry.confidence,
+            cache_age,
+        )
         return cached_entry
 
     async with _regime_lock:
