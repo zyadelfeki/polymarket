@@ -53,9 +53,15 @@ KELLY_CONFIG = {
 }
 
 CIRCUIT_BREAKER_CONFIG = {
+    # NOTE: max_daily_loss is an absolute floor, not pct-based.
+    # Review and update this when deployed capital exceeds $100.
     "max_daily_loss": Decimal("2.00"),
-    "max_drawdown_pct": Decimal("25.0"),
-    "max_consecutive_losses": 5,
+    # FIXED 2026-03-12: was 25.0 — now matches PERFORMANCE_TRACKER_CONFIG.max_drawdown_halt (15%).
+    # The old 25% allowed the bot to blow through the soft 15% halt and keep
+    # losing until the circuit breaker finally fired at 25%.  Both stops must agree.
+    "max_drawdown_pct": Decimal("15.0"),
+    # FIXED 2026-03-12: was 5 — lowered to 4 for tighter protection on micro-bankroll.
+    "max_consecutive_losses": 4,
     "adaptive_risk_profile": True,
     "max_single_trade_loss": Decimal("0.70"),
     "cooldown_after_trip_seconds": 3600,
