@@ -472,6 +472,7 @@ class TradingSystem:
         # None = classifier not yet initialised; first maintenance tick sets it.
         self._dynamic_regime: Optional[str] = None
         self._dynamic_regime_ts: float = 0.0   # monotonic; gate against rapid updates
+        self._meta_gate_last_model_mtime: float = 0.0  # tracks last loaded model mtime for hot-reload
         self.init_timeout_seconds = float(startup_config.get('component_timeout_seconds', 25.0))
         self.network_timeout_seconds = float(startup_config.get('network_timeout_seconds', 20.0))
         self.loop_tick_seconds = float(startup_config.get('loop_tick_seconds', 10.0))
@@ -1930,7 +1931,6 @@ class TradingSystem:
                 quantity = quantize_quantity(order_value / price) if price > Decimal("0") else quantity
                 logger.info(
                     "regime_size_adjustment",
-                    event="regime_size_adjustment",
                     market_id=market_id,
                     regime=_dyn_regime,
                     regime_kelly_frac=str(_regime_kelly_frac),
@@ -3245,7 +3245,6 @@ class TradingSystem:
                 if _new_regime != self._dynamic_regime:
                     logger.info(
                         "regime_changed",
-                        event="regime_changed",
                         old_regime=self._dynamic_regime,
                         new_regime=_new_regime,
                         vol_5min=round(_regime_feats.get("vol_5min", 0) or 0, 5),
@@ -3264,9 +3263,9 @@ class TradingSystem:
                 from ml.meta_gate import _MODEL_PATH as _mgp, reload_model as _reload_meta
                 if _mgp.exists():
                     _mgp_mtime = _mgp.stat().st_mtime
-                    if getattr(self._periodic_maintenance, "_last_model_mtime", 0) < _mgp_mtime:
+                    if self._meta_gate_last_model_mtime < _mgp_mtime:
                         _reload_meta()
-                        self._periodic_maintenance._last_model_mtime = _mgp_mtime  # type: ignore[attr-defined]
+                        self._meta_gate_last_model_mtime = _mgp_mtime
                         logger.info("meta_gate_model_hot_reloaded", mtime=_mgp_mtime)
             except Exception as _mr_exc:
                 logger.warning("meta_gate_hot_reload_check_failed", error=str(_mr_exc))
