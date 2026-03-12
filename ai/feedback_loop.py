@@ -69,27 +69,46 @@ async def resolve_decision(market_id: str, outcome: str, pnl: float) -> None:
 
 
 def _resolve_sync(market_id: str, outcome: str, pnl: float) -> None:
+    """
+    Forward-scan to find the LAST unresolved record for market_id, then patch
+    that specific line in-place and rewrite the file.
+
+    Previous implementation used reversed() + insert(0, ...) which silently
+    moved the resolved record to line 1, corrupting the chronological log.
+    Fixed 2026-03-12: forward scan tracks target_idx; only that line is touched.
+    """
     try:
         if not DECISIONS_FILE.exists():
             return
         if DECISIONS_FILE.stat().st_size > 10 * 1024 * 1024:
-            return  # skip large files
+            return  # skip large files — analytics pipeline handles these
         lines = DECISIONS_FILE.read_text(encoding="utf-8").splitlines()
-        updated = []
-        resolved = False
-        for line in reversed(lines):
-            if not resolved:
-                try:
-                    rec = json.loads(line)
-                    if rec.get("market_id") == market_id and rec.get("outcome") is None:
-                        rec["outcome"] = outcome
-                        rec["pnl"] = pnl
-                        updated.insert(0, json.dumps(rec))
-                        resolved = True
-                        continue
-                except Exception:
-                    pass
-            updated.insert(0, line)
-        DECISIONS_FILE.write_text("\n".join(updated) + "\n", encoding="utf-8")
+
+        # Forward scan: keep updating target_idx so we always resolve the LAST
+        # unresolved record for this market (most recent bet, not the oldest).
+        target_idx = None
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+                if rec.get("market_id") == market_id and rec.get("outcome") is None:
+                    target_idx = i
+            except Exception:
+                pass
+
+        if target_idx is None:
+            return  # no unresolved record found — nothing to update
+
+        # Patch exactly that one line; everything else is untouched.
+        try:
+            rec = json.loads(lines[target_idx])
+            rec["outcome"] = outcome
+            rec["pnl"] = pnl
+            lines[target_idx] = json.dumps(rec)
+        except Exception:
+            return
+
+        DECISIONS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except Exception:
         pass
