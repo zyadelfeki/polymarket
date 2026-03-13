@@ -74,3 +74,5 @@ results/
 # Run artifacts
 *.txt
 live_test_*.py
+
+logs/
