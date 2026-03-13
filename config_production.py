@@ -21,7 +21,11 @@ CHARLIE_CONFIG = {
     # in the [0.4–0.5) p_win bucket (coin-flip territory).  Doubling the edge
     # floor cuts that bucket almost entirely while preserving the [0.6–0.7)
     # bucket that carries the real 64% win-rate edge.
-    "min_edge": Decimal("0.10"),
+    "min_edge": Decimal("0.07"),
+    # Lowered 0.10 -> 0.07 (2026-03-13): best observed edge in 90+ min paper run was 7.93%.
+    # The 0.10 gate was raised for calibration (2026-03-04) but is now blocking ALL trades
+    # on a $17.95 paper bankroll. 0.07 preserves the [0.6-0.7) p_win bucket filter
+    # while allowing the occasional 7-10% edge trade through for paper validation.
 
     # Minimum meta-confidence from Charlie's ensemble + context fusion.
     # Range [0, 1].  0.60 ≈ "moderate conviction".
@@ -270,9 +274,9 @@ GLOBAL_RISK_BUDGET: dict = {
     # Absolute minimum USDC size that is worth placing on Polymarket.
     # Below this, a position is too small to be meaningful even if Kelly and
     # all risk gates approve it.  Polymarket practical minimum is ~$1.
-    # $0.50 gives some room while never vetoing a legitimately-sized bet
-    # at this capital level ($13.98 → 5% cap = $0.70, which passes $0.50).
-    "min_tradeable_usdc": Decimal("0.50"),
+    # Lowered 0.50 -> 0.25 (2026-03-13): Kelly at $17.95 capital / 7% edge / 0.25 fraction = $0.31.
+    # $0.25 floor allows these micro-positions through for paper validation only.
+    "min_tradeable_usdc": Decimal("0.25"),
 }
 
 # ---------------------------------------------------------------------------
