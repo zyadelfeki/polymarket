@@ -38,7 +38,7 @@ trading:
   # Position sizing
   max_position_size_pct: "10.0"  # Max 10% per position
   max_total_exposure_pct: "80.0"  # Max 80% total exposure
-  min_position_size: 0.50  # Minimum $0.50 per position
+  min_position_size: 0.25  # Minimum $0.25 per position
   
   # Order limits
   min_order_size: 0.25
