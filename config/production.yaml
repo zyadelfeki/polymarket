@@ -81,7 +81,7 @@ runtime_controls:
     max_active_entries_per_market: 1
     allow_add_on: false
     min_price_improvement_abs: "0.05"
-  max_entry_price_abs: "0.35"
+  max_entry_price_abs: "0.65"  # raised from 0.35 — BTC 15-min markets trade 0.45–0.65
   calibration:
     fail_closed: false
     min_positive_coef: 0.0
