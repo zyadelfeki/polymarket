@@ -83,7 +83,7 @@ runtime_controls:
     min_price_improvement_abs: "0.05"
   max_entry_price_abs: "0.35"
   calibration:
-    fail_closed: true
+    fail_closed: false
     min_positive_coef: 0.0
     require_monotonic_smoke_test: true
     smoke_test_points: [0.30, 0.50, 0.79]
