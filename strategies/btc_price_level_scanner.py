@@ -468,6 +468,7 @@ class BTCPriceLevelScanner:
             "confidence": confidence,
             "charlie_confidence": confidence,
             "direction": direction,
+            "btc_extra_features": btc_extra_features or {},
             "btc_price": float(btc_extra_features.get("price", 0)) if btc_extra_features else None,
             "asset_price": None,
             "start_price": None,

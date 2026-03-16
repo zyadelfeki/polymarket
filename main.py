@@ -1607,12 +1607,18 @@ class TradingSystem:
                 or "BTC"
             )
 
+            # Prefer scanner-provided Binance features from the opportunity payload.
+            _opportunity_features = opportunity.get("btc_extra_features")
+            if isinstance(_opportunity_features, dict) and _opportunity_features:
+                _extra_features = _opportunity_features
+
             # Fetch real Binance technical features (cached 60s; returns None on failure)
             # This is what actually gives Charlie's ML models live market context.
             # Without it every model returns HOLD → p_win=0.5 → coin-flip trades.
-            _extra_features = await asyncio.get_running_loop().run_in_executor(
-                None, _get_binance_features, opp_symbol
-            )
+            if not _extra_features:
+                _extra_features = await asyncio.get_running_loop().run_in_executor(
+                    None, _get_binance_features, opp_symbol
+                )
             if _extra_features is not None:
                 logger.debug(
                     "binance_features_ready",
@@ -1646,7 +1652,7 @@ class TradingSystem:
                     symbol=opp_symbol,
                     timeframe="15m",
                     bankroll=equity,
-                    extra_features=_extra_features,
+                    extra_features=_extra_features or {},
                     market_question=str(opportunity.get("question") or "")[:80],
                     override_win_rate=(
                         self.performance_tracker.get_rolling_win_rate(20)
