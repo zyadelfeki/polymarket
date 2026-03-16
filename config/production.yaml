@@ -113,9 +113,9 @@ runtime_controls:
   pre_trade_admission:
     enabled: true
     min_healthy_providers: 2
-    max_price_divergence_bps: "90"
+    max_price_divergence_bps: "250"
     macro_risk_block_threshold: "2.0"
-    near_expiry_block_minutes: 45
+    near_expiry_block_minutes: 5
   session_snapshot_interval_seconds: 60
 
 # ==================================================================

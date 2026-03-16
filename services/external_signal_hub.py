@@ -27,32 +27,47 @@ class ExternalSignalHub:
         self.price_divergence_bps_limit = Decimal(str(cfg.get("price_divergence_bps_limit", "80")))
         self.max_staleness_seconds = float(cfg.get("max_staleness_seconds", 90.0))
 
-        self.adapters = {
-            "coingecko": CoinGeckoAdapter(
-                ttl_seconds=float(cfg.get("coingecko_ttl_seconds", 45.0)),
-                timeout_seconds=timeout,
-                max_retries=retries,
-            ),
-            "coincap": CoinCapAdapter(
-                ttl_seconds=float(cfg.get("coincap_ttl_seconds", 20.0)),
-                timeout_seconds=timeout,
-                max_retries=retries,
-            ),
-            "coinpaprika": CoinPaprikaAdapter(
-                ttl_seconds=float(cfg.get("coinpaprika_ttl_seconds", 90.0)),
-                timeout_seconds=timeout,
-                max_retries=retries,
-            ),
-            "cryptocompare": CryptoCompareAdapter(
-                ttl_seconds=float(cfg.get("cryptocompare_ttl_seconds", 60.0)),
-                timeout_seconds=timeout,
-                max_retries=retries,
-            ),
-            "fred": FREDAdapter(
-                ttl_seconds=float(cfg.get("fred_ttl_seconds", 3600.0)),
-                timeout_seconds=float(cfg.get("fred_timeout_seconds", 4.0)),
-                max_retries=retries,
-            ),
+        self.adapter_specs = {
+            "coingecko": {
+                "adapter": CoinGeckoAdapter(
+                    ttl_seconds=float(cfg.get("coingecko_ttl_seconds", 45.0)),
+                    timeout_seconds=timeout,
+                    max_retries=retries,
+                ),
+                "quorum_only": True,
+            },
+            "coincap": {
+                "adapter": CoinCapAdapter(
+                    ttl_seconds=float(cfg.get("coincap_ttl_seconds", 20.0)),
+                    timeout_seconds=timeout,
+                    max_retries=retries,
+                ),
+                "quorum_only": True,
+            },
+            "coinpaprika": {
+                "adapter": CoinPaprikaAdapter(
+                    ttl_seconds=float(cfg.get("coinpaprika_ttl_seconds", 90.0)),
+                    timeout_seconds=timeout,
+                    max_retries=retries,
+                ),
+                "quorum_only": True,
+            },
+            "cryptocompare": {
+                "adapter": CryptoCompareAdapter(
+                    ttl_seconds=float(cfg.get("cryptocompare_ttl_seconds", 60.0)),
+                    timeout_seconds=timeout,
+                    max_retries=retries,
+                ),
+                "quorum_only": True,
+            },
+            "fred": {
+                "adapter": FREDAdapter(
+                    ttl_seconds=float(cfg.get("fred_ttl_seconds", 3600.0)),
+                    timeout_seconds=float(cfg.get("fred_timeout_seconds", 4.0)),
+                    max_retries=retries,
+                ),
+                "quorum_only": False,
+            },
         }
 
     async def get_snapshot(
@@ -62,7 +77,8 @@ class ExternalSignalHub:
         btc_spot_binance: Optional[Decimal] = None,
     ) -> ExternalSignalSnapshot:
         providers: Dict[str, ProviderSignal] = {}
-        for name, adapter in self.adapters.items():
+        for name, spec in self.adapter_specs.items():
+            adapter = spec["adapter"]
             providers[name] = await adapter.fetch(symbol=symbol)
 
         alt_candidates = [
@@ -93,16 +109,16 @@ class ExternalSignalHub:
             if stale:
                 stale_provider_count += 1
                 health_flags.append(f"{name}_stale")
-            if signal.provider_ok and not stale:
+            if signal.provider_ok and not stale and self.adapter_specs.get(name, {}).get("quorum_only", True):
                 healthy_provider_count += 1
             if not signal.provider_ok:
                 reason = signal.degraded_reason or "provider_not_ok"
                 health_flags.append(f"{name}_{reason}")
 
         provider_health_score = Decimal("0")
-        total = len(providers)
-        if total > 0:
-            provider_health_score = Decimal(str(healthy_provider_count / total))
+        quorum_total = sum(1 for spec in self.adapter_specs.values() if spec.get("quorum_only", True))
+        if quorum_total > 0:
+            provider_health_score = Decimal(str(healthy_provider_count / quorum_total))
 
         divergence_bps: Optional[Decimal] = None
         price_truth_degraded = False

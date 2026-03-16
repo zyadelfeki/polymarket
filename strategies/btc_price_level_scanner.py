@@ -243,7 +243,15 @@ class BTCPriceLevelScanner:
             except Exception as _llm_err:
                 logger.warning("llm_layer_error", error=str(_llm_err), market_id=market_id)
 
-            opportunities.append(self._build_opportunity(market, recommendation, market_price, question))
+            opportunities.append(
+                self._build_opportunity(
+                    market,
+                    recommendation,
+                    market_price,
+                    question,
+                    btc_extra_features=btc_extra_features,
+                )
+            )
 
             # Enqueue for background LLM inference (non-blocking, fire-and-forget).
             # The worker will update the cache for the *next* scanner pass.
@@ -398,7 +406,14 @@ class BTCPriceLevelScanner:
                     return value
         return None
 
-    def _build_opportunity(self, market: Dict[str, Any], recommendation, market_price: Decimal, question: str) -> Dict[str, Any]:
+    def _build_opportunity(
+        self,
+        market: Dict[str, Any],
+        recommendation,
+        market_price: Decimal,
+        question: str,
+        btc_extra_features: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         side = str(recommendation.side).upper()
         token_id = self._extract_token_id(market, side)
         direction = "UP" if side == "YES" else "DOWN"
@@ -418,7 +433,7 @@ class BTCPriceLevelScanner:
             "confidence": confidence,
             "charlie_confidence": confidence,
             "direction": direction,
-            "btc_price": None,
+            "btc_price": float(btc_extra_features.get("price", 0)) if btc_extra_features else None,
             "asset_price": None,
             "start_price": None,
             "price_change_pct": None,
