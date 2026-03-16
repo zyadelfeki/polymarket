@@ -52,6 +52,7 @@ class BTCPriceLevelScanner:
         self._recent_rejection_ttl_seconds = int(cfg.get("recent_rejection_ttl_seconds", 120))
         self._expired_market_ids: set[str] = set()
         self._closed_market_ids: set[str] = set()
+        self._permanent_rejection_cache: set[str] = set()
         self._recent_rejection_cache: Dict[tuple[str, str], float] = {}
 
     async def scan(
@@ -129,7 +130,11 @@ class BTCPriceLevelScanner:
             if not market_id:
                 continue
 
-            if market_id in self._expired_market_ids or market_id in self._closed_market_ids:
+            if market_id in self._expired_market_ids:
+                continue
+            if market_id in self._closed_market_ids:
+                continue
+            if market_id in self._permanent_rejection_cache:
                 continue
             if self._is_recently_rejected(market_id):
                 continue
@@ -161,6 +166,15 @@ class BTCPriceLevelScanner:
                 self._mark_recent_rejection(market_id, "missing_question", ttl_seconds=120)
                 continue
             after_id_question_filter += 1
+
+            if self._is_permanent_timeframe_mismatch(market):
+                self._permanent_rejection_cache.add(market_id)
+                self._mark_recent_rejection(
+                    market_id,
+                    "no_timeframe_match_from_metadata_or_question",
+                    ttl_seconds=3600,
+                )
+                continue
 
             market_price = self._extract_market_price(market)
             if market_price is None:
@@ -496,3 +510,131 @@ class BTCPriceLevelScanner:
     def _mark_recent_rejection(self, market_id: str, reason: str, ttl_seconds: Optional[int] = None) -> None:
         ttl = int(ttl_seconds if ttl_seconds is not None else self._recent_rejection_ttl_seconds)
         self._recent_rejection_cache[(market_id, reason)] = time.monotonic() + max(1, ttl)
+
+    def _is_permanent_timeframe_mismatch(self, market: Dict[str, Any]) -> bool:
+        question = str(market.get("question") or market.get("title") or "").lower()
+        slug = str(market.get("slug") or "").lower()
+        resolution_raw = (
+            market.get("resolution")
+            or market.get("rules")
+            or market.get("resolution_time")
+            or market.get("resolutionTime")
+            or ""
+        )
+        resolution_text = str(resolution_raw).lower()
+
+        # Any known intraday or daily timeframe hint means this market is not permanent-mismatch.
+        timeframe_tokens = (
+            "15m",
+            "15 min",
+            "15-minute",
+            "1h",
+            "1 hour",
+            "hourly",
+            "4h",
+            "4 hour",
+            "4-hour",
+            "daily",
+            "1d",
+            "day",
+            "intraday",
+            "updown-daily",
+            "updown-4h",
+            "updown-1h",
+            "updown-15m",
+        )
+        combined = " ".join((question, slug, resolution_text))
+        if any(token in combined for token in timeframe_tokens):
+            return False
+
+        duration_seconds = self._extract_duration_seconds(market)
+        if duration_seconds is not None:
+            if 12 * 60 <= duration_seconds <= 18 * 60:
+                return False
+            if 45 * 60 <= duration_seconds <= int(2.5 * 3600):
+                return False
+            if int(3.0 * 3600) <= duration_seconds <= int(6.0 * 3600):
+                return False
+            if int(18 * 3600) <= duration_seconds <= int(36 * 3600):
+                return False
+
+        time_left_seconds = self._extract_time_left_seconds(market)
+        if time_left_seconds is not None:
+            if 30 * 60 <= time_left_seconds <= int(6.5 * 3600):
+                return False
+
+        end_dt = self._extract_market_datetime(market)
+        if end_dt is not None:
+            now_utc = datetime.now(timezone.utc)
+            day_delta = (end_dt.date() - now_utc.date()).days
+            if day_delta in {0, 1}:
+                return False
+
+        return True
+
+    def _extract_duration_seconds(self, market: Dict[str, Any]) -> Optional[int]:
+        start_dt = self._extract_market_datetime_field(
+            market,
+            [
+                "game_start_time",
+                "gameStartTime",
+                "startDate",
+                "start_date",
+                "startTime",
+                "start_time",
+                "open_time",
+                "openTime",
+                "created_at",
+                "createdAt",
+            ],
+        )
+        end_dt = self._extract_market_datetime_field(
+            market,
+            [
+                "end_date_iso",
+                "endDateIso",
+                "endDateISO",
+                "endDate",
+                "end_date",
+                "endTime",
+                "end_time",
+                "closeTime",
+                "close_time",
+                "closes_at",
+                "resolve_time",
+                "resolution_time",
+                "resolutionTime",
+                "expires_at",
+                "expiresAt",
+            ],
+        )
+        if not start_dt or not end_dt:
+            return None
+        return int((end_dt - start_dt).total_seconds())
+
+    def _extract_market_datetime_field(self, market: Dict[str, Any], fields: List[str]) -> Optional[datetime]:
+        for field in fields:
+            raw_value = market.get(field)
+            if raw_value in (None, ""):
+                continue
+            try:
+                parsed = datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    return parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
+            except ValueError:
+                continue
+        return None
+
+    def _extract_time_left_seconds(self, market: Dict[str, Any]) -> Optional[int]:
+        for key in ("time_left_seconds", "timeLeftSeconds", "seconds_to_expiry", "secondsToExpiry"):
+            raw = market.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                value = int(float(raw))
+                if value >= 0:
+                    return value
+            except (TypeError, ValueError):
+                continue
+        return None

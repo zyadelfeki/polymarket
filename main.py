@@ -1232,14 +1232,17 @@ class TradingSystem:
                         error_type=type(e).__name__,
                     )
 
-            if self.btc_price_scanner and self.charlie_gate and self.api_client and self.ledger:
+            if self.btc_price_scanner and self.charlie_gate and self.api_client:
                 try:
-                    equity = await self.ledger.get_equity()
+                    if self.ledger:
+                        equity = to_decimal(await self.ledger.get_equity())
+                    else:
+                        equity = to_decimal(STARTING_CAPITAL)
                     scanner_opportunities = await asyncio.wait_for(
                         self.btc_price_scanner.scan(
                             charlie_gate=self.charlie_gate,
                             api_client=self.api_client,
-                            equity=to_decimal(equity),
+                            equity=equity,
                         ),
                         timeout=self.strategy_scan_timeout_seconds,
                     )
