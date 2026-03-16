@@ -72,6 +72,8 @@ from services.calibration_observation_service import (
 )
 from services.runtime_guard_evaluator import RuntimeGuardEvaluator
 from database.quarantine_repository import QuarantineRepository
+from services.external_signal_hub import ExternalSignalHub
+from services.pre_trade_admission import PreTradeAdmissionGate
 
 # Phase 3-6 features (log-only)
 from data_feeds.arb_scanner import scan_yes_no_arb
@@ -289,6 +291,32 @@ def _resolve_runtime_controls(config: dict) -> dict:
     runtime_controls["session_snapshot_interval_seconds"] = int(
         runtime_controls.get("session_snapshot_interval_seconds", 60)
     )
+
+    external_signals_cfg = runtime_controls.get("external_signals") or {}
+    runtime_controls["external_signals"] = {
+        "enabled": bool(external_signals_cfg.get("enabled", True)),
+        "timeout_seconds": float(external_signals_cfg.get("timeout_seconds", 2.5)),
+        "max_retries": int(external_signals_cfg.get("max_retries", 1)),
+        "max_staleness_seconds": float(external_signals_cfg.get("max_staleness_seconds", 90.0)),
+        "price_divergence_bps_limit": str(
+            external_signals_cfg.get("price_divergence_bps_limit", "80")
+        ),
+        "coincap_ttl_seconds": float(external_signals_cfg.get("coincap_ttl_seconds", 20.0)),
+        "coingecko_ttl_seconds": float(external_signals_cfg.get("coingecko_ttl_seconds", 45.0)),
+        "coinpaprika_ttl_seconds": float(external_signals_cfg.get("coinpaprika_ttl_seconds", 90.0)),
+        "cryptocompare_ttl_seconds": float(external_signals_cfg.get("cryptocompare_ttl_seconds", 60.0)),
+        "fred_ttl_seconds": float(external_signals_cfg.get("fred_ttl_seconds", 3600.0)),
+    }
+
+    admission_cfg = runtime_controls.get("pre_trade_admission") or {}
+    runtime_controls["pre_trade_admission"] = {
+        "enabled": bool(admission_cfg.get("enabled", True)),
+        "min_healthy_providers": int(admission_cfg.get("min_healthy_providers", 2)),
+        "max_price_divergence_bps": str(admission_cfg.get("max_price_divergence_bps", "90")),
+        "macro_risk_block_threshold": str(admission_cfg.get("macro_risk_block_threshold", "2.0")),
+        "near_expiry_block_minutes": int(admission_cfg.get("near_expiry_block_minutes", 45)),
+    }
+
     return config
 
 
@@ -404,6 +432,8 @@ class TradingSystem:
         self.circuit_breaker: Optional[CircuitBreakerV2] = None
         self.strategy_engine: Optional[MultiTimeframeLatencyArbitrageEngine] = None
         self.btc_price_scanner: Optional[BTCPriceLevelScanner] = None
+        self.external_signal_hub: Optional[ExternalSignalHub] = None
+        self.pre_trade_admission: Optional[PreTradeAdmissionGate] = None
         self.strategy_scan_lock = asyncio.Lock()
         self.last_strategy_scan_at = 0.0
 
@@ -443,6 +473,7 @@ class TradingSystem:
             "blocked_max_entry_price": 0,
             "blocked_bad_calibration": 0,
             "observe_only_bad_calibration": 0,
+            "blocked_external_admission": 0,
             "orders_submitted": 0,
         }
         self._calibration_guard_status: Dict[str, Any] = {
@@ -1947,6 +1978,74 @@ class TradingSystem:
                     trigger=trigger,
                 )
                 return
+
+            if self.pre_trade_admission is not None:
+                admission_verdict = await self._safe_await(
+                    "pre_trade_admission.evaluate",
+                    self.pre_trade_admission.evaluate(
+                        opportunity=opportunity,
+                        market_price=price,
+                        side=side,
+                        trade_confidence=confidence,
+                    ),
+                    timeout_seconds=6.0,
+                    default=None,
+                )
+                if admission_verdict is None:
+                    self._session_stats["blocked_external_admission"] += 1
+                    logger.warning(
+                        "order_blocked_external_admission",
+                        market_id=market_id,
+                        reason="admission_unavailable",
+                        trigger=trigger,
+                    )
+                    return
+
+                if not admission_verdict.allowed:
+                    self._session_stats["blocked_external_admission"] += 1
+                    logger.warning(
+                        "order_blocked_external_admission",
+                        market_id=market_id,
+                        reason=admission_verdict.block_reason,
+                        health_flags=admission_verdict.health_flags,
+                        trigger=trigger,
+                    )
+                    return
+
+                _admission_size_mult = Decimal(str(admission_verdict.size_multiplier))
+                _admission_conf_mult = Decimal(str(admission_verdict.confidence_multiplier))
+                _admission_size_mult = max(Decimal("0.10"), min(Decimal("1.50"), _admission_size_mult))
+                _admission_conf_mult = max(Decimal("0.10"), min(Decimal("1.50"), _admission_conf_mult))
+
+                if _admission_size_mult != Decimal("1.0"):
+                    order_value = quantize_quantity(order_value * _admission_size_mult)
+                    quantity = quantize_quantity(order_value / price) if price > Decimal("0") else quantity
+                    if order_value < min_position_size - Decimal("0.01"):
+                        self._session_stats["blocked_external_admission"] += 1
+                        logger.warning(
+                            "order_blocked_external_admission",
+                            market_id=market_id,
+                            reason="size_after_admission_below_minimum",
+                            order_value=str(order_value),
+                            min_position_size=str(min_position_size),
+                            health_flags=admission_verdict.health_flags,
+                            trigger=trigger,
+                        )
+                        return
+                    logger.info(
+                        "external_admission_size_adjustment",
+                        market_id=market_id,
+                        size_multiplier=str(_admission_size_mult),
+                        adjusted_order_value=str(order_value),
+                        adjusted_quantity=str(quantity),
+                        health_flags=admission_verdict.health_flags,
+                    )
+
+                if charlie_conf_dec is not None and _admission_conf_mult != Decimal("1.0"):
+                    charlie_conf_dec = max(
+                        Decimal("0.01"),
+                        min(Decimal("0.99"), charlie_conf_dec * _admission_conf_mult),
+                    )
         else:
             logger.error(
                 "opportunity_blocked_charlie_unavailable",
@@ -2516,6 +2615,18 @@ class TradingSystem:
             )
             logger.info("component_construct_success", component="execution_service")
             await self._await_step("execution_service.start", self.execution.start())
+
+            # 6b. External data hardening layer.
+            ext_cfg = self.runtime_controls.get("external_signals", {})
+            admission_cfg = self.runtime_controls.get("pre_trade_admission", {})
+            self.external_signal_hub = ExternalSignalHub(ext_cfg)
+            self.pre_trade_admission = PreTradeAdmissionGate(self.external_signal_hub, admission_cfg)
+            logger.info(
+                "component_construct_success",
+                component="pre_trade_admission",
+                external_signals_enabled=bool(ext_cfg.get("enabled", True)),
+                admission_enabled=bool(admission_cfg.get("enabled", True)),
+            )
 
             # 7. Health Monitor
             monitor_config = self.config.get('monitoring', {})

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from main import TradingSystem
+from models.external_signals import AdmissionVerdict
 from services.execution_service_v2 import OrderResult, OrderStatus
 
 
@@ -31,6 +32,14 @@ class _StaticCharlieGate:
 
     async def evaluate_market(self, **kwargs):
         return self._recommendation
+
+
+class _StaticAdmissionGate:
+    def __init__(self, verdict: AdmissionVerdict) -> None:
+        self._verdict = verdict
+
+    async def evaluate(self, **kwargs):
+        return self._verdict
 
 
 def _build_config() -> dict:
@@ -116,6 +125,42 @@ async def test_execute_opportunity_skips_when_circuit_breaker_blocks():
         "edge": Decimal("0.05"),
         "market_price": Decimal("0.50"),
         "confidence": "MEDIUM",
+    }
+
+    await system._execute_opportunity(opportunity=opportunity, trigger="test")
+
+    assert system.execution.place_order_with_risk_check.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_opportunity_skips_when_external_admission_blocks():
+    system = TradingSystem(_build_config())
+    system.execution = AsyncMock()
+    system.ledger = AsyncMock()
+    system.circuit_breaker = AsyncMock()
+    system.charlie_gate = _StaticCharlieGate("YES")
+    system.pre_trade_admission = _StaticAdmissionGate(
+        AdmissionVerdict(
+            allowed=False,
+            confidence_multiplier=Decimal("0"),
+            size_multiplier=Decimal("0"),
+            block_reason="provider_quorum_failed",
+            health_flags=["coingecko_stale"],
+        )
+    )
+
+    system.ledger.get_equity.return_value = Decimal("100")
+    system.circuit_breaker.can_trade = AsyncMock(return_value=True)
+
+    opportunity = {
+        "market_id": "market-1",
+        "token_id": "token-yes",
+        "side": "YES",
+        "edge": Decimal("0.05"),
+        "market_price": Decimal("0.50"),
+        "confidence": "HIGH",
+        "direction": "UP",
+        "btc_price": Decimal("90000"),
     }
 
     await system._execute_opportunity(opportunity=opportunity, trigger="test")

@@ -99,6 +99,23 @@ runtime_controls:
   # Setting true with the 0.5 placeholder active will make last-second size
   # decisions on a coin-flip prior — guaranteed to bleed money.
   sniper_enabled: false
+  external_signals:
+    enabled: true
+    timeout_seconds: 2.5
+    max_retries: 1
+    max_staleness_seconds: 90.0
+    price_divergence_bps_limit: "80"
+    coincap_ttl_seconds: 20.0
+    coingecko_ttl_seconds: 45.0
+    coinpaprika_ttl_seconds: 90.0
+    cryptocompare_ttl_seconds: 60.0
+    fred_ttl_seconds: 3600.0
+  pre_trade_admission:
+    enabled: true
+    min_healthy_providers: 2
+    max_price_divergence_bps: "90"
+    macro_risk_block_threshold: "2.0"
+    near_expiry_block_minutes: 45
   session_snapshot_interval_seconds: 60
 
 # ==================================================================

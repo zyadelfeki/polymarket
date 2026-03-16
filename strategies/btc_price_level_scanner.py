@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
@@ -48,6 +49,10 @@ class BTCPriceLevelScanner:
         self.min_edge = to_decimal(cfg.get("min_edge", "0.05"))
         self.market_limit = int(cfg.get("market_limit", 200))
         self.default_timeframe = str(cfg.get("timeframe", "15m"))
+        self._recent_rejection_ttl_seconds = int(cfg.get("recent_rejection_ttl_seconds", 120))
+        self._expired_market_ids: set[str] = set()
+        self._closed_market_ids: set[str] = set()
+        self._recent_rejection_cache: Dict[tuple[str, str], float] = {}
 
     async def scan(
         self,
@@ -119,17 +124,41 @@ class BTCPriceLevelScanner:
         for market in markets:
             if not isinstance(market, dict):
                 continue
+
+            market_id = str(market.get("id") or market.get("condition_id") or market.get("market_id") or "").strip()
+            if not market_id:
+                continue
+
+            if market_id in self._expired_market_ids or market_id in self._closed_market_ids:
+                continue
+            if self._is_recently_rejected(market_id):
+                continue
+
+            if self._is_market_closed(market):
+                self._closed_market_ids.add(market_id)
+                self._mark_recent_rejection(market_id, "market_closed", ttl_seconds=600)
+                continue
+
             if not self._looks_like_price_level_market(market):
                 continue
             after_price_level_filter += 1
 
-            if not self._resolves_within_window(market, expiry_window_days):
+            end_dt = self._extract_market_datetime(market)
+            if end_dt is None:
+                self._mark_recent_rejection(market_id, "missing_expiry", ttl_seconds=300)
+                continue
+            now = datetime.now(timezone.utc)
+            if end_dt < now:
+                self._expired_market_ids.add(market_id)
+                self._mark_recent_rejection(market_id, "expired", ttl_seconds=600)
+                continue
+            if end_dt > (now + timedelta(days=expiry_window_days)):
                 continue
             after_expiry_filter += 1
 
-            market_id = str(market.get("id") or market.get("condition_id") or market.get("market_id") or "").strip()
             question = str(market.get("question") or market.get("title") or "").strip()
             if not market_id or not question:
+                self._mark_recent_rejection(market_id, "missing_question", ttl_seconds=120)
                 continue
             after_id_question_filter += 1
 
@@ -137,6 +166,7 @@ class BTCPriceLevelScanner:
             if market_price is None:
                 market_price = await self._fetch_market_price(api_client, market_id)
             if market_price is None:
+                self._mark_recent_rejection(market_id, "no_price", ttl_seconds=90)
                 logger.debug("btc_scanner_market_skip", reason="no_price", market_id=market_id)
                 continue
             after_price_fetch += 1
@@ -152,6 +182,7 @@ class BTCPriceLevelScanner:
             )
             if recommendation is None:
                 charlie_none_count += 1
+                self._mark_recent_rejection(market_id, "charlie_rejected", ttl_seconds=60)
                 logger.info(
                     "btc_scanner_charlie_rejected",
                     market_id=market_id,
@@ -163,6 +194,7 @@ class BTCPriceLevelScanner:
             edge = _decimal_from_charlie(recommendation.edge)
             if edge < self.min_edge:
                 edge_too_low_count += 1
+                self._mark_recent_rejection(market_id, "edge_too_low", ttl_seconds=60)
                 logger.info(
                     "btc_scanner_edge_too_low",
                     market_id=market_id,
@@ -421,3 +453,31 @@ class BTCPriceLevelScanner:
             return to_decimal(value)
         except Exception:
             return None
+
+    def _is_market_closed(self, market: Dict[str, Any]) -> bool:
+        status = str(market.get("status") or market.get("state") or "").strip().lower()
+        if status in {"closed", "resolved", "settled", "finalized", "ended"}:
+            return True
+        active = market.get("active")
+        if isinstance(active, bool) and not active:
+            return True
+        return False
+
+    def _is_recently_rejected(self, market_id: str) -> bool:
+        now_mono = time.monotonic()
+        stale_keys = [
+            key
+            for key, expires_at in self._recent_rejection_cache.items()
+            if expires_at <= now_mono
+        ]
+        for key in stale_keys:
+            self._recent_rejection_cache.pop(key, None)
+
+        for (cached_market_id, _reason), expires_at in self._recent_rejection_cache.items():
+            if cached_market_id == market_id and expires_at > now_mono:
+                return True
+        return False
+
+    def _mark_recent_rejection(self, market_id: str, reason: str, ttl_seconds: Optional[int] = None) -> None:
+        ttl = int(ttl_seconds if ttl_seconds is not None else self._recent_rejection_ttl_seconds)
+        self._recent_rejection_cache[(market_id, reason)] = time.monotonic() + max(1, ttl)
