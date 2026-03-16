@@ -122,6 +122,14 @@ class BTCPriceLevelScanner:
         edge_too_low_count = 0
 
         opportunities: List[Dict[str, Any]] = []
+        # Temporary: log cache sizes once per scan at start of loop
+        logger.debug(
+            "btc_scanner_cache_state",
+            permanent_rejections=len(self._permanent_rejection_cache),
+            recent_rejections=len(self._recent_rejection_cache),
+            expired_markets=len(self._expired_market_ids),
+            closed_markets=len(self._closed_market_ids),
+        )
         for market in markets:
             if not isinstance(market, dict):
                 continue
@@ -167,8 +175,21 @@ class BTCPriceLevelScanner:
                 continue
             after_id_question_filter += 1
 
+            time_left_seconds = self._extract_time_left_seconds(market)
+            if time_left_seconds is not None and time_left_seconds <= 0:
+                self._expired_market_ids.add(market_id)
+                self._mark_recent_rejection(market_id, "too_close_to_expiry", ttl_seconds=600)
+                logger.info(
+                    "btc_scanner_market_skip",
+                    reason="too_close_to_expiry",
+                    market_id=market_id,
+                    time_left_seconds=time_left_seconds,
+                    marked_expired=True,
+                )
+                continue
+
             if self._is_permanent_timeframe_mismatch(market):
-                self._permanent_rejection_cache.add(market_id)
+                self._mark_permanent_rejection(market_id)
                 self._mark_recent_rejection(
                     market_id,
                     "no_timeframe_match_from_metadata_or_question",
@@ -510,6 +531,9 @@ class BTCPriceLevelScanner:
     def _mark_recent_rejection(self, market_id: str, reason: str, ttl_seconds: Optional[int] = None) -> None:
         ttl = int(ttl_seconds if ttl_seconds is not None else self._recent_rejection_ttl_seconds)
         self._recent_rejection_cache[(market_id, reason)] = time.monotonic() + max(1, ttl)
+
+    def _mark_permanent_rejection(self, market_id: str) -> None:
+        self._permanent_rejection_cache.add(market_id)
 
     def _is_permanent_timeframe_mismatch(self, market: Dict[str, Any]) -> bool:
         question = str(market.get("question") or market.get("title") or "").lower()
