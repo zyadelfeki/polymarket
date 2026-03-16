@@ -30,7 +30,7 @@ secrets:
 trading:
   # Paper trading mode
   paper_trading: true
-  max_entry_price_abs: "0.35"
+  max_entry_price_abs: "0.65"
   
   # Initial capital
   initial_capital: 17.95
