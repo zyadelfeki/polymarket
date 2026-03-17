@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict
@@ -57,9 +58,9 @@ _regime_lock = asyncio.Lock()
 class RegimeVerdict:
     safe_to_trade: bool       # False = suppress all bets this cycle
     regime_label: str         # e.g. "RISK_OFF", "STABLE", "FLASH_CRASH", "UNKNOWN"
-    confidence: float         # 0.0–1.0
+    confidence: float         # 0.0-1.0
     reason: str               # max 20 words
-    source: str               # "llm" or "passthrough"
+    source: str               # "llm", "passthrough", or "paper_bypass"
 
 
 _PASSTHROUGH = RegimeVerdict(
@@ -69,6 +70,29 @@ _PASSTHROUGH = RegimeVerdict(
     reason="llm_unavailable",
     source="passthrough",
 )
+
+_PAPER_BYPASS = RegimeVerdict(
+    safe_to_trade=True,
+    regime_label="PAPER_MODE",
+    confidence=0.0,
+    reason="regime_guard_disabled_paper_trading",
+    source="paper_bypass",
+)
+
+
+def _regime_guard_disabled() -> bool:
+    """Return True when regime guard should be skipped entirely.
+
+    Honoured env vars (any truthy value):
+      DISABLE_REGIME_GUARD=true   – explicit operator override
+      PAPER_TRADING=true          – paper / dry-run mode never needs LLM veto
+    """
+    _truthy = {"1", "true", "yes", "on"}
+    if os.getenv("DISABLE_REGIME_GUARD", "").strip().lower() in _truthy:
+        return True
+    if os.getenv("PAPER_TRADING", "").strip().lower() in _truthy:
+        return True
+    return False
 
 
 async def get_regime_verdict(
@@ -81,7 +105,17 @@ async def get_regime_verdict(
     """
     Query Phi-3 for the current macro regime. Returns a cached result if fresh.
     On any LLM failure, returns PASSTHROUGH (safe_to_trade=True) — never blocks.
+    In paper-trading or DISABLE_REGIME_GUARD mode, returns PAPER_BYPASS immediately.
     """
+    # --- Paper / disable bypass (checked before cache to avoid stale LLM veto) ---
+    if _regime_guard_disabled():
+        logger.info(
+            "regime_guard_bypassed source=paper_bypass PAPER_TRADING=%s DISABLE_REGIME_GUARD=%s",
+            os.getenv("PAPER_TRADING", ""),
+            os.getenv("DISABLE_REGIME_GUARD", ""),
+        )
+        return _PAPER_BYPASS
+
     now = time.monotonic()
 
     # Fast path: return cached result without acquiring the lock.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -39,6 +40,13 @@ def _decimal_from_charlie(value: Any) -> Decimal:
     return Decimal(str(value))
 
 
+_PAPER_MODE_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _is_paper_mode() -> bool:
+    return os.getenv("PAPER_TRADING", "").strip().lower() in _PAPER_MODE_TRUTHY
+
+
 class BTCPriceLevelScanner:
     """Find BTC price-level markets that Charlie already considers tradable."""
 
@@ -72,6 +80,8 @@ class BTCPriceLevelScanner:
             )
             return []
 
+        paper_mode = _is_paper_mode()
+
         expiry_window_days = max_days_to_expiry or self.max_days_to_expiry
         markets = await self._fetch_markets(api_client)
         logger.info("btc_scanner_fetch_complete", total_markets=len(markets))
@@ -87,6 +97,8 @@ class BTCPriceLevelScanner:
         )
 
         # --- Regime guard (once per cycle, cached 2 min) ----------------------
+        # In paper mode PAPER_TRADING=true causes get_regime_verdict to return
+        # PAPER_BYPASS (safe_to_trade=True) without firing an LLM call.
         _verdict = None
         try:
             from ai.regime_guard import get_regime_verdict
@@ -158,13 +170,32 @@ class BTCPriceLevelScanner:
 
             end_dt = self._extract_market_datetime(market)
             if end_dt is None:
-                self._mark_recent_rejection(market_id, "missing_expiry", ttl_seconds=300)
-                continue
+                if paper_mode:
+                    # In paper mode treat missing expiry as far-future so we can
+                    # still validate the full scanner path end-to-end.
+                    logger.debug(
+                        "btc_scanner_expiry_missing_paper_passthrough",
+                        market_id=market_id,
+                    )
+                    end_dt = datetime.now(timezone.utc) + timedelta(days=expiry_window_days)
+                else:
+                    self._mark_recent_rejection(market_id, "missing_expiry", ttl_seconds=300)
+                    continue
             now = datetime.now(timezone.utc)
             if end_dt < now:
-                self._expired_market_ids.add(market_id)
-                self._mark_recent_rejection(market_id, "expired", ttl_seconds=600)
-                continue
+                if paper_mode:
+                    # Expired markets are still useful for paper validation;
+                    # treat them as resolving 15 min from now.
+                    logger.debug(
+                        "btc_scanner_expired_market_paper_passthrough",
+                        market_id=market_id,
+                        end_dt=end_dt.isoformat(),
+                    )
+                    end_dt = now + timedelta(minutes=15)
+                else:
+                    self._expired_market_ids.add(market_id)
+                    self._mark_recent_rejection(market_id, "expired", ttl_seconds=600)
+                    continue
             if end_dt > (now + timedelta(days=expiry_window_days)):
                 continue
             after_expiry_filter += 1
@@ -177,16 +208,22 @@ class BTCPriceLevelScanner:
 
             time_left_seconds = self._extract_time_left_seconds(market)
             if time_left_seconds is not None and time_left_seconds <= 0:
-                self._expired_market_ids.add(market_id)
-                self._mark_recent_rejection(market_id, "too_close_to_expiry", ttl_seconds=600)
-                logger.info(
-                    "btc_scanner_market_skip",
-                    reason="too_close_to_expiry",
-                    market_id=market_id,
-                    time_left_seconds=time_left_seconds,
-                    marked_expired=True,
-                )
-                continue
+                if paper_mode:
+                    logger.debug(
+                        "btc_scanner_time_left_zero_paper_passthrough",
+                        market_id=market_id,
+                    )
+                else:
+                    self._expired_market_ids.add(market_id)
+                    self._mark_recent_rejection(market_id, "too_close_to_expiry", ttl_seconds=600)
+                    logger.info(
+                        "btc_scanner_market_skip",
+                        reason="too_close_to_expiry",
+                        market_id=market_id,
+                        time_left_seconds=time_left_seconds,
+                        marked_expired=True,
+                    )
+                    continue
 
             if self._is_permanent_timeframe_mismatch(market):
                 self._mark_permanent_rejection(market_id)
@@ -412,7 +449,10 @@ class BTCPriceLevelScanner:
         return now <= end_dt <= (now + timedelta(days=max_days_to_expiry))
 
     def _extract_market_datetime(self, market: Dict[str, Any]) -> Optional[datetime]:
-        for key in ("end_date", "endDate", "resolution_date", "resolve_date", "closedTime"):
+        for key in ("end_date", "endDate", "resolution_date", "resolve_date", "closedTime",
+                    "end_date_iso", "endDateIso", "endDateISO", "endTime", "end_time",
+                    "closeTime", "close_time", "closes_at", "resolve_time",
+                    "resolution_time", "resolutionTime", "expires_at", "expiresAt"):
             raw_value = market.get(key)
             if not raw_value:
                 continue
@@ -426,6 +466,11 @@ class BTCPriceLevelScanner:
         return None
 
     def _extract_market_price(self, market: Dict[str, Any]) -> Optional[Decimal]:
+        # Fast path: use normalised yes_price set by _normalize_gamma_prices
+        yes_price = market.get("yes_price")
+        if yes_price is not None:
+            return self._coerce_optional_decimal(yes_price)
+
         tokens = market.get("tokens") or []
         if not isinstance(tokens, list):
             return None
