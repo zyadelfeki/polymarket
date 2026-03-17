@@ -1310,6 +1310,52 @@ class PolymarketClientV2:
         logger.info("live_market_filter_summary", total=len(markets), accepted=len(filtered), rejected=rejected)
         return filtered
 
+    def _normalize_gamma_prices(self, markets: List[Dict]) -> List[Dict]:
+        """Backfill yes_price/no_price from Gamma outcomePrices/outcomes arrays."""
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            if market.get("yes_price") is not None and market.get("no_price") is not None:
+                continue
+
+            outcome_prices = market.get("outcomePrices")
+            outcomes = market.get("outcomes")
+
+            if isinstance(outcome_prices, str):
+                try:
+                    outcome_prices = json.loads(outcome_prices)
+                except Exception:
+                    outcome_prices = []
+            if isinstance(outcomes, str):
+                try:
+                    outcomes = json.loads(outcomes)
+                except Exception:
+                    outcomes = []
+
+            if not isinstance(outcome_prices, list) or len(outcome_prices) < 2:
+                continue
+            if not isinstance(outcomes, list):
+                outcomes = []
+
+            yes_idx, no_idx = 0, 1
+            for idx, label in enumerate(outcomes):
+                normalized = str(label).strip().lower()
+                if normalized in {"up", "yes"}:
+                    yes_idx = idx
+                elif normalized in {"down", "no"}:
+                    no_idx = idx
+
+            try:
+                yes_price = Decimal(str(outcome_prices[yes_idx])).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+                no_price = Decimal(str(outcome_prices[no_idx])).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            except Exception:
+                continue
+
+            market["yes_price"] = yes_price
+            market["no_price"] = no_price
+
+        return markets
+
     def _extract_market_end_datetime(self, market: Dict) -> Optional[datetime]:
         def _from_unix_decimal(value: Any) -> datetime:
             seconds_decimal = safe_decimal(value)
@@ -1691,6 +1737,7 @@ class PolymarketClientV2:
             merged=len(merged),
             filtered=len(filtered),
         )
+        filtered = self._normalize_gamma_prices(filtered)
         return filtered[:limit]
 
     async def get_events(
