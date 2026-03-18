@@ -1180,7 +1180,9 @@ class PolymarketClientV2:
         if not self.client:
             return []
 
-        gamma_markets = await self._fetch_markets_via_gamma(active=active, limit=limit)
+        # Always sweep at least 500 markets from Gamma so the primary pool is
+        # wide enough; the caller's `limit` trims only the final returned slice.
+        gamma_markets = await self._fetch_markets_via_gamma(active=active, limit=max(limit, 500))
         if gamma_markets:
             logger.info("markets_fetched_gamma", total=len(gamma_markets), active=active)
             return gamma_markets[:limit]
@@ -1215,8 +1217,8 @@ class PolymarketClientV2:
         try:
             import httpx
 
-            requested_limit = max(limit, 1)
-            page_limit = min(max(requested_limit, 100), 500)
+            # Page size: always use 500 (Gamma max) to minimise round-trips.
+            page_limit = 500
             max_pages = 5
 
             all_markets: List[Dict] = []
@@ -1263,9 +1265,10 @@ class PolymarketClientV2:
                     seen_ids.add(market_id)
                     all_markets.append(market)
 
+                # Stop only when the API returns a short page (natural end of data).
+                # Do NOT break early based on collected count — that was the bug that
+                # caused us to silently drop slug-discovered intraday markets.
                 if len(page_markets) < page_limit:
-                    break
-                if len(all_markets) >= requested_limit:
                     break
 
             if not all_markets:
@@ -1274,7 +1277,7 @@ class PolymarketClientV2:
             if active:
                 all_markets = self._filter_live_markets(all_markets)
 
-            return all_markets[:requested_limit]
+            return all_markets
         except Exception as exc:
             logger.warning("gamma_market_fetch_failed", error=str(exc))
             return []
@@ -1695,8 +1698,16 @@ class PolymarketClientV2:
             return []
 
     async def get_active_markets(self, limit: int = 100) -> List[Dict]:
-        """Compatibility helper for strategy modules."""
-        primary_markets = await self.get_markets(active=True, limit=max(limit, 200))
+        """Compatibility helper for strategy modules.
+
+        NOTE: The `limit` parameter controls how many markets the primary
+        Gamma sweep fetches, but the final list returned is NOT sliced to
+        `limit`.  All discovered markets (primary + event + slug) are
+        returned so that the scanner can evaluate the full universe.
+        Callers that genuinely need a hard cap should slice the result
+        themselves after receiving it.
+        """
+        primary_markets = await self.get_markets(active=True, limit=max(limit, 500))
         event_markets = await self._discover_crypto_event_markets(limit=max(limit, 300))
 
         slug_discovered: List[Dict] = []
@@ -1738,7 +1749,11 @@ class PolymarketClientV2:
             filtered=len(filtered),
         )
         filtered = self._normalize_gamma_prices(filtered)
-        return filtered[:limit]
+        # Return the full filtered universe — do NOT slice here.
+        # The scanner (BTCPriceLevelScanner) iterates every market and applies
+        # its own filters; truncating the list here would silently discard
+        # the intraday slug-discovered markets that sit beyond index 100.
+        return filtered
 
     async def get_events(
         self,
@@ -1775,7 +1790,7 @@ class PolymarketClientV2:
             if isinstance(payload, dict):
                 events_list = payload.get("data") or payload.get("events") or []
                 if isinstance(events_list, list):
-                    return [event for event in events_list if isinstance(event, dict)]
+                    return [event for event in events_list if isinstance(events_list, list)]
             return []
         except Exception as exc:
             logger.warning("gamma_events_fetch_failed", error=str(exc))
