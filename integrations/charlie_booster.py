@@ -60,6 +60,18 @@ _ofi_calc = OFICalculator(window_seconds=180)
 
 
 # ---------------------------------------------------------------------------
+# Paper-mode helper
+# ---------------------------------------------------------------------------
+
+_PAPER_MODE_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _is_paper_mode() -> bool:
+    """Return True when PAPER_TRADING env var is set to a truthy value."""
+    return os.getenv("PAPER_TRADING", "").strip().lower() in _PAPER_MODE_TRUTHY
+
+
+# ---------------------------------------------------------------------------
 # Import Charlie signal API
 # ---------------------------------------------------------------------------
 
@@ -464,21 +476,61 @@ class CharliePredictionGate:
         # --- 2b. Coin-flip rejection: p_win near 0.5 = no signal -------------
         # Charlie is operating in degraded/neutral mode when it cannot
         # distinguish direction.  By default, a p_win of 0.5 ± 0.03 means the
-        # model has zero conviction — hard-block these.  A narrower band can be
-        # enabled explicitly for controlled proof / operational diagnostics via
-        # the constructor or `CHARLIE_COIN_FLIP_REJECT_BAND_ABS`.
-        coin_flip_reject_band_abs = float(self._coin_flip_reject_band_abs)
-        if abs(p_win - 0.5) < coin_flip_reject_band_abs:
+        # model has zero conviction — hard-block these in production.
+        #
+        # PAPER MODE OVERRIDE
+        # When PAPER_TRADING=true, PAPER_CHARLIE_COIN_FLIP_BAND_ABS overrides
+        # the production band.  Default is '0.0' — fully open — so that the
+        # downstream pipeline (edge filter, confidence, Kelly, execution) can
+        # be validated end-to-end even when the Platt scaler is absent and
+        # Charlie lands at exactly p_win=0.5.
+        #
+        # This override ONLY applies in paper mode.  Production (PAPER_TRADING
+        # not set) always uses the production band from __init__ / env var
+        # CHARLIE_COIN_FLIP_REJECT_BAND_ABS.  The override never touches order
+        # placement — dry_run.py and run_paper_trading.py enforce paper mode
+        # independently of this gate.
+        if _is_paper_mode():
+            _paper_band_raw = os.getenv("PAPER_CHARLIE_COIN_FLIP_BAND_ABS", "0.0").strip()
+            try:
+                effective_coin_flip_band = float(_paper_band_raw)
+            except ValueError:
+                logger.warning(
+                    "paper_coin_flip_band_invalid",
+                    raw=_paper_band_raw,
+                    fallback=0.0,
+                )
+                effective_coin_flip_band = 0.0
+        else:
+            effective_coin_flip_band = float(self._coin_flip_reject_band_abs)
+
+        if effective_coin_flip_band > 0.0 and abs(p_win - 0.5) < effective_coin_flip_band:
             logger.warning(
                 "charlie_coin_flip_rejected",
                 market_id=market_id,
                 market_question=market_question[:80],
                 p_win=p_win,
-                reason=f"p_win within {coin_flip_reject_band_abs:.4f} of 0.5 = no signal",
+                reason=f"p_win within {effective_coin_flip_band:.4f} of 0.5 = no signal",
                 symbol=symbol,
-                coin_flip_reject_band_abs=coin_flip_reject_band_abs,
+                coin_flip_reject_band_abs=effective_coin_flip_band,
+                paper_mode=_is_paper_mode(),
             )
             return None
+
+        if effective_coin_flip_band == 0.0 and _is_paper_mode() and abs(p_win - 0.5) < float(self._coin_flip_reject_band_abs):
+            logger.warning(
+                "coin_flip_paper_passthrough",
+                market_id=market_id,
+                market_question=market_question[:80],
+                p_win=p_win,
+                production_band=float(self._coin_flip_reject_band_abs),
+                paper_band=effective_coin_flip_band,
+                reason="PAPER_TRADING=true and PAPER_CHARLIE_COIN_FLIP_BAND_ABS=0.0: "
+                       "coin-flip gate open for pipeline validation. "
+                       "This market would be REJECTED in production.",
+            )
+            # Fall through — all other production filters (edge, confidence,
+            # regime, Kelly) remain fully active below.
 
         # --- 3. Edge filter (fee-aware) --------------------------------------
         if Decimal(str(edge)) < self._min_edge:
