@@ -73,7 +73,7 @@ class TradeExecutor:
         edge = float(opportunity.get("edge", 0.0))
         market_price = float(opportunity.get("market_price", 0.5) or 0.5)
         question = str(opportunity.get("question", ""))[:80]
-        token_id = opportunity.get("token_id")
+        token_id = opportunity.get("token_id") or market_id
 
         # --- Sizing: use the pre-computed Kelly size from CharliePredictionGate.
         # Only fall back to legacy kelly_sizer when the key is absent (e.g.
@@ -128,12 +128,17 @@ class TradeExecutor:
             token_id=token_id,
         )
 
-        success = await self.polymarket.place_bet(
-            market_id=market_id,
+        # PolymarketClient / PolymarketClientV2 exposes place_order, not
+        # place_bet.  Signature: place_order(token_id, side, amount, price).
+        # Returns dict {success, order_id, ...} on success, None on failure.
+        # In paper mode it always returns {success: True, order_id: 'paper_...'}.
+        order_result = await self.polymarket.place_order(
+            token_id=token_id,
             side=side,
             amount=float(bet_size),
-            max_price=market_price * 1.05,
+            price=market_price,
         )
+        success = bool(order_result and order_result.get("success"))
 
         if success:
             trade_record = {
@@ -170,6 +175,7 @@ class TradeExecutor:
                 question=question,
                 side=side,
                 bet_size=str(bet_size),
+                order_id=order_result.get("order_id") if order_result else None,
                 trade_id=f"trade_{trade_id}",
                 edge=f"{edge:.4f}",
             )
