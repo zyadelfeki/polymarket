@@ -405,12 +405,15 @@ class BTCPriceLevelScanner:
         return opportunities
 
     async def _fetch_markets(self, api_client) -> List[Dict[str, Any]]:
-        if hasattr(api_client, "get_markets"):
-            markets = await api_client.get_markets(active=True, limit=self.market_limit)
-            if markets:
-                return [m for m in markets if isinstance(m, dict)]
+        # Prefer get_active_markets — it runs full event+slug discovery
+        # and surfaces the BTC intraday 15m markets that gamma /markets?limit=200
+        # does not return.  get_markets is kept as a fallback only.
         if hasattr(api_client, "get_active_markets"):
             markets = await api_client.get_active_markets(limit=self.market_limit)
+            if markets:
+                return [m for m in markets if isinstance(m, dict)]
+        if hasattr(api_client, "get_markets"):
+            markets = await api_client.get_markets(active=True, limit=self.market_limit)
             if markets:
                 return [m for m in markets if isinstance(m, dict)]
         return []
