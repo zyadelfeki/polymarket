@@ -128,15 +128,19 @@ class TradeExecutor:
             token_id=token_id,
         )
 
-        # PolymarketClient / PolymarketClientV2 exposes place_order, not
-        # place_bet.  Signature: place_order(token_id, side, amount, price).
-        # Returns dict {success, order_id, ...} on success, None on failure.
-        # In paper mode it always returns {success: True, order_id: 'paper_...'}.
+        # Both client classes expose place_order, but use different param names:
+        #   PolymarketClient (polymarket_client.py):    place_order(token_id, side, amount, price)
+        #   PolymarketClientV2 (polymarket_client_v2.py): place_order(token_id, side, size, price)
+        #
+        # We call with positional args so both signatures work without branching.
+        # bet_size is Decimal; PolymarketClientV2 validates the type; PolymarketClient
+        # accepts float via its `amount` param (coercion happens inside it).
+        price_dec = Decimal(str(market_price))
         order_result = await self.polymarket.place_order(
-            token_id=token_id,
-            side=side,
-            amount=float(bet_size),
-            price=market_price,
+            token_id,   # positional: token_id
+            side,       # positional: side
+            bet_size,   # positional: size (V2) / amount (V1) — both are 3rd arg
+            price_dec,  # positional: price
         )
         success = bool(order_result and order_result.get("success"))
 
