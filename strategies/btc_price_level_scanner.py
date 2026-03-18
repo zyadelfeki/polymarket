@@ -83,6 +83,15 @@ class BTCPriceLevelScanner:
         paper_mode = _is_paper_mode()
 
         expiry_window_days = max_days_to_expiry or self.max_days_to_expiry
+        env_max_days_to_expiry = os.getenv("MAX_DAYS_TO_EXPIRY")
+        if env_max_days_to_expiry:
+            try:
+                expiry_window_days = int(env_max_days_to_expiry)
+            except ValueError:
+                logger.warning(
+                    "btc_scanner_invalid_max_days_to_expiry_env",
+                    value=env_max_days_to_expiry,
+                )
         markets = await self._fetch_markets(api_client)
         logger.info("btc_scanner_fetch_complete", total_markets=len(markets))
         if not markets:
@@ -439,7 +448,8 @@ class BTCPriceLevelScanner:
             token in question or token in slug
             for token in ("btc", "bitcoin")
         )
-        return has_price_language and has_crypto_language
+        is_intraday_slug = "updown-15m" in slug and has_crypto_language
+        return (has_price_language and has_crypto_language) or is_intraday_slug
 
     def _resolves_within_window(self, market: Dict[str, Any], max_days_to_expiry: int) -> bool:
         end_dt = self._extract_market_datetime(market)

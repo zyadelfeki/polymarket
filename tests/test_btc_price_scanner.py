@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -120,6 +120,59 @@ async def test_btc_price_scanner_surfaces_valid_mispriced_market():
     assert opportunity["size"] == Decimal("2.50")
     assert opportunity["edge"] == Decimal("0.33")
     assert opportunity["question"].startswith("Will BTC price exceed")
+
+
+@pytest.mark.asyncio
+async def test_btc_price_scanner_accepts_far_updown_market_when_env_override_set():
+    scanner = BTCPriceLevelScanner()
+    api_client = StubApiClient([
+        _market(
+            question="Bitcoin Up or Down - March 18, 4:15PM-4:30PM ET",
+            yes_price="0.40",
+            no_price="0.60",
+            days=90,
+            market_id="btc_updown_far",
+        )
+        | {"slug": "btc-updown-15m-1773868500"}
+    ])
+    gate = StubCharlieGate(
+        recommendation=SimpleNamespace(
+            side="YES",
+            size=Decimal("1.50"),
+            kelly_fraction=Decimal("0.10"),
+            p_win=0.62,
+            p_win_raw=0.62,
+            p_win_calibrated=0.62,
+            implied_prob=0.40,
+            edge=0.22,
+            confidence=0.80,
+            regime="BULLISH",
+            technical_regime="TRENDING",
+            reason="edge_pass",
+            model_votes={"rf": "BUY"},
+            ofi_conflict=False,
+        )
+    )
+
+    safe_verdict = SimpleNamespace(
+        safe_to_trade=True,
+        regime_label="TEST_OK",
+        source="test",
+        confidence=1.0,
+        reason="test",
+    )
+    with patch.dict("os.environ", {"MAX_DAYS_TO_EXPIRY": "365"}, clear=False):
+        with patch("ai.regime_guard.get_regime_verdict", new=AsyncMock(return_value=safe_verdict)):
+            opportunities = await scanner.scan(
+                charlie_gate=gate,
+                api_client=api_client,
+                equity=Decimal("20"),
+                max_days_to_expiry=7,
+            )
+
+    assert len(opportunities) == 1
+    assert opportunities[0]["market_id"] == "btc_updown_far"
+    assert len(gate.calls) == 1
 
 
 @pytest.mark.asyncio
