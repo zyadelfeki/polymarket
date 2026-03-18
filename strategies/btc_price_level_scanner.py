@@ -82,16 +82,21 @@ class BTCPriceLevelScanner:
 
         paper_mode = _is_paper_mode()
 
+        # Allow MAX_DAYS_TO_EXPIRY env var to override the caller-supplied value.
+        # Caller passes max_days_to_expiry=7 (dry_run.py hardcoded); env lets us
+        # widen the window without touching dry_run.py.
         expiry_window_days = max_days_to_expiry or self.max_days_to_expiry
-        env_max_days_to_expiry = os.getenv("MAX_DAYS_TO_EXPIRY")
-        if env_max_days_to_expiry:
+        env_max = os.getenv("MAX_DAYS_TO_EXPIRY", "").strip()
+        if env_max:
             try:
-                expiry_window_days = int(env_max_days_to_expiry)
+                expiry_window_days = int(env_max)
             except ValueError:
                 logger.warning(
-                    "btc_scanner_invalid_max_days_to_expiry_env",
-                    value=env_max_days_to_expiry,
+                    "btc_scanner_invalid_MAX_DAYS_TO_EXPIRY",
+                    raw=env_max,
+                    fallback=expiry_window_days,
                 )
+
         markets = await self._fetch_markets(api_client)
         logger.info("btc_scanner_fetch_complete", total_markets=len(markets))
         if not markets:
@@ -143,7 +148,6 @@ class BTCPriceLevelScanner:
         edge_too_low_count = 0
 
         opportunities: List[Dict[str, Any]] = []
-        # Temporary: log cache sizes once per scan at start of loop
         logger.debug(
             "btc_scanner_cache_state",
             permanent_rejections=len(self._permanent_rejection_cache),
@@ -180,8 +184,6 @@ class BTCPriceLevelScanner:
             end_dt = self._extract_market_datetime(market)
             if end_dt is None:
                 if paper_mode:
-                    # In paper mode treat missing expiry as far-future so we can
-                    # still validate the full scanner path end-to-end.
                     logger.debug(
                         "btc_scanner_expiry_missing_paper_passthrough",
                         market_id=market_id,
@@ -193,8 +195,6 @@ class BTCPriceLevelScanner:
             now = datetime.now(timezone.utc)
             if end_dt < now:
                 if paper_mode:
-                    # Expired markets are still useful for paper validation;
-                    # treat them as resolving 15 min from now.
                     logger.debug(
                         "btc_scanner_expired_market_paper_passthrough",
                         market_id=market_id,
@@ -284,11 +284,6 @@ class BTCPriceLevelScanner:
                 )
                 continue
 
-            # --- LLM layer: zero-latency cache read ----------------------------
-            # The background LLMWorker fills the cache at the model's own pace
-            # (~9 s per call).  The scanner only reads the cache — O(1), no
-            # blocking.  A cache miss is a silent pass-through; trading is never
-            # gated on LLM availability.
             _cached = None
             try:
                 from ai.llm_worker import get_cache as _get_llm_cache
@@ -334,8 +329,6 @@ class BTCPriceLevelScanner:
                 )
             )
 
-            # Enqueue for background LLM inference (non-blocking, fire-and-forget).
-            # The worker will update the cache for the *next* scanner pass.
             try:
                 import ai.llm_worker as _llm_worker_mod
                 if _llm_worker_mod._singleton_worker is not None:
@@ -366,9 +359,8 @@ class BTCPriceLevelScanner:
                         "minutes_to_expiry": _minutes_expiry,
                     }])
             except Exception:
-                pass  # worker unavailable — never block trading
+                pass
 
-            # Fire-and-forget feedback log entry.
             try:
                 from ai.feedback_loop import record_decision
                 asyncio.create_task(record_decision(
@@ -448,7 +440,15 @@ class BTCPriceLevelScanner:
             token in question or token in slug
             for token in ("btc", "bitcoin")
         )
-        is_intraday_slug = "updown-15m" in slug and has_crypto_language
+
+        # BTC intraday up/down markets use slugs like btc-updown-15m-<ts>.
+        # They resolve on BTC price direction but don't contain price/$ keywords,
+        # so they were silently filtered out before.  Accept them explicitly.
+        is_intraday_slug = (
+            any(pat in slug for pat in ("updown-15m", "updown-1h", "updown-4h", "updown-daily"))
+            and has_crypto_language
+        )
+
         return (has_price_language and has_crypto_language) or is_intraday_slug
 
     def _resolves_within_window(self, market: Dict[str, Any], max_days_to_expiry: int) -> bool:
@@ -603,7 +603,6 @@ class BTCPriceLevelScanner:
         )
         resolution_text = str(resolution_raw).lower()
 
-        # Any known intraday or daily timeframe hint means this market is not permanent-mismatch.
         timeframe_tokens = (
             "15m",
             "15 min",
