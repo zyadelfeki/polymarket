@@ -15,11 +15,11 @@ What this does
       submitted this session.
    b. Checks PaperOrderBook — skip if an open position already exists
       for this (market_id, side) pair (deduplication).
-   c. Calls TradeExecutor.execute_trade() — which calls place_bet() on
+   c. Calls TradeExecutor.execute_trade() — which calls place_order() on
       the paper client.  Logs order_attempt / order_placed / order_rejected.
 3. After each scan, calls settle_open_positions() which resolves any markets
-   whose end_date has passed, crediting/debiting the bankroll and calling
-   circuit_breaker.record_trade() ONLY on resolved outcomes.
+   whose end_date has passed, crediting the bankroll and notifying the
+   circuit_breaker ONLY on resolved outcomes.
 4. Logs a per-scan summary with open position count and PnL.
 5. Runs until interrupted.  Safe to restart: IdempotencyManager persists
    to disk so duplicate orders are prevented across restarts.
@@ -46,7 +46,6 @@ from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Enforce paper trading mode before any other imports.
 os.environ["PAPER_TRADING"] = "true"
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -131,8 +130,6 @@ class _PaperBankrollTracker:
 
     def add_trade(self, record: dict) -> None:
         self._trades.append(record)
-        # Stake is deducted from balance immediately; it will be returned
-        # (with profit or loss) when the market settles.
         self.balance -= Decimal(str(record.get("bet_size", 0)))
 
     @property
@@ -146,58 +143,45 @@ def settle_open_positions(
     circuit_breaker: CircuitBreaker,
 ) -> int:
     """
-    Check each open position.  If the market end_date has passed, settle it.
+    Check each open PaperPosition.  If its end_date has passed, settle it.
 
-    For paper trading we don't have the real resolution result from Polymarket,
-    so we use a simple heuristic:
-      - We bet NO on directional markets (our signal is always SELL → side=NO).
-      - "Win" means price went DOWN (NO resolves YES): we credit stake / price.
-      - Since we cannot know the real result here, we mark it as a NEUTRAL
-        settlement — stake returned, profit=0, win=False — until a real
-        resolution feed is wired in.  This is honest: it doesn't fake wins OR
-        trigger the circuit breaker unfairly.
+    Neutral settlement: stake returned, profit=0, win=True.
+    This prevents the circuit breaker from firing on unresolved markets.
+    Wire in real Polymarket resolution data here when available.
 
     Returns the number of positions settled this cycle.
     """
     now = datetime.now(timezone.utc)
     settled = 0
 
-    for position in list(order_book.get_open_positions()):
-        end_date_str = position.get("end_date", "")
-        if not end_date_str:
+    for pos in list(order_book.get_open_positions()):
+        if not pos.end_date:
             continue
 
         try:
             end_dt = datetime.fromisoformat(
-                str(end_date_str).replace("Z", "+00:00")
+                pos.end_date.replace("Z", "+00:00")
             )
         except Exception:
             continue
 
         if now < end_dt:
-            # Market still open — nothing to settle yet.
             continue
 
-        market_id = position["market_id"]
-        side = position["side"]
-        bet_size = Decimal(str(position.get("size", 0)))
-        question = position.get("question", "")[:60]
-
-        # Neutral settlement: return stake, count as resolved (not a loss).
-        # Replace this block with real Polymarket resolution data when available.
-        bankroll_tracker.balance += bet_size
+        # Market window has closed — settle neutrally.
+        bankroll_tracker.balance += pos.size
         circuit_breaker.record_trade(profit=Decimal("0"), win=True)
-        order_book.close_position(market_id, side)
+        order_book.remove_position(pos.market_id, pos.side)
         settled += 1
 
         log(
             "info",
             "position_settled_neutral",
-            market_id=market_id,
-            side=side,
-            bet_size=str(bet_size),
-            question=question,
-            end_date=end_date_str,
+            market_id=pos.market_id,
+            side=pos.side,
+            bet_size=str(pos.size),
+            question=pos.question[:60],
+            end_date=pos.end_date,
         )
 
     return settled
@@ -254,6 +238,7 @@ async def run_loop(
             side = str(opp.get("side", "YES")).upper()
             size = Decimal(str(opp.get("size", "0")))
             entry_price = Decimal(str(opp.get("market_price", "0.5")))
+            end_date = str(opp.get("end_date", ""))
 
             # --- Idempotency check -------------------------------------------
             idem_key = idempotency.generate_key(
@@ -297,7 +282,7 @@ async def run_loop(
                     edge=Decimal(str(opp.get("edge", "0"))),
                     confidence=Decimal(str(opp.get("confidence", "0"))),
                     question=str(opp.get("question", "")),
-                    end_date=str(opp.get("end_date", "")),
+                    end_date=end_date,
                 )
             else:
                 idempotency.update_result(idem_key, {"success": False})

@@ -40,6 +40,7 @@ class PaperPosition:
     edge: Decimal
     confidence: Decimal
     question: str
+    end_date: str = ""  # ISO-8601 string; used by settlement loop
     opened_at: float = field(default_factory=time.monotonic)
     settled: bool = False
     pnl: Optional[Decimal] = None
@@ -65,6 +66,10 @@ class PaperOrderBook:
         pos = self._positions.get(key)
         return pos is not None and not pos.settled
 
+    def get_open_positions(self) -> List[PaperPosition]:
+        """Return all unsettled positions."""
+        return [p for p in self._positions.values() if not p.settled]
+
     def record_order(
         self,
         market_id: str,
@@ -75,6 +80,7 @@ class PaperOrderBook:
         edge: Decimal,
         confidence: Decimal,
         question: str,
+        end_date: str = "",
     ) -> bool:
         """
         Record a new paper order.  Returns True if recorded, False if duplicate.
@@ -103,6 +109,7 @@ class PaperOrderBook:
             edge=edge,
             confidence=confidence,
             question=question[:120],
+            end_date=end_date,
         )
         self._total_staked += size
         self._orders_placed += 1
@@ -137,7 +144,6 @@ class PaperOrderBook:
 
             won = (side == "YES" and resolved_yes) or (side == "NO" and not resolved_yes)
             if won:
-                # Payout = size / entry_price * 1 USDC per share, minus stake
                 payout = pos.size / pos.entry_price if pos.entry_price > 0 else Decimal("0")
                 pos.pnl = payout - pos.size
             else:
