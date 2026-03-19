@@ -75,6 +75,7 @@ class TradeExecutor:
         market_price = float(opportunity.get("market_price", 0.5) or 0.5)
         question = str(opportunity.get("question", ""))[:80]
         token_id = opportunity.get("token_id") or market_id
+        balance = Decimal(str(self.bankroll.current_balance))
 
         # --- Sizing -----------------------------------------------------------
         if "kelly_size" in opportunity and opportunity["kelly_size"] is not None:
@@ -98,18 +99,34 @@ class TradeExecutor:
 
         # --- Minimum size enforcement (Polymarket floor is $1.00 USDC) -------
         if bet_size < MIN_BET_SIZE:
-            _log(
-                "info",
-                "order_rejected_below_minimum",
-                market_id=market_id,
-                question=question,
-                bet_size=str(bet_size),
-                min_bet_size=str(MIN_BET_SIZE),
-                side=side,
-                edge=f"{edge:.4f}",
-                confidence=f"{confidence:.4f}",
-            )
-            return False
+            if balance >= MIN_BET_SIZE:
+                _log(
+                    "info",
+                    "bet_size_clamped_to_minimum",
+                    market_id=market_id,
+                    question=question,
+                    original_bet_size=str(bet_size),
+                    bet_size=str(MIN_BET_SIZE),
+                    min_bet_size=str(MIN_BET_SIZE),
+                    side=side,
+                    edge=f"{edge:.4f}",
+                    confidence=f"{confidence:.4f}",
+                )
+                bet_size = MIN_BET_SIZE
+            else:
+                _log(
+                    "info",
+                    "order_rejected_insufficient_balance",
+                    market_id=market_id,
+                    question=question,
+                    bet_size=str(bet_size),
+                    min_bet_size=str(MIN_BET_SIZE),
+                    balance=str(balance),
+                    side=side,
+                    edge=f"{edge:.4f}",
+                    confidence=f"{confidence:.4f}",
+                )
+                return False
 
         _log(
             "info",

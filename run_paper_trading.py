@@ -261,8 +261,6 @@ async def run_loop(
                     market_id=market_id, side=side)
                 continue
 
-            idempotency.record(idem_key, status="pending")
-
             exec_opp = dict(opp)
             exec_opp["kelly_size"] = opp.get("size")
             exec_opp["strategy"] = "charlie_gate"
@@ -272,6 +270,10 @@ async def run_loop(
 
             if success:
                 orders_placed += 1
+                # Only write to the idempotency cache after the order is
+                # confirmed placed.  Recording before execution caused locally-
+                # rejected orders (e.g. bet_size below minimum) to poison the
+                # cache and permanently block re-attempts on subsequent cycles.
                 idempotency.update_result(idem_key, {"success": True})
                 order_book.record_order(
                     market_id=market_id,
@@ -284,8 +286,6 @@ async def run_loop(
                     question=str(opp.get("question", "")),
                     end_date=end_date,
                 )
-            else:
-                idempotency.update_result(idem_key, {"success": False})
 
         # --- Settle resolved positions ---------------------------------------
         settled_count = settle_open_positions(
