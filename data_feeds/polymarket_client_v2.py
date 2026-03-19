@@ -1486,8 +1486,8 @@ class PolymarketClientV2:
             )
 
             # Build the deduplicated slug list.  Only offset=0 is used because the
-            # ET→UTC interval computation is exact (EST = UTC-5 in Feb; no DST).
-            # The former ±1h/±2h offsets produced ~100 extra 404 requests per cycle,
+            # ET->UTC interval computation is exact (EST = UTC-5 in Feb; no DST).
+            # The former +/-1h/+/-2h offsets produced ~100 extra 404 requests per cycle,
             # causing the asyncio.wait_for(timeout=10s) in _get_active_markets to
             # always fire before the function could return any results.
             slugs_to_check: List[tuple] = []  # (asset, slug)
@@ -1590,7 +1590,7 @@ class PolymarketClientV2:
                     logger.error("slug_fetch_failed", slug=slug, error=str(exc))
 
             # Run all slug fetches concurrently.  With 24 slugs at ~0.3 s each this
-            # completes in ~1–3 s instead of the former ~60 s serial execution.
+            # completes in ~1-3 s instead of the former ~60 s serial execution.
             async with httpx.AsyncClient(timeout=10.0) as http_client:
                 await asyncio.gather(
                     *[_fetch_one(asset, slug, http_client) for asset, slug in slugs_to_check],
@@ -1706,6 +1706,11 @@ class PolymarketClientV2:
         returned so that the scanner can evaluate the full universe.
         Callers that genuinely need a hard cap should slice the result
         themselves after receiving it.
+
+        NOTE: 1h/4h/daily slug scans are intentionally disabled — they fire
+        hundreds of sequential throttled HTTP requests and always return 0
+        results, wasting ~26s per cycle.  Re-enable if Polymarket ever
+        launches those market types.
         """
         primary_markets = await self.get_markets(active=True, limit=max(limit, 500))
         event_markets = await self._discover_crypto_event_markets(limit=max(limit, 300))
@@ -1713,9 +1718,9 @@ class PolymarketClientV2:
         slug_discovered: List[Dict] = []
         try:
             slug_discovered.extend(await self.get_crypto_15min_markets())
-            slug_discovered.extend(await self._discover_updown_markets_by_timeframe("1h"))
-            slug_discovered.extend(await self._discover_updown_markets_by_timeframe("4h"))
-            slug_discovered.extend(await self._discover_updown_markets_by_timeframe("daily"))
+            # _discover_updown_markets_by_timeframe("1h")   — disabled: 0 results, ~10s wasted
+            # _discover_updown_markets_by_timeframe("4h")   — disabled: 0 results, ~10s wasted
+            # _discover_updown_markets_by_timeframe("daily")— disabled: 0 results, ~6s wasted
         except Exception as exc:
             logger.warning("slug_discovery_failed", error=str(exc))
 
@@ -1887,7 +1892,13 @@ class PolymarketClientV2:
         return discovered[:limit]
 
     async def _discover_updown_markets_by_timeframe(self, timeframe_slug: str) -> List[Dict]:
-        """Discover crypto up/down markets by known slug patterns for 1h/4h/daily."""
+        """Discover crypto up/down markets by known slug patterns for 1h/4h/daily.
+
+        NOTE: This method is currently unused (disabled in get_active_markets).
+        It fires hundreds of sequential throttled HTTP requests per call and
+        always returns 0 results for 1h/4h/daily timeframes as of 2026-03.
+        Kept for reference in case Polymarket re-launches those market types.
+        """
         try:
             import httpx
             from datetime import timedelta
