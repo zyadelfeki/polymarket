@@ -51,7 +51,9 @@ def test_drawdown_threshold_exact_decimal():
     If MAX_DRAWDOWN_PCT is int/float, floating-point epsilon can cause the
     threshold to be missed by tiny amounts.
 
-    This test verifies exact Decimal threshold behaviour.
+    This test isolates the drawdown path by pinning daily_start_capital to
+    the same value as current_capital, so the daily-loss check always reads 0%
+    and cannot fire before the drawdown check is reached.
     """
     breaker = _make_breaker("100")
 
@@ -63,18 +65,23 @@ def test_drawdown_threshold_exact_decimal():
     mock_settings.MAX_DAILY_TRADES = 10000
 
     with patch("risk.circuit_breaker.settings", mock_settings):
-        # 19.99% drawdown — must NOT trip
+        # Pin daily_start_capital to current_capital so daily-loss path
+        # always reads 0% loss and cannot fire ahead of the drawdown check.
         breaker.peak_capital = Decimal("100")
         breaker.current_capital = Decimal("80.01")
+        breaker.daily_start_capital = Decimal("80.01")  # isolate drawdown path
+
+        # 19.99% drawdown — must NOT trip
         breaker._check_circuit_breaker()
         assert not breaker.breaker_triggered, "Breaker tripped too early at 19.99% drawdown"
 
-        # Reset state so _trigger_breaker's early-return guard doesn't block the next check
+        # Reset guard so _trigger_breaker's early-return doesn't skip the next call
         breaker.breaker_triggered = False
         breaker.breaker_reason = None
 
         # Exactly 20.00% drawdown — MUST trip
         breaker.current_capital = Decimal("80.00")
+        breaker.daily_start_capital = Decimal("80.00")  # keep daily loss at 0%
         breaker._check_circuit_breaker()
         assert breaker.breaker_triggered, "Breaker did NOT trip at exactly 20% drawdown"
         assert "20" in breaker.breaker_reason
