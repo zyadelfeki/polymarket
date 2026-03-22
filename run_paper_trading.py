@@ -76,7 +76,7 @@ from config.settings import Settings
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
 from execution.idempotency_manager import IdempotencyManager
 from execution.paper_order_book import PaperOrderBook
-from execution.trade_executor import TradeExecutor
+from execution.trade_executor import MIN_BET_SIZE, TradeExecutor
 from integrations.charlie_booster import CharliePredictionGate
 from risk.circuit_breaker import CircuitBreaker
 from risk.kelly_sizing import KellySizer
@@ -150,6 +150,10 @@ def settle_open_positions(
     Wire in real Polymarket resolution data here when available.
 
     Returns the number of positions settled this cycle.
+
+    Key invariant: pos.size is already the post-clamp size (mirroring the
+    executor's MIN_BET_SIZE clamp), so crediting pos.size exactly reverses
+    the earlier bankroll debit with no drift.
     """
     now = datetime.now(timezone.utc)
     settled = 0
@@ -169,6 +173,9 @@ def settle_open_positions(
             continue
 
         # Market window has closed — settle neutrally.
+        # pos.size == the clamped size written by PaperOrderBook.record_order
+        # (which mirrors TradeExecutor's MIN_BET_SIZE clamp).  This guarantees
+        # that bankroll_tracker.balance returns exactly to the pre-trade value.
         bankroll_tracker.balance += pos.size
         circuit_breaker.record_trade(profit=Decimal("0"), win=True)
         order_book.remove_position(pos.market_id, pos.side)
@@ -236,7 +243,12 @@ async def run_loop(
         for opp in opportunities:
             market_id = str(opp.get("market_id", ""))
             side = str(opp.get("side", "YES")).upper()
-            size = Decimal(str(opp.get("size", "0")))
+            raw_size = Decimal(str(opp.get("size", "0")))
+            # Mirror TradeExecutor's MIN_BET_SIZE clamp here so that the size
+            # we record in the order book always matches what the executor
+            # actually debits from the bankroll.  Without this, neutral
+            # settlement would return a different amount than was staked.
+            effective_size = max(raw_size, MIN_BET_SIZE) if raw_size > Decimal("0") else raw_size
             entry_price = Decimal(str(opp.get("market_price", "0.5")))
             end_date = str(opp.get("end_date", ""))
 
@@ -244,7 +256,7 @@ async def run_loop(
             idem_key = idempotency.generate_key(
                 market_id=market_id,
                 side=side,
-                size=size,
+                size=raw_size,
                 price=entry_price,
                 strategy="charlie_gate",
             )
@@ -278,7 +290,7 @@ async def run_loop(
                 order_book.record_order(
                     market_id=market_id,
                     side=side,
-                    size=size,
+                    size=effective_size,  # post-clamp — matches executor debit
                     entry_price=entry_price,
                     kelly_fraction=Decimal(str(opp.get("kelly_fraction", "0"))),
                     edge=Decimal(str(opp.get("edge", "0"))),
