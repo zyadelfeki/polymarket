@@ -22,6 +22,11 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
+# Keep the paper book's notion of "size" in sync with the executor's
+# placement logic so bankroll accounting and neutral settlement do not
+# drift due to the Polymarket minimum bet clamp.
+from execution.trade_executor import MIN_BET_SIZE
+
 try:
     import structlog
     logger = structlog.get_logger(__name__)
@@ -34,7 +39,7 @@ except ImportError:
 class PaperPosition:
     market_id: str
     side: str           # "YES" or "NO"
-    size: Decimal       # USDC staked
+    size: Decimal       # USDC staked (after min-bet clamp)
     entry_price: Decimal
     kelly_fraction: Decimal
     edge: Decimal
@@ -82,9 +87,7 @@ class PaperOrderBook:
         question: str,
         end_date: str = "",
     ) -> bool:
-        """
-        Record a new paper order.  Returns True if recorded, False if duplicate.
-        """
+        """Record a new paper order.  Returns True if recorded, False if duplicate."""
         side = side.upper()
         if self.is_duplicate(market_id, side):
             self._orders_rejected_duplicate += 1
@@ -99,11 +102,17 @@ class PaperOrderBook:
                 pass
             return False
 
+        # Mirror TradeExecutor's minimum bet clamp so that the paper
+        # position size matches the actual size sent to the exchange.
+        effective_size = size
+        if size < MIN_BET_SIZE:
+            effective_size = MIN_BET_SIZE
+
         key = (market_id, side)
         self._positions[key] = PaperPosition(
             market_id=market_id,
             side=side,
-            size=size,
+            size=effective_size,
             entry_price=entry_price,
             kelly_fraction=kelly_fraction,
             edge=edge,
@@ -111,7 +120,7 @@ class PaperOrderBook:
             question=question[:120],
             end_date=end_date,
         )
-        self._total_staked += size
+        self._total_staked += effective_size
         self._orders_placed += 1
 
         try:
@@ -119,7 +128,7 @@ class PaperOrderBook:
                 "paper_order_placed",
                 market_id=market_id,
                 side=side,
-                size=str(size),
+                size=str(effective_size),
                 entry_price=str(entry_price),
                 edge=str(edge),
                 confidence=str(confidence),
