@@ -1,5 +1,5 @@
 from decimal import Decimal, ROUND_DOWN
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncio
 import logging
 from typing import Optional
@@ -19,7 +19,7 @@ class CircuitBreaker:
         self.peak_capital = Decimal(str(initial_capital))
 
         self.daily_start_capital = Decimal(str(initial_capital))
-        self.daily_reset_time = datetime.utcnow()
+        self.daily_reset_time = datetime.now(timezone.utc)
 
         self.consecutive_losses = 0
         self.trades_today = 0
@@ -36,7 +36,7 @@ class CircuitBreaker:
         if self.current_capital > self.peak_capital:
             self.peak_capital = self.current_capital
 
-        if (datetime.utcnow() - self.daily_reset_time) > timedelta(days=1):
+        if (datetime.now(timezone.utc) - self.daily_reset_time) > timedelta(days=1):
             self._reset_daily()
 
     def record_trade(self, profit: Decimal, win: bool):
@@ -101,7 +101,7 @@ class CircuitBreaker:
 
         self.breaker_triggered = True
         self.breaker_reason = reason
-        self.breaker_until = datetime.utcnow() + timedelta(hours=hours)
+        self.breaker_until = datetime.now(timezone.utc) + timedelta(hours=hours)
 
         logger.critical("CIRCUIT BREAKER TRIGGERED: %s", reason)
         logger.critical("Trading paused until: %s", self.breaker_until)
@@ -125,7 +125,7 @@ class CircuitBreaker:
         if not self.breaker_triggered:
             return True
 
-        if datetime.utcnow() >= self.breaker_until:
+        if datetime.now(timezone.utc) >= self.breaker_until:
             self._reset_breaker()
             return True
 
@@ -146,7 +146,7 @@ class CircuitBreaker:
         self.current_capital = Decimal(str(capital))
         self.peak_capital = Decimal(str(capital))
         self.daily_start_capital = Decimal(str(capital))
-        self.daily_reset_time = datetime.utcnow()
+        self.daily_reset_time = datetime.now(timezone.utc)
         logger.info("Circuit breaker baseline reset: $%s", str(capital))
 
     def _reset_breaker(self):
@@ -158,7 +158,7 @@ class CircuitBreaker:
 
     def _reset_daily(self):
         self.daily_start_capital = self.current_capital
-        self.daily_reset_time = datetime.utcnow()
+        self.daily_reset_time = datetime.now(timezone.utc)
         self.trades_today = 0
         logger.info(
             "Daily reset. Starting capital: $%s",
