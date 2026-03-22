@@ -3,7 +3,7 @@ Additional tests to improve execution and risk coverage.
 Exercises kelly sizing, idempotency manager, and executor math paths.
 """
 from decimal import Decimal
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -110,7 +110,6 @@ async def test_executor_calculate_bet_size_and_kelly():
 
 def test_trade_executor_requires_circuit_breaker():
     """TradeExecutor must refuse to instantiate without a circuit_breaker."""
-    from unittest.mock import MagicMock
     from execution.trade_executor import TradeExecutor
 
     with pytest.raises(RuntimeError, match="circuit_breaker required"):
@@ -124,17 +123,14 @@ def test_trade_executor_requires_circuit_breaker():
 
 @pytest.mark.asyncio
 async def test_execute_trade_blocked_when_circuit_breaker_tripped():
-    """execute_trade must return False and never call place_bet when breaker is open."""
-    from unittest.mock import MagicMock, AsyncMock
+    """execute_trade must return False and never call place_order when breaker is open."""
     from execution.trade_executor import TradeExecutor
 
     mock_polymarket = AsyncMock()
-    mock_polymarket.place_bet = AsyncMock(return_value=True)
-
-    mock_kelly = MagicMock()
-    mock_kelly.calculate_bet_size.return_value = 1.50
+    mock_polymarket.place_order = AsyncMock(return_value={"success": True, "order_id": "x"})
 
     mock_bankroll = MagicMock()
+    mock_bankroll.current_balance = Decimal("100")
     mock_db = MagicMock()
     mock_db.log_trade.return_value = 1
 
@@ -145,39 +141,42 @@ async def test_execute_trade_blocked_when_circuit_breaker_tripped():
     executor = TradeExecutor(
         polymarket_client=mock_polymarket,
         bankroll_tracker=mock_bankroll,
-        kelly_sizer=mock_kelly,
+        kelly_sizer=MagicMock(),
         db=mock_db,
         circuit_breaker=mock_breaker,
     )
 
-    opportunity = {
+    result = await executor.execute_trade({
         "market_id": "test_market",
         "side": "YES",
         "confidence": 0.75,
         "edge": 0.10,
         "market_price": 0.50,
-    }
-
-    result = await executor.execute_trade(opportunity)
+    })
 
     assert result is False
-    mock_polymarket.place_bet.assert_not_called()
+    mock_polymarket.place_order.assert_not_called()
     mock_breaker.is_trading_allowed.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_execute_trade_records_after_placement():
-    """execute_trade must call circuit_breaker.record_trade after a successful bet."""
-    from unittest.mock import MagicMock, AsyncMock, call
+async def test_execute_trade_returns_true_on_success():
+    """
+    execute_trade must return True when place_order succeeds.
+
+    Design invariant: circuit_breaker.record_trade() is NOT called on
+    placement — only when the market settles (run_paper_trading.py
+    settle_open_positions).  This test explicitly asserts that invariant.
+    """
     from execution.trade_executor import TradeExecutor
 
     mock_polymarket = AsyncMock()
-    mock_polymarket.place_bet = AsyncMock(return_value=True)
-
-    mock_kelly = MagicMock()
-    mock_kelly.calculate_bet_size.return_value = 2.00
+    mock_polymarket.place_order = AsyncMock(
+        return_value={"success": True, "order_id": "ord_42"}
+    )
 
     mock_bankroll = MagicMock()
+    mock_bankroll.current_balance = Decimal("100")
     mock_db = MagicMock()
     mock_db.log_trade.return_value = 42
 
@@ -187,27 +186,113 @@ async def test_execute_trade_records_after_placement():
     executor = TradeExecutor(
         polymarket_client=mock_polymarket,
         bankroll_tracker=mock_bankroll,
-        kelly_sizer=mock_kelly,
+        kelly_sizer=None,
         db=mock_db,
         circuit_breaker=mock_breaker,
     )
 
-    opportunity = {
+    result = await executor.execute_trade({
         "market_id": "test_market",
         "side": "YES",
         "confidence": 0.80,
         "edge": 0.12,
         "market_price": 0.50,
-    }
-
-    result = await executor.execute_trade(opportunity)
+        "kelly_size": 2.00,
+        "token_id": "tok_001",
+    })
 
     assert result is True
-    mock_breaker.record_trade.assert_called_once()
-    call_kwargs = mock_breaker.record_trade.call_args
-    # profit should be negative (capital at risk)
-    profit_arg = call_kwargs[1].get("profit") or call_kwargs[0][0]
-    assert profit_arg < Decimal("0"), "record_trade profit must be negative on trade open"
+    mock_polymarket.place_order.assert_called_once()
+    # record_trade is NOT called on placement — only on settlement.
+    mock_breaker.record_trade.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_trade_min_bet_clamp():
+    """
+    When kelly_size < MIN_BET_SIZE but balance >= MIN_BET_SIZE, executor
+    must clamp to MIN_BET_SIZE and still return True.
+    """
+    from execution.trade_executor import TradeExecutor, MIN_BET_SIZE
+
+    placed_sizes = []
+
+    async def capture_order(token_id, side, size, price):
+        placed_sizes.append(size)
+        return {"success": True, "order_id": "ord_min"}
+
+    mock_polymarket = AsyncMock()
+    mock_polymarket.place_order = capture_order
+
+    mock_bankroll = MagicMock()
+    mock_bankroll.current_balance = Decimal("100")
+    mock_db = MagicMock()
+    mock_db.log_trade.return_value = 1
+    mock_breaker = MagicMock()
+    mock_breaker.is_trading_allowed.return_value = True
+
+    executor = TradeExecutor(
+        polymarket_client=mock_polymarket,
+        bankroll_tracker=mock_bankroll,
+        kelly_sizer=None,
+        db=mock_db,
+        circuit_breaker=mock_breaker,
+    )
+
+    result = await executor.execute_trade({
+        "market_id": "mkt_clamp",
+        "side": "YES",
+        "confidence": 0.70,
+        "edge": 0.08,
+        "market_price": 0.50,
+        "kelly_size": 0.30,
+        "token_id": "tok_002",
+    })
+
+    assert result is True
+    assert len(placed_sizes) == 1
+    assert placed_sizes[0] == MIN_BET_SIZE, (
+        f"Expected clamp to {MIN_BET_SIZE}, got {placed_sizes[0]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_trade_rejected_below_minimum_insufficient_balance():
+    """
+    When kelly_size < MIN_BET_SIZE AND balance < MIN_BET_SIZE, executor
+    must return False without calling place_order.
+    """
+    from execution.trade_executor import TradeExecutor
+
+    mock_polymarket = AsyncMock()
+    mock_polymarket.place_order = AsyncMock()
+
+    mock_bankroll = MagicMock()
+    mock_bankroll.current_balance = Decimal("0.50")
+    mock_db = MagicMock()
+    mock_breaker = MagicMock()
+    mock_breaker.is_trading_allowed.return_value = True
+
+    executor = TradeExecutor(
+        polymarket_client=mock_polymarket,
+        bankroll_tracker=mock_bankroll,
+        kelly_sizer=None,
+        db=mock_db,
+        circuit_breaker=mock_breaker,
+    )
+
+    result = await executor.execute_trade({
+        "market_id": "mkt_broke",
+        "side": "YES",
+        "confidence": 0.70,
+        "edge": 0.08,
+        "market_price": 0.50,
+        "kelly_size": 0.30,
+        "token_id": "tok_003",
+    })
+
+    assert result is False
+    mock_polymarket.place_order.assert_not_called()
 
 
 if __name__ == "__main__":

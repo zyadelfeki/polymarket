@@ -4,8 +4,8 @@ Tests for Issue #121: no float arithmetic in trade_executor active path.
 Every money-sensitive value (bet_size, entry_price, shares, edge, confidence)
 must be a str-encoded Decimal in the persisted trade_record, not a float.
 """
-from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, call
+from decimal import Decimal, ROUND_DOWN
+from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from execution.trade_executor import TradeExecutor, MIN_BET_SIZE
@@ -45,13 +45,13 @@ def _make_executor(placed_records, balance="100", kelly_raw=None):
 async def test_execute_trade_no_float_in_trade_record():
     """
     bet_size, entry_price, shares, edge, confidence in trade_record must all
-    be str, not float.  float values here cause silent precision loss in JSON
+    be str, not float.  float values cause silent precision loss in JSON
     serialisation and downstream PnL arithmetic.
     """
     records = []
     executor = _make_executor(records)
 
-    opp = {
+    result = await executor.execute_trade({
         "market_id": "mkt_1",
         "side": "YES",
         "confidence": "0.75",
@@ -60,18 +60,17 @@ async def test_execute_trade_no_float_in_trade_record():
         "kelly_size": "2.50",
         "token_id": "tok_1",
         "question": "Test market",
-    }
+    })
 
-    result = await executor.execute_trade(opp)
     assert result is True
     assert len(records) == 1
     rec = records[0]
 
     for field in ("bet_size", "entry_price", "shares", "edge", "confidence"):
         assert isinstance(rec[field], str), (
-            f"trade_record['{field}'] must be str(Decimal), got {type(rec[field])}: {rec[field]!r}"
+            f"trade_record['{field}'] must be str(Decimal), "
+            f"got {type(rec[field])}: {rec[field]!r}"
         )
-        assert isinstance(float, type(rec[field])) is False
         # Must round-trip through Decimal without error
         Decimal(rec[field])
 
@@ -79,15 +78,18 @@ async def test_execute_trade_no_float_in_trade_record():
 @pytest.mark.asyncio
 async def test_shares_calculation_decimal_precision():
     """
-    shares = bet_size / market_price must be exact Decimal division.
-    float(2.50) / float(0.65) = 3.846153846153846... with float rounding.
-    Decimal('2.50') / Decimal('0.65') gives the same digits but is stored
-    losslessly as a str.  Verify the stored value is exactly reproducible.
+    shares = bet_size / market_price must use ROUND_DOWN (shares must never
+    be overstated) and be stored as str(Decimal) to 8 decimal places.
+
+    Concrete case: Decimal('2.50') / Decimal('0.65') = 3.846153846153...
+    With ROUND_DOWN to 8dp -> 3.84615384  (truncate, never round up)
+    With ROUND_HALF_EVEN  -> 3.84615385  (rounds up the last digit)
+    The executor must use ROUND_DOWN.
     """
     records = []
     executor = _make_executor(records)
 
-    opp = {
+    await executor.execute_trade({
         "market_id": "mkt_shares",
         "side": "YES",
         "confidence": "0.70",
@@ -95,25 +97,24 @@ async def test_shares_calculation_decimal_precision():
         "market_price": "0.65",
         "kelly_size": "2.50",
         "token_id": "tok_shares",
-    }
+    })
 
-    await executor.execute_trade(opp)
     rec = records[0]
-
     shares = Decimal(rec["shares"])
-    expected = (Decimal("2.50") / Decimal("0.65")).quantize(Decimal("0.00000001"))
+
+    # Expected: ROUND_DOWN (truncate) — never overstate shares
+    expected = (Decimal("2.50") / Decimal("0.65")).quantize(
+        Decimal("0.00000001"), rounding=ROUND_DOWN
+    )
     assert shares == expected, f"Shares mismatch: {shares} != {expected}"
-    # Must NOT equal the float-rounded version if there is any discrepancy
-    # (this is mainly a documentation assertion — both may agree to 8dp)
     assert isinstance(rec["shares"], str)
 
 
 @pytest.mark.asyncio
 async def test_payout_odds_decimal_no_float():
     """
-    When kelly_size is absent, the executor computes payout_odds = 1/market_price.
+    When kelly_size is absent, executor computes payout_odds = 1/market_price.
     That division must be Decimal/Decimal, not float/float.
-    Verify by checking what calculate_bet_size receives.
     """
     records = []
     captured_args = []
@@ -142,16 +143,15 @@ async def test_payout_odds_decimal_no_float():
         circuit_breaker=mock_breaker,
     )
 
-    opp = {
+    await executor.execute_trade({
         "market_id": "mkt_kelly",
         "side": "YES",
         "confidence": "0.70",
         "edge": "0.10",
         "market_price": "0.50",
         "token_id": "tok_k",
-    }
+    })
 
-    await executor.execute_trade(opp)
     assert len(captured_args) == 1
     confidence, payout_odds, edge = captured_args[0]
 
@@ -167,7 +167,7 @@ async def test_market_price_zero_guard():
     records = []
     executor = _make_executor(records)
 
-    opp = {
+    result = await executor.execute_trade({
         "market_id": "mkt_zero",
         "side": "YES",
         "confidence": "0.70",
@@ -175,9 +175,8 @@ async def test_market_price_zero_guard():
         "market_price": "0",
         "kelly_size": "1.00",
         "token_id": "tok_zero",
-    }
+    })
 
-    result = await executor.execute_trade(opp)
     assert result is True
     assert records[0]["shares"] == "0"
 
