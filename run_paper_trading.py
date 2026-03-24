@@ -155,11 +155,10 @@ def settle_open_positions(
     Neutral settlement: full stake refunded, pnl=0, circuit_breaker win=True.
     This prevents the circuit breaker from firing on unresolved markets.
 
-    IMPORTANT: uses order_book.settle_open_positions() so that
-    PaperOrderBook's internal _total_staked and _total_pnl stay consistent
-    with what is actually staked/returned.  The old code called
-    order_book.remove_position() directly, which skipped all internal
-    accounting and left the order book summary permanently stale.
+    Uses order_book.settle_open_positions() so that PaperOrderBook's internal
+    _total_staked and _total_pnl stay consistent with what is actually
+    staked/returned.  Calling order_book.remove_position() directly would
+    bypass that internal accounting and leave the order book summary stale.
 
     Returns the number of positions settled this cycle.
     """
@@ -192,8 +191,15 @@ def settle_open_positions(
             # Refund the clamped stake (pos.size is already the effective
             # amount after the MIN_BET_SIZE clamp applied in record_order).
             bankroll_tracker.balance += settled_pos.size
+
+            # Keep the circuit breaker's capital view in sync with the real
+            # bankroll after every settlement credit.  Without this call the
+            # breaker sees a progressively lower capital figure and may fire a
+            # false drawdown alert on long-running sessions.
+            circuit_breaker.update_capital(bankroll_tracker.current_balance)
+
             # Neutral outcome = no real win/loss; tell circuit breaker it
-            # was a win so consecutive-loss counter is not incremented.
+            # was a win so the consecutive-loss counter is not incremented.
             circuit_breaker.record_trade(
                 profit=Decimal("0"),
                 win=True,
@@ -282,9 +288,9 @@ async def run_loop(
             # --- Idempotency check -------------------------------------------
             # Key is built from the raw Kelly size so price-tick movements
             # that produce a trivially different Kelly fraction don't
-            # immediately bypass the duplicate guard.  Still, only
-            # SUCCESSFUL placements are ever written to the cache so a
-            # failed attempt never poisons future cycles.
+            # immediately bypass the duplicate guard.  Only SUCCESSFUL
+            # placements are ever written to the cache so a failed attempt
+            # never poisons future cycles.
             idem_key = idempotency.generate_key(
                 market_id=market_id,
                 side=side,
@@ -324,16 +330,13 @@ async def run_loop(
 
             if success:
                 orders_placed += 1
-                # Write to idempotency cache ONLY after confirmed success.
-                # record_placement() increments the attempt counter correctly
-                # and persists to disk atomically.
-                idempotency.record_placement(
-                    idem_key,
-                    {"success": True, "market_id": market_id, "side": side},
-                )
-                # Record in order book using the raw Kelly size; the order book
-                # applies the same MIN_BET_SIZE clamp internally so its
-                # accounting agrees with what the executor and bankroll debited.
+
+                # Write to the order book FIRST, then to the idempotency cache.
+                # This ordering guarantees atomicity: if record_placement()
+                # raises after record_order() succeeds, the order book dedup
+                # guard catches any retry on the next cycle.  The reverse
+                # ordering would poison the idem cache on a mid-write crash,
+                # permanently blocking re-entry with no log trace.
                 order_book.record_order(
                     market_id=market_id,
                     side=side,
@@ -344,6 +347,22 @@ async def run_loop(
                     confidence=Decimal(str(opp.get("confidence", "0"))),
                     question=str(opp.get("question", "")),
                     end_date=end_date,
+                )
+                # Only write to idempotency cache after the order book record
+                # has been committed.  record_placement() increments the
+                # attempt counter correctly and persists to disk atomically.
+                idempotency.record_placement(
+                    idem_key,
+                    {"success": True, "market_id": market_id, "side": side},
+                )
+
+                # Keep the circuit breaker's capital view in sync after each
+                # successful placement.  execute_trade() debits the bankroll
+                # via bankroll.add_trade() but the breaker is never notified,
+                # so without this call its drawdown calculation drifts lower
+                # on every trade and may fire a false circuit-break.
+                executor.circuit_breaker.update_capital(
+                    bankroll_tracker.current_balance
                 )
 
         # --- Settle resolved positions ---------------------------------------
