@@ -13,6 +13,7 @@ Exhaustive coverage of every production code path:
 
 Run with:
     pytest tests/test_master_suite.py -v --tb=short
+
 """
 
 from __future__ import annotations
@@ -1011,7 +1012,7 @@ class TestAccountingInvariants:
     """
     The fundamental contract:
       bankroll_debit == order_book_staked_size (post-clamp)
-    These tests run a full simulated placement → settle cycle.
+    These tests run a full simulated placement -> settle cycle.
     """
 
     def _full_cycle(
@@ -1310,8 +1311,7 @@ class TestRunLoop:
         }
 
         scanner_mock = MagicMock()
-        scanner_mock.scan = AsyncMock(side_effect=[opp.__class__([opp]), StopAsyncIteration()])
-        # Actually return list on first call, then KeyboardInterrupt to stop loop
+        # Return list on first call, then KeyboardInterrupt to stop the loop
         scanner_mock.scan = AsyncMock(side_effect=[[opp], KeyboardInterrupt()])
 
         charlie_mock = MagicMock()
