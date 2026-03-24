@@ -2,6 +2,12 @@
 Idempotency layer for order execution.
 Prevents duplicate orders during network retries.
 Solves the "Two Generals Problem" in distributed systems.
+
+Admission policy
+----------------
+Only SUCCESSFUL placements enter the deduplication cache.
+Failed placements (broker reject, network error, etc.) must NOT be cached —
+the caller may legitimately retry and the retry should go through.
 """
 
 import hashlib
@@ -96,6 +102,9 @@ class IdempotencyManager:
     def is_duplicate(self, key: str) -> bool:
         if key in self._cache:
             entry = self._cache[key]
+            # Only entries marked as successful are considered duplicates.
+            if not entry.get("success"):
+                return False
             age = time.time() - entry.get("timestamp", 0)
             if age < self.cache_ttl:
                 if _structlog_available:
@@ -137,27 +146,66 @@ class IdempotencyManager:
         return None
 
     def record(self, key: str, status: str = "pending") -> None:
+        """Record a pending attempt.  Does NOT overwrite an existing success entry."""
         existing = self._cache.get(key, {})
+        # Never downgrade a successful entry back to pending.
+        if existing.get("success"):
+            return
         attempts = existing.get("attempts", 0) + 1
         self._cache[key] = {
             "timestamp": time.time(),
             "status": status,
             "attempts": attempts,
             "result": existing.get("result"),
-            "success": existing.get("success"),
+            "success": False,
             "order_id": existing.get("order_id"),
         }
-        self._save_cache()
+        # Pending entries are not persisted to disk — only successes are.
 
     def update_result(self, key: str, result: Dict[str, Any]) -> None:
+        """Update the cache with a broker result.  Only persists on success."""
         serialized = self._serialize_value(result)
+        is_success = bool(serialized.get("success")) if isinstance(serialized, dict) else False
         existing = self._cache.get(key, {})
         self._cache[key] = {
             "timestamp": existing.get("timestamp", time.time()),
-            "status": "success" if serialized.get("success") else "failed",
+            "status": "success" if is_success else "failed",
             "attempts": existing.get("attempts", 1),
             "result": serialized,
-            "success": serialized.get("success") if isinstance(serialized, dict) else False,
+            "success": is_success,
+            "order_id": serialized.get("order_id") if isinstance(serialized, dict) else None,
+        }
+        if is_success:
+            self._save_cache()
+        else:
+            # Failed results: remove from cache so caller can retry freely.
+            del self._cache[key]
+
+    def record_placement(self, key: str, result: Dict[str, Any]) -> None:
+        """
+        Record the final result of a placement attempt.
+
+        This is the canonical method callers should use after receiving a
+        broker response.  Behaviour:
+        - result["success"] is True  => enters the dedup cache; persisted to disk.
+        - result["success"] is False => NOT cached; the next attempt is allowed.
+
+        Calling record_placement multiple times for the same key increments the
+        attempts counter on success entries.
+        """
+        serialized = self._serialize_value(result)
+        is_success = bool(serialized.get("success")) if isinstance(serialized, dict) else False
+        if not is_success:
+            # Don't cache failed placements.
+            return
+        existing = self._cache.get(key, {})
+        attempts = existing.get("attempts", 0) + 1
+        self._cache[key] = {
+            "timestamp": time.time(),
+            "status": "success",
+            "attempts": attempts,
+            "result": serialized,
+            "success": True,
             "order_id": serialized.get("order_id") if isinstance(serialized, dict) else None,
         }
         self._save_cache()

@@ -11,10 +11,11 @@ Key invariants
   smooth Kelly ramp, fee deduction, and OFI-conflict halving.  We do NOT
   recompute it here.
 - Minimum bet floor is $1.00 (Polymarket enforced minimum).  Orders below
-  this floor are logged and dropped — they will never succeed on-chain.
+  this floor are clamped when balance allows, or dropped otherwise.
 - circuit_breaker.record_trade() is NOT called here.  Placement != loss.
   The settlement loop in run_paper_trading.py calls it after resolution.
 - circuit_breaker is required at construction time; raises RuntimeError otherwise.
+- All monetary values stored in trade records are str(Decimal) — never float.
 """
 
 import asyncio
@@ -38,6 +39,15 @@ else:
 
 
 MIN_BET_SIZE = Decimal("1.00")  # Polymarket enforced minimum order size (USDC)
+
+
+def _dec(value, fallback="0") -> Decimal:
+    """Convert any numeric type to Decimal safely, avoiding float binary repr."""
+    if value is None:
+        return Decimal(str(fallback))
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
 
 
 def _log(level: str, event: str, **kwargs):
@@ -70,24 +80,26 @@ class TradeExecutor:
 
         market_id = str(opportunity["market_id"])
         side = str(opportunity.get("side") or opportunity.get("true_outcome") or "YES").upper()
-        confidence = float(opportunity.get("confidence", 0.0))
-        edge = float(opportunity.get("edge", 0.0))
-        market_price = float(opportunity.get("market_price", 0.5) or 0.5)
+        confidence = _dec(opportunity.get("confidence", "0"))
+        edge = _dec(opportunity.get("edge", "0"))
+        market_price = _dec(opportunity.get("market_price", "0.5") or "0.5")
+        if market_price == Decimal("0"):
+            market_price = Decimal("0.5")
         question = str(opportunity.get("question", ""))[:80]
         token_id = opportunity.get("token_id") or market_id
-        balance = Decimal(str(self.bankroll.current_balance))
+        balance = _dec(self.bankroll.current_balance)
 
         # --- Sizing -----------------------------------------------------------
         if "kelly_size" in opportunity and opportunity["kelly_size"] is not None:
-            bet_size = Decimal(str(opportunity["kelly_size"]))
+            bet_size = _dec(opportunity["kelly_size"])
         else:
             if self.kelly is not None:
-                payout_odds = 1.0 / market_price if market_price > 0 else 2.0
+                payout_odds = Decimal("1") / market_price if market_price > 0 else Decimal("2")
                 raw = self.kelly.calculate_bet_size(
-                    confidence, payout_odds, edge,
+                    float(confidence), float(payout_odds), float(edge),
                     strategy=opportunity.get("strategy", "default")
                 )
-                bet_size = Decimal(str(raw))
+                bet_size = _dec(raw)
             else:
                 _log(
                     "warning",
@@ -109,8 +121,8 @@ class TradeExecutor:
                     bet_size=str(MIN_BET_SIZE),
                     min_bet_size=str(MIN_BET_SIZE),
                     side=side,
-                    edge=f"{edge:.4f}",
-                    confidence=f"{confidence:.4f}",
+                    edge=str(edge),
+                    confidence=str(confidence),
                 )
                 bet_size = MIN_BET_SIZE
             else:
@@ -123,8 +135,8 @@ class TradeExecutor:
                     min_bet_size=str(MIN_BET_SIZE),
                     balance=str(balance),
                     side=side,
-                    edge=f"{edge:.4f}",
-                    confidence=f"{confidence:.4f}",
+                    edge=str(edge),
+                    confidence=str(confidence),
                 )
                 return False
 
@@ -134,36 +146,36 @@ class TradeExecutor:
             market_id=market_id,
             question=question,
             side=side,
-            market_price=f"{market_price:.4f}",
-            edge=f"{edge:.4f}",
-            confidence=f"{confidence:.4f}",
+            market_price=str(market_price),
+            edge=str(edge),
+            confidence=str(confidence),
             bet_size=str(bet_size),
             token_id=token_id,
         )
 
         # Pass positional args so both PolymarketClient (V1, param name=amount)
         # and PolymarketClientV2 (param name=size) work without branching.
-        price_dec = Decimal(str(market_price))
         order_result = await self.polymarket.place_order(
-            token_id,   # positional 1: token_id
-            side,       # positional 2: side
-            bet_size,   # positional 3: size (V2) / amount (V1)
-            price_dec,  # positional 4: price
+            token_id,    # positional 1: token_id
+            side,        # positional 2: side
+            bet_size,    # positional 3: size (V2) / amount (V1)
+            market_price,  # positional 4: price
         )
         success = bool(order_result and order_result.get("success"))
 
         if success:
+            shares = bet_size / market_price if market_price > 0 else Decimal("0")
             trade_record = {
                 "market_id": market_id,
                 "market_title": question,
                 "side": side,
-                "entry_price": market_price,
-                "bet_size": float(bet_size),
-                "shares": float(bet_size) / market_price if market_price > 0 else 0,
+                "entry_price": str(market_price),
+                "bet_size": str(bet_size),
+                "shares": str(shares),
                 "status": "OPEN",
                 "strategy": opportunity.get("strategy", "charlie_gate"),
-                "edge": edge,
-                "confidence": confidence,
+                "edge": str(edge),
+                "confidence": str(confidence),
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "token_id": token_id,
                 "kelly_fraction": str(opportunity.get("kelly_fraction", "")),
@@ -192,7 +204,7 @@ class TradeExecutor:
                 bet_size=str(bet_size),
                 order_id=order_result.get("order_id") if order_result else None,
                 trade_id=f"trade_{trade_id}",
-                edge=f"{edge:.4f}",
+                edge=str(edge),
             )
             return True
         else:
@@ -203,7 +215,7 @@ class TradeExecutor:
                 question=question,
                 side=side,
                 bet_size=str(bet_size),
-                edge=f"{edge:.4f}",
+                edge=str(edge),
             )
             return False
 

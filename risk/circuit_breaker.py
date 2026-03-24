@@ -1,6 +1,7 @@
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncio
+import inspect
 import logging
 from typing import Optional
 from config.settings import settings
@@ -15,7 +16,7 @@ class CircuitBreaker:
         self.peak_capital = initial_capital
         
         self.daily_start_capital = initial_capital
-        self.daily_reset_time = datetime.utcnow()
+        self.daily_reset_time = datetime.now(timezone.utc)
         
         self.consecutive_losses = 0
         self.trades_today = 0
@@ -32,7 +33,7 @@ class CircuitBreaker:
         if new_capital > self.peak_capital:
             self.peak_capital = new_capital
         
-        if (datetime.utcnow() - self.daily_reset_time) > timedelta(days=1):
+        if (datetime.now(timezone.utc) - self.daily_reset_time) > timedelta(days=1):
             self._reset_daily()
     
     def record_trade(self, profit: Decimal, win: bool):
@@ -75,7 +76,7 @@ class CircuitBreaker:
         
         self.breaker_triggered = True
         self.breaker_reason = reason
-        self.breaker_until = datetime.utcnow() + timedelta(hours=hours)
+        self.breaker_until = datetime.now(timezone.utc) + timedelta(hours=hours)
         
         logger.critical(f"CIRCUIT BREAKER TRIGGERED: {reason}")
         logger.critical(f"Trading paused until: {self.breaker_until}")
@@ -86,20 +87,30 @@ class CircuitBreaker:
         )
 
     def _dispatch_alert(self, title: str, message: str) -> None:
+        """Fire-and-forget alert dispatch that is safe in both sync and async
+        contexts, and also safe when alert_service methods are plain mocks
+        (not coroutines) — e.g. during unit tests."""
         if not self.alert_service:
             return
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            asyncio.run(self.alert_service.send_critical_alert(title, message))
+            coro = self.alert_service.send_critical_alert(title, message)
+        except Exception:
             return
-        loop.create_task(self.alert_service.send_critical_alert(title, message))
+        # If the mock/stub returned a non-coroutine (e.g. MagicMock), bail out.
+        if not inspect.isawaitable(coro):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(coro)
+        except RuntimeError:
+            # No running loop — we are in a sync context, run it directly.
+            asyncio.run(coro)
     
     def is_trading_allowed(self) -> bool:
         if not self.breaker_triggered:
             return True
         
-        if datetime.utcnow() >= self.breaker_until:
+        if datetime.now(timezone.utc) >= self.breaker_until:
             self._reset_breaker()
             return True
         
@@ -120,7 +131,7 @@ class CircuitBreaker:
         self.current_capital = capital
         self.peak_capital = capital
         self.daily_start_capital = capital
-        self.daily_reset_time = datetime.utcnow()
+        self.daily_reset_time = datetime.now(timezone.utc)
         logger.info(f"Circuit breaker baseline reset: ${capital}")
     
     def _reset_breaker(self):
@@ -132,15 +143,15 @@ class CircuitBreaker:
     
     def _reset_daily(self):
         self.daily_start_capital = self.current_capital
-        self.daily_reset_time = datetime.utcnow()
+        self.daily_reset_time = datetime.now(timezone.utc)
         self.trades_today = 0
         logger.info(f"Daily reset. Starting capital: ${self.current_capital:.2f}")
     
-    def get_current_drawdown(self) -> float:
+    def get_current_drawdown(self) -> Decimal:
+        """Returns drawdown as a Decimal percentage (0-100)."""
         if self.peak_capital == 0:
-            return 0.0
-        drawdown = ((self.peak_capital - self.current_capital) / self.peak_capital) * Decimal("100")
-        return float(drawdown)
+            return Decimal("0")
+        return ((self.peak_capital - self.current_capital) / self.peak_capital) * Decimal("100")
     
     def get_status(self) -> dict:
         return {
@@ -148,9 +159,9 @@ class CircuitBreaker:
             "breaker_triggered": self.breaker_triggered,
             "breaker_reason": self.breaker_reason,
             "breaker_until": self.breaker_until.isoformat() if self.breaker_until else None,
-            "current_drawdown": self.get_current_drawdown(),
+            "current_drawdown": str(self.get_current_drawdown()),
             "consecutive_losses": self.consecutive_losses,
             "trades_today": self.trades_today,
-            "current_capital": float(self.current_capital),
-            "peak_capital": float(self.peak_capital)
+            "current_capital": str(self.current_capital),
+            "peak_capital": str(self.peak_capital),
         }

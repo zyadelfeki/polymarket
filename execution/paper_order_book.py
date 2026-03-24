@@ -11,6 +11,8 @@ Design
   silently rejected with reason="duplicate_position_open".
 - ``settle(market_id, resolved_yes)`` closes all positions for a market and
   computes PnL.  Call this when you receive a resolution event.
+- ``settle_open_positions(market_id, outcome)`` supports neutral/win/loss
+  outcomes used by the run_paper_trading settlement loop.
 - ``summary()`` returns serializable stats for the monitoring dashboard.
 - Thread-safe within asyncio (single-threaded event loop); no locks needed.
 """
@@ -25,7 +27,10 @@ from typing import Dict, List, Optional, Tuple
 # Keep the paper book's notion of "size" in sync with the executor's
 # placement logic so bankroll accounting and neutral settlement do not
 # drift due to the Polymarket minimum bet clamp.
-from execution.trade_executor import MIN_BET_SIZE
+try:
+    from execution.trade_executor import MIN_BET_SIZE
+except ImportError:
+    MIN_BET_SIZE = Decimal("1.00")
 
 try:
     import structlog
@@ -104,8 +109,10 @@ class PaperOrderBook:
 
         # Mirror TradeExecutor's minimum bet clamp so that the paper
         # position size matches the actual size sent to the exchange.
+        # IMPORTANT: Only clamp strictly positive sub-minimum sizes.
+        # Zero is a valid sentinel (no bet placed) and must not be clamped.
         effective_size = size
-        if size < MIN_BET_SIZE:
+        if size > Decimal("0") and size < MIN_BET_SIZE:
             effective_size = MIN_BET_SIZE
 
         key = (market_id, side)
@@ -170,6 +177,63 @@ class PaperOrderBook:
                     market_id=market_id,
                     side=side,
                     won=won,
+                    size=str(pos.size),
+                    pnl=str(pos.pnl),
+                    question=pos.question[:80],
+                )
+            except Exception:
+                pass
+
+        return settled_positions
+
+    def settle_open_positions(
+        self,
+        market_id: str,
+        outcome: str = "neutral",
+    ) -> List[PaperPosition]:
+        """
+        Settle all open positions for a market with an explicit outcome string.
+
+        outcome:
+            "neutral" — the market resolved without a clear win/loss (e.g. N/A,
+                         cancelled, expired).  PnL is 0; stake is refunded.
+            "win"     — the position holder wins.  Computed same as settle(resolved_yes=True
+                         for YES positions, resolved_yes=False for NO positions).
+            "loss"    — the position holder loses.  PnL = -size.
+
+        Returns all affected PaperPosition objects with pnl populated.
+        """
+        settled_positions = []
+        for side in ("YES", "NO"):
+            key = (market_id, side)
+            pos = self._positions.get(key)
+            if pos is None or pos.settled:
+                continue
+
+            outcome_lower = outcome.lower()
+            if outcome_lower == "neutral":
+                pos.pnl = Decimal("0")
+            elif outcome_lower == "win":
+                payout = pos.size / pos.entry_price if pos.entry_price > 0 else Decimal("0")
+                pos.pnl = payout - pos.size
+            elif outcome_lower == "loss":
+                pos.pnl = -pos.size
+            else:
+                # Unknown outcome: treat as neutral
+                pos.pnl = Decimal("0")
+
+            pos.settled = True
+            pos.settled_at = time.monotonic()
+            self._total_pnl += pos.pnl
+            self._settled.append(pos)
+            settled_positions.append(pos)
+
+            try:
+                logger.info(
+                    "paper_position_settled_outcome",
+                    market_id=market_id,
+                    side=side,
+                    outcome=outcome,
                     size=str(pos.size),
                     pnl=str(pos.pnl),
                     question=pos.question[:80],
