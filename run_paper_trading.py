@@ -177,6 +177,13 @@ def settle_open_positions(
         # (which mirrors TradeExecutor's MIN_BET_SIZE clamp).  This guarantees
         # that bankroll_tracker.balance returns exactly to the pre-trade value.
         bankroll_tracker.balance += pos.size
+
+        # Keep the circuit breaker's capital view in sync with the real
+        # bankroll after every settlement credit.  Without this call the
+        # breaker sees a progressively lower capital figure and may fire a
+        # false drawdown alert on long-running sessions.
+        circuit_breaker.update_capital(bankroll_tracker.current_balance)
+
         circuit_breaker.record_trade(profit=Decimal("0"), win=True)
         order_book.remove_position(pos.market_id, pos.side)
         settled += 1
@@ -282,11 +289,12 @@ async def run_loop(
 
             if success:
                 orders_placed += 1
-                # Only write to the idempotency cache after the order is
-                # confirmed placed.  Recording before execution caused locally-
-                # rejected orders (e.g. bet_size below minimum) to poison the
-                # cache and permanently block re-attempts on subsequent cycles.
-                idempotency.update_result(idem_key, {"success": True})
+
+                # Record the order in the book first, then write to the
+                # idempotency cache.  This ordering ensures atomicity: if
+                # anything raises between the two writes, the idempotency
+                # cache will NOT mark the order as placed, so the next scan
+                # cycle can retry rather than silently skipping it forever.
                 order_book.record_order(
                     market_id=market_id,
                     side=side,
@@ -297,6 +305,20 @@ async def run_loop(
                     confidence=Decimal(str(opp.get("confidence", "0"))),
                     question=str(opp.get("question", "")),
                     end_date=end_date,
+                )
+                # Only write to the idempotency cache after the order book
+                # record has been committed.  Recording before execution caused
+                # locally-rejected orders (e.g. bet_size below minimum) to
+                # poison the cache and permanently block re-attempts on
+                # subsequent cycles.
+                idempotency.update_result(idem_key, {"success": True})
+
+                # Keep the circuit breaker's internal capital view in sync
+                # with the real bankroll after each successful placement.
+                # Without this, the breaker's drawdown calculation drifts
+                # lower on every trade and may fire a false circuit-break.
+                executor.circuit_breaker.update_capital(
+                    bankroll_tracker.current_balance
                 )
 
         # --- Settle resolved positions ---------------------------------------
