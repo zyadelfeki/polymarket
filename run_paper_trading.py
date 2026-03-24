@@ -2,27 +2,30 @@
 """
 Paper trading runner — the real continuous loop.
 
-This is the entry point that was missing: it connects
+This is the entry point that connects
 BTCPriceLevelScanner → IdempotencyManager → PaperOrderBook → TradeExecutor
-into a single loop that actually places paper orders.
+into a single loop that places paper orders.
 
 What this does
 --------------
 1. Scans every SCAN_INTERVAL_SECONDS for BTC price-level markets.
-2. For every opportunity returned by the scanner (already gate-approved
-   by CharliePredictionGate), it:
-   a. Checks IdempotencyManager — skip if this exact order was already
-      submitted this session.
+2. For every opportunity the scanner returns (already gate-approved by
+   CharliePredictionGate):
+   a. Checks IdempotencyManager — skip if a SUCCESSFUL order for this
+      exact market/side/price was already placed this session.  Rejected
+      orders are NOT cached so transient blocks never suppress re-entry.
    b. Checks PaperOrderBook — skip if an open position already exists
-      for this (market_id, side) pair (deduplication).
-   c. Calls TradeExecutor.execute_trade() — which calls place_order() on
+      for this (market_id, side) pair (deduplication within the book).
+   c. Calls TradeExecutor.execute_trade() which calls place_order() on
       the paper client.  Logs order_attempt / order_placed / order_rejected.
-3. After each scan, calls settle_open_positions() which resolves any markets
-   whose end_date has passed, crediting the bankroll and notifying the
-   circuit_breaker ONLY on resolved outcomes.
+3. After each scan, calls settle_open_positions() which resolves any
+   markets whose end_date has passed, crediting the bankroll and notifying
+   the circuit breaker ONLY on resolved outcomes.  Uses the order book's
+   own settle_open_positions() method so internal accounting stays correct.
 4. Logs a per-scan summary with open position count and PnL.
 5. Runs until interrupted.  Safe to restart: IdempotencyManager persists
-   to disk so duplicate orders are prevented across restarts.
+   successful placements to disk so duplicate orders are prevented across
+   restarts.
 
 Environment variables
 ---------------------
@@ -76,7 +79,7 @@ from config.settings import Settings
 from data_feeds.polymarket_client_v2 import PolymarketClientV2
 from execution.idempotency_manager import IdempotencyManager
 from execution.paper_order_book import PaperOrderBook
-from execution.trade_executor import MIN_BET_SIZE, TradeExecutor
+from execution.trade_executor import TradeExecutor, MIN_BET_SIZE
 from integrations.charlie_booster import CharliePredictionGate
 from risk.circuit_breaker import CircuitBreaker
 from risk.kelly_sizing import KellySizer
@@ -105,7 +108,7 @@ class _PaperDB:
             return 0
         try:
             with open(self._path, "r", encoding="utf-8") as fh:
-                lines = [l.strip() for l in fh if l.strip()]
+                lines = [ln.strip() for ln in fh if ln.strip()]
             return len(lines)
         except Exception:
             return 0
@@ -121,7 +124,11 @@ class _PaperDB:
 class _PaperBankrollTracker:
     """
     Tracks paper bankroll in memory.
+
     add_trade() is called by TradeExecutor after each successful order.
+    The executor passes bet_size = the POST-CLAMP value (i.e. at least
+    MIN_BET_SIZE when Kelly was below the floor), which matches exactly
+    what PaperOrderBook.record_order() now stores as PaperPosition.size.
     """
 
     def __init__(self, initial: Decimal) -> None:
@@ -145,18 +152,18 @@ def settle_open_positions(
     """
     Check each open PaperPosition.  If its end_date has passed, settle it.
 
-    Neutral settlement: stake returned, profit=0, win=True.
+    Neutral settlement: full stake refunded, pnl=0, circuit_breaker win=True.
     This prevents the circuit breaker from firing on unresolved markets.
-    Wire in real Polymarket resolution data here when available.
+
+    Uses order_book.settle_open_positions() so that PaperOrderBook's internal
+    _total_staked and _total_pnl stay consistent with what is actually
+    staked/returned.  Calling order_book.remove_position() directly would
+    bypass that internal accounting and leave the order book summary stale.
 
     Returns the number of positions settled this cycle.
-
-    Key invariant: pos.size is already the post-clamp size (mirroring the
-    executor's MIN_BET_SIZE clamp), so crediting pos.size exactly reverses
-    the earlier bankroll debit with no drift.
     """
     now = datetime.now(timezone.utc)
-    settled = 0
+    total_settled = 0
 
     for pos in list(order_book.get_open_positions()):
         if not pos.end_date:
@@ -172,33 +179,44 @@ def settle_open_positions(
         if now < end_dt:
             continue
 
-        # Market window has closed — settle neutrally.
-        # pos.size == the clamped size written by PaperOrderBook.record_order
-        # (which mirrors TradeExecutor's MIN_BET_SIZE clamp).  This guarantees
-        # that bankroll_tracker.balance returns exactly to the pre-trade value.
-        bankroll_tracker.balance += pos.size
-
-        # Keep the circuit breaker's capital view in sync with the real
-        # bankroll after every settlement credit.  Without this call the
-        # breaker sees a progressively lower capital figure and may fire a
-        # false drawdown alert on long-running sessions.
-        circuit_breaker.update_capital(bankroll_tracker.current_balance)
-
-        circuit_breaker.record_trade(profit=Decimal("0"), win=True)
-        order_book.remove_position(pos.market_id, pos.side)
-        settled += 1
-
-        log(
-            "info",
-            "position_settled_neutral",
-            market_id=pos.market_id,
-            side=pos.side,
-            bet_size=str(pos.size),
-            question=pos.question[:60],
-            end_date=pos.end_date,
+        # Settle through the order book so its internal counters update.
+        # settle_open_positions(outcome='neutral') sets pos.pnl=0, marks
+        # pos.settled=True, appends to _settled, updates _total_pnl.
+        settled_list = order_book.settle_open_positions(
+            pos.market_id,
+            outcome="neutral",
         )
 
-    return settled
+        for settled_pos in settled_list:
+            # Refund the clamped stake (pos.size is already the effective
+            # amount after the MIN_BET_SIZE clamp applied in record_order).
+            bankroll_tracker.balance += settled_pos.size
+
+            # Keep the circuit breaker's capital view in sync with the real
+            # bankroll after every settlement credit.  Without this call the
+            # breaker sees a progressively lower capital figure and may fire a
+            # false drawdown alert on long-running sessions.
+            circuit_breaker.update_capital(bankroll_tracker.current_balance)
+
+            # Neutral outcome = no real win/loss; tell circuit breaker it
+            # was a win so consecutive-loss counter is not incremented.
+            circuit_breaker.record_trade(
+                profit=Decimal("0"),
+                win=True,
+            )
+            total_settled += 1
+
+            log(
+                "info",
+                "position_settled_neutral",
+                market_id=settled_pos.market_id,
+                side=settled_pos.side,
+                bet_size=str(settled_pos.size),
+                question=settled_pos.question[:60],
+                end_date=settled_pos.end_date,
+            )
+
+    return total_settled
 
 
 async def run_loop(
@@ -215,14 +233,21 @@ async def run_loop(
 
     while True:
         cycle += 1
-        log("info", "scan_cycle_start", cycle=cycle,
-            balance=str(bankroll_tracker.current_balance))
+        log(
+            "info",
+            "scan_cycle_start",
+            cycle=cycle,
+            balance=str(bankroll_tracker.current_balance),
+        )
 
         # --- Circuit breaker check -------------------------------------------
         if not executor.circuit_breaker.is_trading_allowed():
-            log("warning", "scan_cycle_skipped_circuit_breaker",
+            log(
+                "warning",
+                "scan_cycle_skipped_circuit_breaker",
                 cycle=cycle,
-                reason=executor.circuit_breaker.breaker_reason)
+                reason=executor.circuit_breaker.breaker_reason,
+            )
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
             continue
 
@@ -239,8 +264,12 @@ async def run_loop(
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
             continue
 
-        log("info", "scan_cycle_opportunities",
-            cycle=cycle, count=len(opportunities))
+        log(
+            "info",
+            "scan_cycle_opportunities",
+            cycle=cycle,
+            count=len(opportunities),
+        )
 
         orders_attempted = 0
         orders_placed = 0
@@ -250,16 +279,18 @@ async def run_loop(
         for opp in opportunities:
             market_id = str(opp.get("market_id", ""))
             side = str(opp.get("side", "YES")).upper()
+            # raw Kelly size from the scanner/gate — may be below MIN_BET_SIZE.
+            # The executor will clamp it; the order book mirrors that clamp.
             raw_size = Decimal(str(opp.get("size", "0")))
-            # Mirror TradeExecutor's MIN_BET_SIZE clamp here so that the size
-            # we record in the order book always matches what the executor
-            # actually debits from the bankroll.  Without this, neutral
-            # settlement would return a different amount than was staked.
-            effective_size = max(raw_size, MIN_BET_SIZE) if raw_size > Decimal("0") else raw_size
             entry_price = Decimal(str(opp.get("market_price", "0.5")))
             end_date = str(opp.get("end_date", ""))
 
             # --- Idempotency check -------------------------------------------
+            # Key is built from the raw Kelly size so price-tick movements
+            # that produce a trivially different Kelly fraction don't
+            # immediately bypass the duplicate guard.  Still, only
+            # SUCCESSFUL placements are ever written to the cache so a
+            # failed attempt never poisons future cycles.
             idem_key = idempotency.generate_key(
                 market_id=market_id,
                 side=side,
@@ -269,17 +300,27 @@ async def run_loop(
             )
             if idempotency.is_duplicate(idem_key):
                 orders_skipped_idempotency += 1
-                log("debug", "order_skipped_idempotency",
-                    market_id=market_id, side=side)
+                log(
+                    "debug",
+                    "order_skipped_idempotency",
+                    market_id=market_id,
+                    side=side,
+                )
                 continue
 
             # --- Paper order book dedup --------------------------------------
             if order_book.is_duplicate(market_id, side):
                 orders_skipped_duplicate += 1
-                log("debug", "order_skipped_open_position",
-                    market_id=market_id, side=side)
+                log(
+                    "debug",
+                    "order_skipped_open_position",
+                    market_id=market_id,
+                    side=side,
+                )
                 continue
 
+            # Build the opportunity dict the executor expects.
+            # kelly_size carries the raw value; the executor owns the clamp.
             exec_opp = dict(opp)
             exec_opp["kelly_size"] = opp.get("size")
             exec_opp["strategy"] = "charlie_gate"
@@ -290,15 +331,16 @@ async def run_loop(
             if success:
                 orders_placed += 1
 
-                # Record the order in the book first, then write to the
-                # idempotency cache.  This ordering ensures atomicity: if
-                # anything raises between the two writes, the idempotency
-                # cache will NOT mark the order as placed, so the next scan
-                # cycle can retry rather than silently skipping it forever.
+                # Write to the order book FIRST, then to the idempotency cache.
+                # This ordering guarantees atomicity: if record_placement()
+                # raises, the order book already has the position so the
+                # dedup guard will catch any retry.  The reverse ordering
+                # (idem first) would poison the cache on a crash before
+                # record_order(), permanently blocking re-entry with no trace.
                 order_book.record_order(
                     market_id=market_id,
                     side=side,
-                    size=effective_size,  # post-clamp — matches executor debit
+                    size=raw_size,
                     entry_price=entry_price,
                     kelly_fraction=Decimal(str(opp.get("kelly_fraction", "0"))),
                     edge=Decimal(str(opp.get("edge", "0"))),
@@ -306,17 +348,19 @@ async def run_loop(
                     question=str(opp.get("question", "")),
                     end_date=end_date,
                 )
-                # Only write to the idempotency cache after the order book
-                # record has been committed.  Recording before execution caused
-                # locally-rejected orders (e.g. bet_size below minimum) to
-                # poison the cache and permanently block re-attempts on
-                # subsequent cycles.
-                idempotency.update_result(idem_key, {"success": True})
+                # Only write to idempotency cache after the order book record
+                # has been committed.  record_placement() increments the
+                # attempt counter correctly and persists to disk atomically.
+                idempotency.record_placement(
+                    idem_key,
+                    {"success": True, "market_id": market_id, "side": side},
+                )
 
-                # Keep the circuit breaker's internal capital view in sync
-                # with the real bankroll after each successful placement.
-                # Without this, the breaker's drawdown calculation drifts
-                # lower on every trade and may fire a false circuit-break.
+                # Keep the circuit breaker's capital view in sync after each
+                # successful placement.  execute_trade() debits the bankroll
+                # via bankroll.add_trade() but never calls update_capital(),
+                # so without this call the breaker's drawdown calculation
+                # drifts lower on every trade and may fire a false circuit-break.
                 executor.circuit_breaker.update_capital(
                     bankroll_tracker.current_balance
                 )
@@ -328,8 +372,12 @@ async def run_loop(
             circuit_breaker=executor.circuit_breaker,
         )
         if settled_count:
-            log("info", "positions_settled", count=settled_count,
-                balance=str(bankroll_tracker.current_balance))
+            log(
+                "info",
+                "positions_settled",
+                count=settled_count,
+                balance=str(bankroll_tracker.current_balance),
+            )
 
         # --- Per-cycle summary -----------------------------------------------
         book_summary = order_book.summary()
@@ -396,9 +444,13 @@ async def main() -> None:
 
     scanner = BTCPriceLevelScanner()
 
-    log("info", "paper_trading_runner_started",
+    log(
+        "info",
+        "paper_trading_runner_started",
         initial_capital=str(INITIAL_CAPITAL),
-        scan_interval=SCAN_INTERVAL_SECONDS)
+        scan_interval=SCAN_INTERVAL_SECONDS,
+        min_bet_size=str(MIN_BET_SIZE),
+    )
 
     await run_loop(
         scanner=scanner,
