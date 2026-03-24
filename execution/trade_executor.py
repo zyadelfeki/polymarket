@@ -11,15 +11,16 @@ Key invariants
   smooth Kelly ramp, fee deduction, and OFI-conflict halving.  We do NOT
   recompute it here.
 - Minimum bet floor is $1.00 (Polymarket enforced minimum).  Orders below
-  this floor are clamped when balance allows, or dropped otherwise.
+  this floor are logged and dropped — they will never succeed on-chain.
 - circuit_breaker.record_trade() is NOT called here.  Placement != loss.
   The settlement loop in run_paper_trading.py calls it after resolution.
 - circuit_breaker is required at construction time; raises RuntimeError otherwise.
-- All monetary values stored in trade records are str(Decimal) — never float.
+- All money-sensitive arithmetic (prices, sizes, balances, shares, PnL) uses
+  Decimal throughout.  float() is forbidden on the active path.
 """
 
 import asyncio
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Optional
 import logging
 from datetime import datetime, timezone
@@ -39,14 +40,19 @@ else:
 
 
 MIN_BET_SIZE = Decimal("1.00")  # Polymarket enforced minimum order size (USDC)
+_FOUR_DP = Decimal("0.0001")
+_EIGHT_DP = Decimal("0.00000001")
 
 
-def _dec(value, fallback="0") -> Decimal:
-    """Convert any numeric type to Decimal safely, avoiding float binary repr."""
+def _dec(value, fallback: str = "0") -> Decimal:
+    """Safely coerce any scalar to Decimal without going through float."""
     if value is None:
-        return Decimal(str(fallback))
+        return Decimal(fallback)
     if isinstance(value, Decimal):
         return value
+    if isinstance(value, float):
+        # Go through str to avoid float binary representation noise
+        return Decimal(str(value))
     return Decimal(str(value))
 
 
@@ -80,23 +86,26 @@ class TradeExecutor:
 
         market_id = str(opportunity["market_id"])
         side = str(opportunity.get("side") or opportunity.get("true_outcome") or "YES").upper()
-        confidence = _dec(opportunity.get("confidence", "0"))
-        edge = _dec(opportunity.get("edge", "0"))
-        market_price = _dec(opportunity.get("market_price", "0.5") or "0.5")
-        if market_price == Decimal("0"):
-            market_price = Decimal("0.5")
+        # Keep all money/probability values as Decimal — never float on this path
+        confidence: Decimal = _dec(opportunity.get("confidence", "0"))
+        edge: Decimal = _dec(opportunity.get("edge", "0"))
+        market_price: Decimal = _dec(opportunity.get("market_price", "0.5") or "0.5")
         question = str(opportunity.get("question", ""))[:80]
         token_id = opportunity.get("token_id") or market_id
-        balance = _dec(self.bankroll.current_balance)
+        balance: Decimal = _dec(self.bankroll.current_balance)
 
         # --- Sizing -----------------------------------------------------------
         if "kelly_size" in opportunity and opportunity["kelly_size"] is not None:
-            bet_size = _dec(opportunity["kelly_size"])
+            bet_size: Decimal = _dec(opportunity["kelly_size"])
         else:
             if self.kelly is not None:
-                payout_odds = Decimal("1") / market_price if market_price > 0 else Decimal("2")
+                # Decimal reciprocal — no float division
+                payout_odds: Decimal = (
+                    Decimal("1") / market_price if market_price > Decimal("0")
+                    else Decimal("2")
+                )
                 raw = self.kelly.calculate_bet_size(
-                    float(confidence), float(payout_odds), float(edge),
+                    confidence, payout_odds, edge,
                     strategy=opportunity.get("strategy", "default")
                 )
                 bet_size = _dec(raw)
@@ -121,8 +130,8 @@ class TradeExecutor:
                     bet_size=str(MIN_BET_SIZE),
                     min_bet_size=str(MIN_BET_SIZE),
                     side=side,
-                    edge=str(edge),
-                    confidence=str(confidence),
+                    edge=str(edge.quantize(_FOUR_DP)),
+                    confidence=str(confidence.quantize(_FOUR_DP)),
                 )
                 bet_size = MIN_BET_SIZE
             else:
@@ -135,8 +144,8 @@ class TradeExecutor:
                     min_bet_size=str(MIN_BET_SIZE),
                     balance=str(balance),
                     side=side,
-                    edge=str(edge),
-                    confidence=str(confidence),
+                    edge=str(edge.quantize(_FOUR_DP)),
+                    confidence=str(confidence.quantize(_FOUR_DP)),
                 )
                 return False
 
@@ -146,9 +155,9 @@ class TradeExecutor:
             market_id=market_id,
             question=question,
             side=side,
-            market_price=str(market_price),
-            edge=str(edge),
-            confidence=str(confidence),
+            market_price=str(market_price.quantize(_FOUR_DP)),
+            edge=str(edge.quantize(_FOUR_DP)),
+            confidence=str(confidence.quantize(_FOUR_DP)),
             bet_size=str(bet_size),
             token_id=token_id,
         )
@@ -158,17 +167,23 @@ class TradeExecutor:
         order_result = await self.polymarket.place_order(
             token_id,    # positional 1: token_id
             side,        # positional 2: side
-            bet_size,    # positional 3: size (V2) / amount (V1)
-            market_price,  # positional 4: price
+            bet_size,    # positional 3: size (V2) / amount (V1) — Decimal
+            market_price,  # positional 4: price — Decimal
         )
         success = bool(order_result and order_result.get("success"))
 
         if success:
-            shares = bet_size / market_price if market_price > 0 else Decimal("0")
+            # shares = bet_size / market_price — Decimal division, no float
+            shares: Decimal = (
+                (bet_size / market_price).quantize(_EIGHT_DP, rounding=ROUND_DOWN)
+                if market_price > Decimal("0")
+                else Decimal("0")
+            )
             trade_record = {
                 "market_id": market_id,
                 "market_title": question,
                 "side": side,
+                # Store as str so JSON serialisation is lossless
                 "entry_price": str(market_price),
                 "bet_size": str(bet_size),
                 "shares": str(shares),
@@ -202,9 +217,11 @@ class TradeExecutor:
                 question=question,
                 side=side,
                 bet_size=str(bet_size),
+                shares=str(shares),
+                entry_price=str(market_price),
                 order_id=order_result.get("order_id") if order_result else None,
                 trade_id=f"trade_{trade_id}",
-                edge=str(edge),
+                edge=str(edge.quantize(_FOUR_DP)),
             )
             return True
         else:
@@ -215,7 +232,7 @@ class TradeExecutor:
                 question=question,
                 side=side,
                 bet_size=str(bet_size),
-                edge=str(edge),
+                edge=str(edge.quantize(_FOUR_DP)),
             )
             return False
 
