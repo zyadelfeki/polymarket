@@ -16,9 +16,9 @@
 aiohttp>=3.9.0,<4.0.0          # Async HTTP client
 aiosqlite>=0.19.0,<1.0.0       # Async SQLite
 sqlalchemy>=2.0.0,<3.0.0       # ORM / query layer (checked by validate_setup.py)
-websockets>=12.0,<16.0         # WebSocket client (compatible with web3)
+websockets>=12.0,<16.0         # WebSocket client (binance_websocket_v2 + web3 compat)
 msgpack>=1.0.0,<2.0.0          # MessagePack serialization (required by zmq tests)
-pyzmq>=25.0.0,<27.0.0          # ZeroMQ bindings (required by zmq tests)
+pyzmq>=25.0.0,<28.0.0          # ZeroMQ bindings (required by zmq tests)
 redis>=5.0.0,<6.0.0            # Redis client (data_feeds/redis_intelligence_subscriber.py)
 
 # ==================================================================
@@ -48,7 +48,9 @@ rich>=13.7.0,<14.0.0           # Terminal dashboard rendering
 # ==================================================================
 # DATA PROCESSING
 # ==================================================================
-numpy>=1.24.0,<2.0.0           # Hard pin below 2.x: avoid accidental scikit-learn resolver upgrades that break the test/runtime stack
+# numpy: allow 2.x — required for Python 3.14 (no 1.x wheels for cp314).
+# scikit-learn 1.5+ is compatible with numpy 2.x.
+numpy>=1.24.0,<3.0.0
 pandas>=2.1.0,<3.0.0           # Data analysis (optional)
 
 # ==================================================================
@@ -69,8 +71,8 @@ python-dotenv>=1.0.0,<2.0.0    # Environment variables
 # ==================================================================
 # TESTING
 # ==================================================================
-pytest>=7.4.0,<8.0.0           # Testing framework
-pytest-asyncio>=0.21.0,<1.0.0  # Async test support
+pytest>=7.4.0,<10.0.0          # Testing framework (allow 9.x already installed)
+pytest-asyncio>=0.21.0,<2.0.0  # Async test support (allow 1.x already installed)
 pytest-cov>=4.1.0,<5.0.0       # Coverage reporting
 
 # ==================================================================
@@ -124,7 +126,7 @@ gunicorn>=21.2.0,<22.0.0       # WSGI server (production)
 # ==================================================================
 # MINIMUM VERSIONS SUMMARY
 # ==================================================================
-# Python: 3.10+
+# Python: 3.10+  (3.14 supported via relaxed numpy/pytest pins)
 # pip: 23.0+
 # setuptools: 65.0+
 #
@@ -144,7 +146,7 @@ gunicorn>=21.2.0,<22.0.0       # WSGI server (production)
 #    pip install -r requirements.txt
 #
 # 4. Verify installation:
-#    python -c "import pydantic, structlog, aiosqlite; print('✅ OK')"
+#    python -c "import pydantic, structlog, aiosqlite; print('OK')"
 #
 # ==================================================================
 # OPTIONAL DEPENDENCIES
