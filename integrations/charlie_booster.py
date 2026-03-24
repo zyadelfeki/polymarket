@@ -347,6 +347,15 @@ class CharliePredictionGate:
         ``market_question`` is used for BTC-relevance guard and log enrichment.
         """
         try:
+            # -- Live Binance features for Charlie (injected) ------------------
+            if symbol.upper().startswith("BTC") and extra_features is None:
+                try:
+                    from integrations.binance_live_features import fetch_btc_features
+                    extra_features = await asyncio.wait_for(
+                        fetch_btc_features(timeframe), timeout=5.0)
+                except Exception:
+                    pass  # degraded mode — Charlie falls back to synthetic
+            # -- end injection ------------------------------------------------
             return await self._evaluate_market_inner(
                 market_id=market_id,
                 market_price=market_price,
