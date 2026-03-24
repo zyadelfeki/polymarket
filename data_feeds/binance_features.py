@@ -15,7 +15,11 @@ Features computed:
   macd              EMA(12) - EMA(26) of close prices
   price_vs_sma20    (close[-1] - SMA20) / SMA20
   price_vs_sma50    (close[-1] - SMA50) / SMA50
-  volatility_20d    std-dev of log returns over last 20 candles
+  volatility_20d    std-dev of log returns over last 20 candles, scaled to
+                    daily equivalent by multiplying by sqrt(96).
+                    96 = number of 15m candles per 24h.
+                    This matches the scale expected by the LSTM model
+                    (trained on daily vol, threshold 0.02).
   book_imbalance    (bid_qty_top5 - ask_qty_top5) / (bid_qty_top5 + ask_qty_top5)
 """
 
@@ -41,6 +45,11 @@ _CANDLE_FAILURE_TTL = 30.0   # seconds — failed fetch TTL (prevent hammering)
 _BOOK_TTL           = 5.0    # seconds
 
 _BINANCE_BASE = "https://api.binance.com"
+
+# Number of 15m candles in one trading day (24h).
+# Used to scale per-candle volatility to a daily equivalent so that
+# the value matches the scale the LSTM was trained on (daily vol ~0.02-0.05).
+_CANDLES_PER_DAY = 96  # 24h * 4 candles/h
 
 
 # ---------------------------------------------------------------------------
@@ -220,13 +229,19 @@ def get_candle_features(asset: str) -> Optional[Dict[str, float]]:
         price_vs_sma20 = ((last_close - sma20) / sma20) if sma20 and sma20 != 0 else None
         price_vs_sma50 = ((last_close - sma50) / sma50) if sma50 and sma50 != 0 else None
 
-        # Volatility: std of log returns over last 20 candles
+        # Volatility: std of log returns over last 20 candles, scaled to daily.
+        # Raw per-15m vol is ~0.002 for BTC; the LSTM threshold is 0.02 (daily).
+        # Multiply by sqrt(96) — 96 candles per day — to convert to daily scale.
         log_returns = [
             math.log(closes[i] / closes[i - 1])
             for i in range(max(1, len(closes) - 20), len(closes))
             if closes[i - 1] > 0
         ]
-        vol_20d = _std(log_returns) if len(log_returns) >= 2 else None
+        if len(log_returns) >= 2:
+            vol_raw = _std(log_returns)
+            vol_20d = vol_raw * math.sqrt(_CANDLES_PER_DAY)  # scale to daily equivalent
+        else:
+            vol_20d = None
 
         # --- Regime guard keys ---
         # Current price (last close from the candle series)
