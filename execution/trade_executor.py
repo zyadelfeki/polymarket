@@ -220,9 +220,28 @@ class TradeExecutor:
             return False
 
     async def process_execution_queue(self):
+        """Drain the execution queue indefinitely.
+
+        Each item is processed with a full try/except so that a single bad
+        opportunity (network error, malformed data, unexpected exception)
+        cannot kill the consumer coroutine.  The error is logged with enough
+        context to diagnose the root cause, then the loop continues with the
+        next queued item.
+        """
         while True:
             opportunity = await self.execution_queue.get()
-            await self.execute_trade(opportunity)
+            try:
+                await self.execute_trade(opportunity)
+            except Exception as exc:  # noqa: BLE001
+                _log(
+                    "error",
+                    "execution_queue_item_failed",
+                    market_id=opportunity.get("market_id") if isinstance(opportunity, dict) else None,
+                    error=str(exc),
+                    exc_info=True,
+                )
+            finally:
+                self.execution_queue.task_done()
             await asyncio.sleep(1)
 
     def queue_trade(self, opportunity: Dict):
