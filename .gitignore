@@ -58,6 +58,11 @@ ai/decisions.jsonl
 .coverage
 htmlcov/
 
+# Test output artifacts (never commit these)
+test_output*.txt
+*.output.txt
+test_output/
+
 # Backtest results
 backtest_results/
 *.csv
