@@ -23,7 +23,7 @@ for line in lines:
         continue
     try:
         obj = json.loads(line)
-        if isinstance(obj, dict):   # skip plain strings like "HTTP/2 200 OK"
+        if isinstance(obj, dict):
             events.append(obj)
     except json.JSONDecodeError:
         pass
@@ -44,6 +44,7 @@ scans             = count("strategy_scan_begin")
 features          = count("binance_features_computed")
 charlie_approved  = count("charlie_gate_approved")
 opp_detected      = count("arbitrage_opportunity_detected")
+opps_evaluated    = count("opportunity_evaluated") or opp_detected  # fallback
 order_submitted   = count("order_submitted")
 order_settled     = count("order_settled")
 
@@ -71,18 +72,19 @@ except Exception as _dbe:
 # market_blocked events from this session
 market_blocked_static    = count_field("market_blocked", "reason", "static_blocked_markets")
 market_blocked_perf      = count_field("market_blocked", "reason", "performance_guard_auto_block")
-perf_guard_checked       = count("performance_guard_checked")       # fired by fix: guard now re-evaluates each call
-market_auto_blocked      = count("market_auto_blocked_performance")  # guard decided to block (logged as warning)
+perf_guard_checked       = count("performance_guard_checked")
+market_auto_blocked      = count("market_auto_blocked_performance")
 order_error_transitions  = count("order_state_set_to_error")
 
 # OFI signal events
 ofi_signal_confirmed     = count("ofi_signal_confirmed")
 ofi_conflict             = count("ofi_conflict")
+# OFI feed degradation (Tier 2 data contract guard)
+ofi_feed_degraded        = count("ofi_feed_degraded")
 
 # ---------- Session 1-4: ML feature gates ----------
 meta_gate_approved     = count("meta_gate_approved")
 meta_gate_rejected     = count("meta_gate_rejected")
-# meta_gate_decision events carry proba + threshold; emitted by should_trade()
 meta_gate_dec_approved = count_field("meta_gate_decision", "decision", "approved")
 meta_gate_dec_rejected = count_field("meta_gate_decision", "decision", "rejected")
 _meta_gate_probas = [
@@ -93,22 +95,24 @@ _meta_gate_avg_proba = (
     round(sum(_meta_gate_probas) / len(_meta_gate_probas), 3)
     if _meta_gate_probas else None
 )
-market_blocked_tag     = count("market_blocked_tag")        # Session 3: tag blocklist
-regime_size_adj        = count("regime_size_adjustment")    # Session 2: regime multiplier
-regime_changed         = count("regime_changed")            # Session 2: every regime transition
-regime_update_failed   = count("regime_update_failed")      # Session 2: background update error
+market_blocked_tag     = count("market_blocked_tag")
+regime_size_adj        = count("regime_size_adjustment")
+regime_changed         = count("regime_changed")
+regime_update_failed   = count("regime_update_failed")
 ofi_execution_actions  = Counter(
     e.get("action_label", "standard")
     for e in events
     if e.get("event") == "ofi_execution_action"
-)                                                           # Session 4: execution policy
+)
+
+# Async task death visibility (Tier 3 supervisor)
+task_died_events = [e for e in events if e.get("event") == "task_died"]
+task_died_count  = len(task_died_events)
 
 # Previously-fixed events (should stay at 0)
 periodic_failed   = count("periodic_check_failed")
 cb_attr_err       = count("circuit_breaker_attribute_error")
 
-# performance_halt_win_rate: CRITICAL in live mode (trips CB), WARNING in paper mode.
-# Count live-mode (actionable) halts only — paper-mode fires are log_only artefacts.
 perf_halt_win_rate_live = sum(
     1 for e in events
     if e.get("event") == "performance_halt_win_rate" and e.get("action") != "log_only"
@@ -117,9 +121,6 @@ perf_halt_win_rate_paper = sum(
     1 for e in events
     if e.get("event") == "performance_halt_win_rate" and e.get("action") == "log_only"
 )
-
-# performance_halt_drawdown: CRITICAL in live mode (trips CB), WARNING in paper mode.
-# Count live-mode (actionable) halts only — paper-mode fires are cross-session artefact.
 perf_halt_drawdown_live = sum(
     1 for e in events
     if e.get("event") == "performance_halt_drawdown" and e.get("action") != "log_only"
@@ -129,7 +130,6 @@ perf_halt_drawdown_paper = sum(
     if e.get("event") == "performance_halt_drawdown" and e.get("action") == "log_only"
 )
 
-# Degraded mode
 degraded_mode     = count("charlie_degraded_mode")
 ratio_str = (
     f"{degraded_mode / features:.1f}x  (target: <3x)"
@@ -137,7 +137,6 @@ ratio_str = (
     else "N/A (0 features computed)"
 )
 
-# Rejection reasons
 rejection_events = [
     "charlie_gate_rejected",
     "charlie_gate_exception",
@@ -152,20 +151,17 @@ opportunity_skip_reasons = Counter(
     for e in events
     if e.get("event") == "opportunity_skipped"
 )
-# risk_rejected = circuit breaker blocked (fires BEFORE Charlie is called)
 risk_rejected_reasons = Counter(
     e.get("reason", "unknown")
     for e in events
     if e.get("event") == "risk_rejected"
 )
-# order_blocked_portfolio_risk = portfolio risk engine cap (fires AFTER Charlie)
 portfolio_blocked_reasons = Counter(
     e.get("reason", "unknown")
     for e in events
     if e.get("event") == "order_blocked_portfolio_risk"
 )
 
-# Circuit breaker state history events
 cb_trip_events     = [e for e in events if e.get("event") == "circuit_breaker_tripped"]
 cb_half_open_events = [e for e in events if e.get("event") == "circuit_breaker_half_open"]
 cb_recovered_events = [e for e in events if e.get("event") == "circuit_breaker_recovered"]
@@ -174,6 +170,102 @@ cb_init_events      = [e for e in events if e.get("event") == "circuit_breaker_i
 print(f"\n=== SESSION STATS ===")
 print(f"  Total log lines  : {total_lines}")
 print(f"  strategy_scan_begin: {scans}")
+
+# ============================================================
+# INVARIANT CHECKS (Tier 2 — logic violations between events)
+# ============================================================
+# These are causal invariants: if A happened, B must also have happened.
+# A violation means the pipeline silently swallowed something.
+_RESET  = "\033[0m"
+_RED    = "\033[91m"
+_YELLOW = "\033[93m"
+_GREEN  = "\033[92m"
+
+def _color(text, color):
+    """Wrap text in ANSI color codes (gracefully degrades on Windows)."""
+    try:
+        return f"{color}{text}{_RESET}"
+    except Exception:
+        return text
+
+violations = []
+warnings_inv = []
+
+# INV-1: If scans happened but zero features were computed, Binance feed is dead.
+if scans > 10 and features == 0:
+    violations.append(
+        f"INV-1  scans={scans} but binance_features_computed=0 "
+        "-- Binance candle/indicator pipeline is broken"
+    )
+
+# INV-2: If features were computed but charlie_approved=0 and opp_detected>0,
+#         something in Charlie or the gate is silently blocking everything.
+if features > 20 and opp_detected > 0 and charlie_approved == 0:
+    all_charlie_rejected = count("charlie_gate_rejected")
+    coin_flip_rejected   = count("charlie_coin_flip_rejected")
+    if all_charlie_rejected == 0 and coin_flip_rejected == 0:
+        violations.append(
+            f"INV-2  features={features} opp_detected={opp_detected} but "
+            "charlie_approved=0 with NO rejection events -- silent gate failure"
+        )
+
+# INV-3: If charlie_approved > 0 but order_submitted=0 (and no exec errors),
+#         execution service is broken.
+exec_errors = count("execution_failed")
+if charlie_approved > 0 and order_submitted == 0 and exec_errors == 0:
+    violations.append(
+        f"INV-3  charlie_approved={charlie_approved} but order_submitted=0 "
+        "with execution_failed=0 -- silent execution block"
+    )
+
+# INV-4: order_submitted > charlie_approved is impossible (each order needs approval).
+if order_submitted > charlie_approved and charlie_approved > 0:
+    violations.append(
+        f"INV-4  order_submitted={order_submitted} > charlie_approved={charlie_approved} "
+        "-- accounting mismatch, investigate dedup logic"
+    )
+
+# INV-5: If any task_died events exist, that is always a CRITICAL violation.
+if task_died_count > 0:
+    for _td in task_died_events:
+        violations.append(
+            f"INV-5  task_died: task={_td.get('task_name','?')} "
+            f"error={str(_td.get('error','?'))[:120]}"
+        )
+
+# INV-6: OFI feed degradation rate. If > 10% of evaluated opps triggered
+#         ofi_feed_degraded, the orderbook pipeline needs investigation.
+if opps_evaluated > 5 and ofi_feed_degraded > 0:
+    pct = 100.0 * ofi_feed_degraded / opps_evaluated
+    if pct > 10:
+        violations.append(
+            f"INV-6  ofi_feed_degraded={ofi_feed_degraded} / opps_evaluated={opps_evaluated} "
+            f"= {pct:.1f}% (threshold: 10%) -- OFI orderbook pipeline degraded"
+        )
+    else:
+        warnings_inv.append(
+            f"INV-6  ofi_feed_degraded={ofi_feed_degraded} / opps_evaluated={opps_evaluated} "
+            f"= {pct:.1f}% (minor, < 10% threshold)"
+        )
+
+# INV-7: If binance_feed_unhealthy fired, the ws supervisor caught it;
+#         but if it fires AND scans continued, something is wrong.
+binance_feed_unhealthy = count("binance_feed_unhealthy")
+if binance_feed_unhealthy > 0 and scans > 5:
+    violations.append(
+        f"INV-7  binance_feed_unhealthy={binance_feed_unhealthy} but scans kept running ({scans}) "
+        "-- supervisor may not have halted scan loop on feed failure"
+    )
+
+print(f"\n--- INVARIANT CHECKS ---")
+if violations:
+    for v in violations:
+        print(f"  {_color('VIOLATION', _RED)}  {v}")
+else:
+    print(f"  {_color('ALL INVARIANTS HOLD', _GREEN)}")
+if warnings_inv:
+    for w in warnings_inv:
+        print(f"  {_color('WARN', _YELLOW)}      {w}")
 
 print(f"\n--- FIXED (must be 0) ---")
 ok_fixed = True
@@ -189,10 +281,10 @@ for name, val in [
     print(f"  {tag}          {name}: {val}")
 if perf_halt_win_rate_paper > 0:
     print(f"  INFO          performance_halt_win_rate [paper log_only]: {perf_halt_win_rate_paper}"
-          f"  (paper-mode win-rate warning \u2014 CB not tripped, safe to ignore)")
+          f"  (paper-mode win-rate warning — CB not tripped, safe to ignore)")
 if perf_halt_drawdown_paper > 0:
     print(f"  INFO          performance_halt_drawdown [paper log_only]: {perf_halt_drawdown_paper}"
-          f"  (cross-session historical drawdown \u2014 CB not tripped, safe to ignore)")
+          f"  (cross-session historical drawdown — CB not tripped, safe to ignore)")
 
 print(f"\n--- ERROR ORDERS (DB total, all sessions) ---")
 print(f"  order_state='ERROR' in DB  : {_error_orders_total}")
@@ -210,6 +302,23 @@ print(f"  market_auto_blocked_performance              : {market_auto_blocked}  
 print(f"\n--- OFI SIGNAL (this session) ---")
 print(f"  ofi_signal_confirmed : {ofi_signal_confirmed}")
 print(f"  ofi_conflict         : {ofi_conflict}  (signals where OFI disagrees with Charlie; size halved)")
+_ofi_deg_label = (
+    _color(f"{ofi_feed_degraded}  <-- INVESTIGATE", _RED)
+    if ofi_feed_degraded > 0 else str(ofi_feed_degraded)
+)
+print(f"  ofi_feed_degraded    : {_ofi_deg_label}  (Tier 2: absent ofi_bids/ofi_asks for 5+ consecutive evaluations)")
+
+print(f"\n--- ASYNC TASK HEALTH (Tier 3 supervisor) ---")
+if task_died_count == 0:
+    print(f"  task_died : {_color('0  OK', _GREEN)}")
+else:
+    print(f"  task_died : {_color(str(task_died_count) + '  CRITICAL -- background tasks crashed', _RED)}")
+    for _td in task_died_events[:5]:
+        print(f"    task={_td.get('task_name','?')}  error={str(_td.get('error','?'))[:100]}")
+binance_feed_unhealthy_label = (
+    _color(str(binance_feed_unhealthy), _RED) if binance_feed_unhealthy > 0 else str(binance_feed_unhealthy)
+)
+print(f"  binance_feed_unhealthy : {binance_feed_unhealthy_label}")
 
 print(f"\n--- ML FEATURE GATES (Sessions 1-4) ---")
 print(f"  meta_gate_approved   : {meta_gate_approved}")
@@ -278,7 +387,6 @@ if cb_half_open_events:
 if cb_recovered_events:
     print(f"  full recoveries: {len(cb_recovered_events)}")
 
-# risk_rejected events include cb_state/half_open_max_pct since latest fix
 if risk_rejected_reasons:
     first_rr = next((e for e in events if e.get("event") == "risk_rejected"), None)
     if first_rr and first_rr.get("cb_state"):
@@ -289,7 +397,6 @@ if risk_rejected_reasons:
 print(f"\n--- REJECTION BREAKDOWN ---")
 found_any_rejection = False
 
-# 1. Circuit breaker (fires BEFORE Charlie — if non-zero, Charlie was never called)
 total_rr = sum(risk_rejected_reasons.values())
 if total_rr > 0:
     found_any_rejection = True
@@ -297,7 +404,6 @@ if total_rr > 0:
     for reason, c in risk_rejected_reasons.most_common():
         print(f"    +-- {reason}: {c}")
 
-# 2. Per-event rejection items (Charlie, global/per-market budget, etc.)
 for ev in rejection_events:
     c = count(ev)
     if c > 0:
@@ -322,7 +428,6 @@ for ev in rejection_events:
         else:
             print(f"  {ev}: {c}")
 
-# 3. Portfolio risk engine breakdown (fires AFTER circuit breaker + Charlie)
 if portfolio_blocked_reasons:
     found_any_rejection = True
     total_pb = sum(portfolio_blocked_reasons.values())
@@ -338,7 +443,6 @@ if opportunity_skip_reasons:
 if not found_any_rejection:
     print("  (none -- if charlie_gate_approved=0 check for charlie_gate_rejected events)")
 
-# ---------- Phase 3-6 features ----------
 print(f"\n--- ADVANCED FEATURES ---")
 _arb_found = count("yes_no_arb_found")
 _snipe_would = count("snipe_would_fire")
@@ -350,13 +454,15 @@ print(f"  snipe_attempt: {_snipe_attempt}")
 print(f"  oracle_window_detected: {_oracle_window}")
 
 # ---------- final verdict ----------
-all_ok = ok_fixed and signals_ok
+all_ok = ok_fixed and signals_ok and not violations
 print()
 if all_ok:
     print("=== ALL CHECKS PASSED -- run the Kelly sweep next ===")
     print("  python experiments/sweep_kelly_and_edge.py --log logs/production.log")
 else:
     print("=== CHECKS FAILED -- DO NOT RUN SWEEP YET ===")
+    if violations:
+        print("  Invariant violations detected — see INVARIANT CHECKS section above.")
     if not ok_fixed:
         print("  Previously-fixed errors have returned.")
     if not signals_ok:
@@ -405,7 +511,6 @@ if _cal_csv.exists():
     _cal_n = len(_cal_p)
     print(f"  Calibration samples: {_cal_n}")
     if _cal_n > 0:
-        # ECE (10-bin)
         _n_bins = 10
         _bins = [[] for _ in range(_n_bins)]
         for _p, _a in zip(_cal_p, _cal_a):
@@ -468,4 +573,3 @@ async def _print_pnl_by_market():
         print(f"  (pnl_by_market unavailable: {_e})")
 
 _asyncio.run(_print_pnl_by_market())
-
