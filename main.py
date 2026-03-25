@@ -475,6 +475,7 @@ class TradingSystem:
             "observe_only_bad_calibration": 0,
             "blocked_external_admission": 0,
             "orders_submitted": 0,
+            "ofi_feed_misses": 0,
         }
         self._calibration_guard_status: Dict[str, Any] = {
             "blocked": False,
@@ -999,6 +1000,7 @@ class TradingSystem:
             lifecycle_markets=len(self._market_lifecycle_state),
             calibration_blocked=self._calibration_guard_status.get("blocked", False),
             calibration_reason=self._calibration_guard_status.get("reason"),
+            ofi_feed_misses=self._session_stats.get("ofi_feed_misses", 0),
         )
 
     @staticmethod
@@ -1620,6 +1622,7 @@ class TradingSystem:
                     None, _get_binance_features, opp_symbol
                 )
             if _extra_features is not None:
+                self._session_stats["ofi_feed_misses"] = 0
                 logger.debug(
                     "binance_features_ready",
                     symbol=opp_symbol,
@@ -1631,6 +1634,13 @@ class TradingSystem:
                 logger.warning("binance_features_unavailable",
                                symbol=opp_symbol,
                                msg="Charlie will run in degraded mode — coin-flip rejection will block trade")
+                self._session_stats["ofi_feed_misses"] += 1
+                if self._session_stats["ofi_feed_misses"] % 5 == 0:
+                    logger.warning(
+                        "ofi_feed_degraded",
+                        consecutive_misses=self._session_stats["ofi_feed_misses"],
+                        symbol=opp_symbol,
+                    )
 
             # Charlie's edge model always treats market_price as the YES token
             # price.  When the strategy surfaces a NO opportunity it sets
@@ -2124,7 +2134,7 @@ class TradingSystem:
         import hashlib as _hashlib
         from datetime import datetime as _dt, timezone as _tz
         _minute_str = _dt.now(_tz.utc).strftime("%Y%m%dT%H%M")
-        _dedup_input = f"{market_id}:{token_id}:{side}:{price}:{order_value}:{_minute_str}"
+        _dedup_input = f"{market_id}:{token_id}:{side}:{_minute_str}"
         _client_order_id = _hashlib.sha256(_dedup_input.encode()).hexdigest()[:16]
         metadata["client_order_id"] = _client_order_id
         metadata["expected_price"] = str(price)  # For slippage tracking on fill
