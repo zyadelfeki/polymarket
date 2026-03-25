@@ -226,7 +226,11 @@ def get_candle_features(asset: str) -> Optional[Dict[str, float]]:
             for i in range(max(1, len(closes) - 20), len(closes))
             if closes[i - 1] > 0
         ]
-        vol_20d = _std(log_returns) if len(log_returns) >= 2 else None
+        if len(log_returns) >= 2:
+            vol_raw = _std(log_returns)
+            vol_20d = vol_raw * math.sqrt(96)  # scale 15m → daily (96 candles/day)
+        else:
+            vol_20d = None
 
         # --- Regime guard keys ---
         # Current price (last close from the candle series)
