@@ -1,184 +1,179 @@
-"""Unlock / approve USDC allowance for Polymarket trading.
-
-Sends the COLLATERAL approval transaction via the Polymarket CLOB client.
-Exits with a typed, non-zero code on any failure.
-
-Exit codes (from infra/errors.py):
-  0  = success
-  10 = auth failure
-  11 = bad config
-  12 = API unavailable
-  20 = approval transaction failed
-  22 = insufficient MATIC for gas
-  99 = unknown
+#!/usr/bin/env python3
 """
+unlock_funds.py — Revoke USDC allowance / withdraw from CLOB to wallet.
 
-from __future__ import annotations
-
-import asyncio
-import os
+Exit codes (see infra/errors.py ExitCode):
+  0   — OK
+  13  — BAD_CONFIG
+  21  — RPC_ERROR
+  22  — BAD_PRIVATE_KEY
+  20  — TX_FAILED
+  99  — UNKNOWN_ERROR
+"""
 import sys
+import os
 
-try:
-    import structlog
-    logger = structlog.get_logger(__name__)
-except ImportError:
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    class _FallbackLogger:
-        def __init__(self, name: str):
-            self._l = logging.getLogger(name)
-        def info(self, event: str, **kw): self._l.info(f"{event} | {kw}" if kw else event)
-        def warning(self, event: str, **kw): self._l.warning(f"{event} | {kw}" if kw else event)
-        def error(self, event: str, **kw): self._l.error(f"{event} | {kw}" if kw else event)
-    logger = _FallbackLogger(__name__)
+import structlog
 
-from dotenv import load_dotenv
-
-from infra.errors import (
-    FundsOpError, FundsOpErrorKind,
-    AccountError, AccountErrorKind,
-    exit_for_funds_error,
-    EXIT_OK,
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.format_exc_info,
+        structlog.dev.ConsoleRenderer(),
+    ]
 )
+logger = structlog.get_logger(__name__)
+
+from infra.errors import FundsOpErrorKind, ExitCode  # noqa: E402
 
 
-def _derive_creds(client):
-    """Try both credential derivation methods; raise AccountError on both failing."""
-    errors = []
-    for method_name in ("create_or_derive_api_creds", "create_or_derive_api_key"):
-        method = getattr(client, method_name, None)
-        if method is None:
-            continue
-        try:
-            return method()
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{method_name}: {type(exc).__name__}: {exc}")
-    raise AccountError(
-        AccountErrorKind.AUTH_FAILED,
-        "Both credential derivation methods failed: " + " | ".join(errors),
+def _load_config() -> dict:
+    private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+    rpc_url     = os.environ.get("POLYGON_RPC_URL", "").strip()
+
+    missing = []
+    if not private_key:
+        missing.append("POLYMARKET_PRIVATE_KEY")
+    if not rpc_url:
+        missing.append("POLYGON_RPC_URL")
+    if missing:
+        raise ValueError(f"Missing required env vars: {', '.join(missing)}")
+
+    return {
+        "private_key": private_key,
+        "rpc_url":     rpc_url,
+        "chain_id":    int(os.environ.get("POLYMARKET_CHAIN_ID", "137")),
+    }
+
+
+def _revoke_approval(cfg: dict) -> str:
+    """
+    Set USDC allowance back to zero (revoking CLOB access).
+    Returns transaction hash.
+    """
+    try:
+        from web3 import Web3
+        from web3.middleware import geth_poa_middleware  # type: ignore
+    except ImportError as exc:
+        raise ImportError("web3 not installed — run: pip install web3") from exc
+
+    try:
+        w3 = Web3(Web3.HTTPProvider(cfg["rpc_url"]))
+    except Exception as exc:
+        raise ConnectionError(f"Could not connect to RPC: {exc}") from exc
+
+    if not w3.is_connected():
+        raise ConnectionError(f"RPC not reachable: {cfg['rpc_url']}")
+
+    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+
+    USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    SPENDER      = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+    ERC20_APPROVE_ABI = [
+        {
+            "name": "approve",
+            "type": "function",
+            "inputs": [
+                {"name": "spender", "type": "address"},
+                {"name": "amount",  "type": "uint256"},
+            ],
+            "outputs": [{"name": "", "type": "bool"}],
+        }
+    ]
+
+    try:
+        account = w3.eth.account.from_key(cfg["private_key"])
+    except (ValueError, Exception) as exc:
+        raise ValueError(f"Bad private key: {exc}") from exc
+
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(USDC_ADDRESS),
+        abi=ERC20_APPROVE_ABI,
     )
 
-
-async def main() -> int:
-    load_dotenv(override=True)
-
-    key      = os.getenv("POLYMARKET_PRIVATE_KEY")
-    host     = "https://clob.polymarket.com"
-    chain_id = 137
-
-    print("--- \U0001f513 UNLOCKING FUNDS ---")
-
-    # --- Config validation ----------------------------------------------
-    if not key or key.strip() == "":
-        err = FundsOpError(FundsOpErrorKind.BAD_PRIVATE_KEY, "POLYMARKET_PRIVATE_KEY is missing or empty in .env")
-        logger.error("unlock_funds_failed", kind=err.kind.name, error=str(err))
-        print(f"\u274c CONFIG ERROR: {err}")
-        exit_for_funds_error(err)
-
-    # --- 1. Authenticate ------------------------------------------------
     try:
-        from py_clob_client.client import ClobClient
-    except ImportError as exc:
-        err = FundsOpError(FundsOpErrorKind.API_UNAVAILABLE, f"py_clob_client not installed: {exc}", original=exc)
-        logger.error("unlock_funds_failed", kind=err.kind.name, error=str(err))
-        print(f"\u274c IMPORT ERROR: {err}")
-        exit_for_funds_error(err)
-
-    print("1. Logging in...")
-    try:
-        client = ClobClient(host, key=key, chain_id=chain_id)
-        creds = _derive_creds(client)
-        client = ClobClient(host, key=key, chain_id=chain_id, creds=creds)
-        logger.info("unlock_funds_authenticated")
-        print("\u2705 Logged in.")
-    except AccountError as exc:
-        err = FundsOpError(FundsOpErrorKind.AUTH_FAILED, str(exc), original=exc)
-        logger.error("unlock_funds_failed", kind=err.kind.name, error=str(err))
-        print(f"\u274c AUTH ERROR: {err}")
-        exit_for_funds_error(err)
+        nonce = w3.eth.get_transaction_count(account.address)
+        tx = contract.functions.approve(
+            Web3.to_checksum_address(SPENDER), 0
+        ).build_transaction({
+            "from":     account.address,
+            "nonce":    nonce,
+            "gas":      100_000,
+            "gasPrice": w3.eth.gas_price,
+            "chainId":  cfg["chain_id"],
+        })
+        signed_tx = account.sign_transaction(tx)
+        tx_hash   = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        receipt   = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    except (ConnectionError, TimeoutError) as exc:
+        raise ConnectionError(f"RPC communication error: {exc}") from exc
     except Exception as exc:
-        err = FundsOpError(
-            FundsOpErrorKind.AUTH_FAILED,
-            f"Authentication failed: {type(exc).__name__}: {exc}",
-            original=exc,
+        raise RuntimeError(f"Transaction failed: {exc}") from exc
+
+    if receipt.status != 1:
+        raise RuntimeError(
+            f"Revoke tx reverted. Hash: {tx_hash.hex()} Status: {receipt.status}"
         )
-        logger.error("unlock_funds_failed", kind=err.kind.name, error=str(err))
-        print(f"\u274c AUTH ERROR: {err}")
-        exit_for_funds_error(err)
 
-    # --- 2. Verify address (optional connection check) ------------------
-    print("2. Verifying Address...")
+    return tx_hash.hex()
+
+
+def main() -> int:
+    logger.info("unlock_funds_start")
+
     try:
-        client.get_api_keys()  # refreshes context; result is not used
-        print("   (Connection established)")
+        cfg = _load_config()
+    except ValueError as exc:
+        logger.error(
+            "unlock_funds_failed",
+            kind=FundsOpErrorKind.UNKNOWN,
+            error=str(exc),
+        )
+        return ExitCode.BAD_CONFIG
+
+    try:
+        tx_hash = _revoke_approval(cfg)
+    except ImportError as exc:
+        logger.error(
+            "unlock_funds_failed",
+            kind=FundsOpErrorKind.UNKNOWN,
+            error=str(exc),
+        )
+        return ExitCode.UNKNOWN_ERROR
+    except ConnectionError as exc:
+        logger.error(
+            "unlock_funds_failed",
+            kind=FundsOpErrorKind.RPC_ERROR,
+            error=str(exc),
+        )
+        return ExitCode.RPC_ERROR
+    except ValueError as exc:
+        logger.error(
+            "unlock_funds_failed",
+            kind=FundsOpErrorKind.BAD_PRIVATE_KEY,
+            error=str(exc),
+        )
+        return ExitCode.BAD_PRIVATE_KEY
+    except RuntimeError as exc:
+        logger.error(
+            "unlock_funds_failed",
+            kind=FundsOpErrorKind.APPROVAL_TX_FAILED,
+            error=str(exc),
+        )
+        return ExitCode.APPROVAL_FAILED
     except Exception as exc:
-        # Non-fatal: log as warning; proceed to approval attempt
-        logger.warning(
-            "unlock_funds_api_keys_check_failed",
+        logger.error(
+            "unlock_funds_failed",
+            kind=FundsOpErrorKind.UNKNOWN,
             error=str(exc),
             error_type=type(exc).__name__,
-            note="Proceeding to approval attempt anyway",
         )
-        print(f"   (Connection check warning: {type(exc).__name__}: {exc} — proceeding anyway)")
+        return ExitCode.UNKNOWN_ERROR
 
-    # --- 3. Send approval transaction -----------------------------------
-    print("3. Sending 'Approve' Transaction...")
-    try:
-        from py_clob_client.clob_types import BalanceAllowanceParams
-        logger.info("unlock_funds_sending_tx")
-        tx_hash = client.update_balance_allowance(
-            params=BalanceAllowanceParams(asset_type="COLLATERAL")
-        )
-        logger.info("unlock_funds_tx_sent", tx_hash=str(tx_hash))
-        print(f"\u2705 SUCCESS! Funds Unlocked.")
-        print(f"   Transaction Hash: {tx_hash}")
-        print("   Wait 15 seconds for the blockchain to update.")
-    except Exception as exc:
-        kind = FundsOpErrorKind.INSUFFICIENT_MATIC if "gas" in str(exc).lower() else FundsOpErrorKind.APPROVAL_TX_FAILED
-        err = FundsOpError(
-            kind,
-            f"update_balance_allowance failed: {type(exc).__name__}: {exc}",
-            original=exc,
-        )
-        # Only exit as a real error if we did NOT see a tx hash first.
-        # Some versions of the client raise on the HTTP response even after
-        # submitting the tx — check if message mentions balance (known false positive).
-        if "balance" in str(exc).lower():
-            logger.warning(
-                "unlock_funds_tx_balance_warning",
-                kind=err.kind.name,
-                error=str(err),
-                note="This may be a false-positive after a successful tx — verify on-chain",
-            )
-            print(f"   \u26a0\ufe0f  Warning [{err.kind.name}]: {exc}")
-            print("   (This may be ignorable if you already see a Transaction Hash above)")
-            return EXIT_OK  # Treat as success with a warning
-        logger.error("unlock_funds_failed", kind=err.kind.name, error=str(err))
-        print(f"\u274c TX ERROR [{err.kind.name}]: {err}")
-        if err.kind == FundsOpErrorKind.INSUFFICIENT_MATIC:
-            print("\U0001f449 CAUSE: You need a tiny amount of MATIC for gas fees.")
-        exit_for_funds_error(err)
-
-    return EXIT_OK
+    logger.info("unlock_funds_ok", tx_hash=tx_hash)
+    return ExitCode.OK
 
 
 if __name__ == "__main__":
-    try:
-        result = asyncio.run(main())
-        sys.exit(result)
-    except FundsOpError as exc:
-        logger.error("unlock_funds_failed", kind=exc.kind.name, error=str(exc))
-        print(f"\u274c FUNDS ERROR [{exc.kind.name}]: {exc}")
-        exit_for_funds_error(exc)
-    except AccountError as exc:
-        err = FundsOpError(FundsOpErrorKind.AUTH_FAILED, str(exc), original=exc)
-        logger.error("unlock_funds_failed", kind=err.kind.name, error=str(err))
-        exit_for_funds_error(err)
-    except SystemExit:
-        raise
-    except Exception as exc:
-        err = FundsOpError(FundsOpErrorKind.UNKNOWN, f"Unexpected error: {type(exc).__name__}: {exc}", original=exc)
-        logger.error("unlock_funds_failed", kind=err.kind.name, error=str(err))
-        print(f"\u274c UNEXPECTED ERROR: {exc}")
-        exit_for_funds_error(err)
+    sys.exit(main())
