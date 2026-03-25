@@ -39,6 +39,7 @@ import logging
 import sys
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Optional
 import structlog
@@ -287,6 +288,16 @@ class CharliePredictionGate:
                 os.getenv("CHARLIE_COIN_FLIP_REJECT_BAND_ABS", "0.03")
             )
         self._coin_flip_reject_band_abs = Decimal(str(coin_flip_reject_band_abs))
+
+        # Per-market approval dedup cache.
+        # Key: f"{market_id}:{side}:{minute_str}"  (minute_str = "%Y%m%dT%H%M" UTC)
+        # Value: the TradeRecommendation that was returned.
+        # Prevents the same market firing charlie_gate_approved on every poll
+        # cycle (every ~20s) within the same minute window.
+        # Cache is pruned of stale minute-keys on each evaluate_market call.
+        self._approved_cache: Dict[str, TradeRecommendation] = {}
+        self._last_cache_prune: str = ""
+
         _load_charlie_api()
 
     async def verify_contract_health(
@@ -401,6 +412,32 @@ class CharliePredictionGate:
                 ensemble_votes=None,
             )
             return None
+
+        # --- 0b. Per-market 1-minute dedup cache ---------------------------
+        # Prune stale minute-keys first (runs at most once per minute).
+        _now_minute = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M")
+        if _now_minute != self._last_cache_prune:
+            self._approved_cache = {
+                k: v for k, v in self._approved_cache.items()
+                if k.endswith(f":{_now_minute}")
+            }
+            self._last_cache_prune = _now_minute
+
+        # Pre-check: we don't know the side yet (requires the signal), so key
+        # on market_id + minute only for the initial duplicate guard.
+        # A market flipping from YES to NO within the same minute is extremely
+        # unlikely given BTC 15-minute windows, and would only happen if p_win
+        # crossed 0.5 mid-minute — treat that as a new signal next minute.
+        _cache_key_prefix = f"{market_id}:{_now_minute}"
+        for _cached_key, _cached_rec in self._approved_cache.items():
+            if _cached_key.startswith(f"{market_id}:"):
+                logger.info(
+                    "charlie_gate_dedup_cache_hit",
+                    market_id=market_id,
+                    cached_side=_cached_rec.side,
+                    minute=_now_minute,
+                )
+                return _cached_rec
 
         # --- 1. Fetch Charlie signal ----------------------------------------
         try:
@@ -730,6 +767,11 @@ class CharliePredictionGate:
             regime=regime,
             symbol=symbol,
         )
+
+        # Store in dedup cache so subsequent poll cycles within the same minute
+        # return immediately without re-evaluating or re-logging.
+        _final_cache_key = f"{market_id}:{side}:{_now_minute}"
+        self._approved_cache[_final_cache_key] = recommendation
 
         return recommendation
 
