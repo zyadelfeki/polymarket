@@ -80,6 +80,7 @@ from data_feeds.arb_scanner import scan_yes_no_arb
 from execution.sniper import MarketSniper
 from execution.oracle_monitor import check_oracle_window
 from data_feeds.binance_feed import BinanceTradeFeed
+from services.task_supervisor import TaskSupervisor
 
 # Session 2: volatility / regime classifier
 from utils.regime_features import get_regime_features as _get_regime_features
@@ -2805,7 +2806,6 @@ class TradingSystem:
             _trade_feed_symbols = self.config.get('markets', {}).get('crypto_symbols', ['BTC', 'ETH'])
             logger.info("component_construct_begin", component="binance_trade_feed")
             self.binance_trade_feed = BinanceTradeFeed(symbols=_trade_feed_symbols)
-            asyncio.get_running_loop().create_task(self.binance_trade_feed.run())
             logger.info(
                 "component_construct_success",
                 component="binance_trade_feed",
@@ -3060,6 +3060,31 @@ class TradingSystem:
                 asyncio.create_task(self.health_server.serve())
                 logger.info("health_server_task_started", port=int(os.environ.get("HEALTH_PORT", "8765")))
 
+            # Wire TaskSupervisor for supervised background tasks
+            self.task_supervisor = TaskSupervisor(logger=logger)
+            self.task_supervisor.register(
+                "market_resolution_monitor",
+                lambda: self._market_resolution_monitor(),
+                restart_delay=5.0,
+                max_restarts=5,
+            )
+            self.task_supervisor.register(
+                "periodic_maintenance",
+                lambda: self._periodic_maintenance(),
+                restart_delay=10.0,
+                max_restarts=5,
+            )
+            if self.binance_trade_feed is not None:
+                self.task_supervisor.register(
+                    "binance_trade_feed",
+                    lambda: self.binance_trade_feed.run(),
+                    restart_delay=5.0,
+                    max_restarts=10,
+                )
+            if self.websocket is not None:
+                self.task_supervisor.set_binance_ws(self.websocket)
+            self._supervisor_task = asyncio.create_task(self.task_supervisor.run())
+
             self._log_session_snapshot(force=True)
 
             await self._main_loop()
@@ -3112,10 +3137,6 @@ class TradingSystem:
                 if iteration % 1 == 0:
                     await self._periodic_check()
                 
-                maintenance_every = max(1, int(60 / max(self.loop_tick_seconds, 1.0)))
-                if iteration % maintenance_every == 0:
-                    await self._periodic_maintenance()
-
                 if now >= next_session_snapshot_at:
                     self._log_session_snapshot()
                     while next_session_snapshot_at <= now:
@@ -3859,6 +3880,16 @@ class TradingSystem:
         self.shutdown_event.set()
         
         try:
+            # Stop task supervisor before other teardown
+            if hasattr(self, "task_supervisor"):
+                self.task_supervisor.stop()
+            if hasattr(self, "_supervisor_task") and self._supervisor_task is not None:
+                self._supervisor_task.cancel()
+                try:
+                    await self._supervisor_task
+                except asyncio.CancelledError:
+                    pass
+
             # --- Shutdown snapshot: log final state before closing ---
             # Use ledger.shutdown_snapshot (order_tracking table) — single source of truth.
             if self.ledger is not None:
