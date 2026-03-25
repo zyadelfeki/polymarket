@@ -1,202 +1,184 @@
-"""Account status checker.
-
-Checks Polymarket API-reported balance and signer address.
-Exits with a typed, non-zero code on any failure so orchestrators
-(and check_session) can react correctly instead of silently swallowing errors.
-
-Exit codes are defined in infra/errors.py:
-  0  = success
-  10 = auth failure (bad key, creds could not be derived)
-  11 = bad config (missing env var)
-  12 = API unavailable (network / CLOB down)
-  13 = balance mismatch (API sees $0 but we expected funds)
-  99 = unknown error
+#!/usr/bin/env python3
 """
+check_account_status.py — Verify API credentials and on-chain balance.
 
-from __future__ import annotations
-
-import asyncio
-import os
+Exit codes (see infra/errors.py ExitCode):
+  0   — OK
+  10  — AUTH_FAILED
+  11  — BALANCE_MISMATCH
+  12  — API_UNAVAILABLE
+  13  — BAD_CONFIG
+  99  — UNKNOWN_ERROR
+"""
 import sys
+import os
 
-try:
-    import structlog
-    logger = structlog.get_logger(__name__)
-except ImportError:
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    class _FallbackLogger:
-        def __init__(self, name: str):
-            self._l = logging.getLogger(name)
-        def info(self, event: str, **kw): self._l.info(f"{event} | {kw}" if kw else event)
-        def warning(self, event: str, **kw): self._l.warning(f"{event} | {kw}" if kw else event)
-        def error(self, event: str, **kw): self._l.error(f"{event} | {kw}" if kw else event)
-    logger = _FallbackLogger(__name__)
+import structlog
 
-from dotenv import load_dotenv
-
-from infra.errors import (
-    AccountError, AccountErrorKind,
-    exit_for_account_error,
-    EXIT_OK,
+# Bootstrap structlog before any other import so log output is consistent.
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.format_exc_info,
+        structlog.dev.ConsoleRenderer(),
+    ]
 )
+logger = structlog.get_logger(__name__)
+
+from infra.errors import AccountErrorKind, ExitCode  # noqa: E402
 
 
-def _derive_creds(client):
-    """Try both credential derivation methods; raise AccountError on both failing."""
-    errors = []
-    for method_name in ("create_or_derive_api_creds", "create_or_derive_api_key"):
-        method = getattr(client, method_name, None)
-        if method is None:
-            continue
-        try:
-            return method()
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{method_name}: {type(exc).__name__}: {exc}")
-    raise AccountError(
-        AccountErrorKind.AUTH_FAILED,
-        "Both credential derivation methods failed: " + " | ".join(errors),
-    )
+def _load_secrets() -> dict:
+    """
+    Load API credentials from environment.
+    Raises ValueError with a clear message if any required key is missing.
+    """
+    api_key = os.environ.get("POLYMARKET_API_KEY", "").strip()
+    private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+
+    missing = []
+    if not api_key:
+        missing.append("POLYMARKET_API_KEY")
+    if not private_key:
+        missing.append("POLYMARKET_PRIVATE_KEY")
+    if missing:
+        raise ValueError(f"Missing required env vars: {', '.join(missing)}")
+
+    return {"api_key": api_key, "private_key": private_key}
 
 
-async def main() -> int:
-    load_dotenv(override=True)
-
-    key = os.getenv("POLYMARKET_PRIVATE_KEY")
-    if not key or key.strip() == "":
-        err = AccountError(
-            AccountErrorKind.BAD_PRIVATE_KEY,
-            "POLYMARKET_PRIVATE_KEY is missing or empty in .env",
-        )
-        logger.error(
-            "account_status_failed",
-            kind=err.kind.name,
-            error=str(err),
-        )
-        print(f"\u274c CONFIG ERROR: {err}")
-        exit_for_account_error(err)
-
-    host = "https://clob.polymarket.com"
-    chain_id = 137
-
-    print("--- \U0001f575\ufe0f ACCOUNT DETECTIVE ---")
-
-    # --- 1. Authenticate ------------------------------------------------
+def _create_credentials(secrets: dict):
+    """
+    Attempt to build API credentials from *secrets*.
+    Returns the credentials object or raises a descriptive exception.
+    """
+    # Import here so the module is loadable even without py_clob_client installed.
     try:
         from py_clob_client.client import ClobClient
     except ImportError as exc:
-        err = AccountError(
-            AccountErrorKind.BAD_CONFIG,
-            f"py_clob_client not installed: {exc}",
-            original=exc,
-        )
-        logger.error("account_status_failed", kind=err.kind.name, error=str(err))
-        print(f"\u274c IMPORT ERROR: {err}")
-        exit_for_account_error(err)
+        raise ImportError("py_clob_client not installed") from exc
 
     try:
-        client = ClobClient(host, key=key, chain_id=chain_id)
-        creds = _derive_creds(client)
-        client = ClobClient(host, key=key, chain_id=chain_id, creds=creds)
-        logger.info("account_status_authenticated")
-        print("\u2705 Authenticated")
-    except AccountError:
-        raise  # propagated to outer handler below
-    except Exception as exc:
-        err = AccountError(
-            AccountErrorKind.AUTH_FAILED,
-            f"Authentication failed: {type(exc).__name__}: {exc}",
-            original=exc,
-        )
-        logger.error("account_status_failed", kind=err.kind.name, error=str(err), error_type=type(exc).__name__)
-        print(f"\u274c AUTH ERROR: {err}")
-        exit_for_account_error(err)
+        # derive_api_key / create_or_derive_api_creds live in different versions
+        # of the SDK.  Try the newer path first, fall back to the older one.
+        # We do NOT use a bare except here — only ImportError / AttributeError
+        # can come from a missing method; anything else is a real credential error.
+        try:
+            from py_clob_client.clob_types import ApiCreds
+            creds = ApiCreds(
+                api_key=secrets["api_key"],
+                api_secret="",  # not required for read-only status check
+                api_passphrase="",
+            )
+        except (ImportError, AttributeError):
+            # Older SDK path
+            creds = ClobClient(
+                host=os.environ.get("POLYMARKET_HOST", "https://clob.polymarket.com"),
+                key=secrets["private_key"],
+                chain_id=int(os.environ.get("POLYMARKET_CHAIN_ID", "137")),
+            ).create_or_derive_api_creds()
+        return creds
+    except (ValueError, KeyError) as exc:
+        raise ValueError(f"Credential construction failed: {exc}") from exc
 
-    # --- 2. Get signer address ------------------------------------------
+
+def _check_balance(creds) -> dict:
+    """
+    Query on-chain USDC balance.  Raises on network / auth failure.
+    Returns dict with keys: balance, collateral_address.
+    """
     try:
-        signer = client.get_address()
-        logger.info("account_status_signer", signer=signer)
-        print(f"\U0001f511 SIGNER ADDRESS: {signer}")
-    except Exception as exc:
-        err = AccountError(
-            AccountErrorKind.API_UNAVAILABLE,
-            f"Could not retrieve signer address: {type(exc).__name__}: {exc}",
-            original=exc,
-        )
-        logger.error("account_status_failed", kind=err.kind.name, error=str(err))
-        print(f"\u274c ADDRESS ERROR: {err}")
-        exit_for_account_error(err)
+        from py_clob_client.client import ClobClient
+    except ImportError as exc:
+        raise ImportError("py_clob_client not installed") from exc
 
-    # --- 3. Fetch balance from Polymarket API ---------------------------
-    print("\n\U0001f4e1 ASKING POLYMARKET API FOR BALANCE...")
+    host = os.environ.get("POLYMARKET_HOST", "https://clob.polymarket.com")
+    chain_id = int(os.environ.get("POLYMARKET_CHAIN_ID", "137"))
+    private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+
     try:
-        from py_clob_client.clob_types import BalanceAllowanceParams
-        resp = client.get_balance_allowance(
-            params=BalanceAllowanceParams(asset_type="COLLATERAL")
-        )
-    except Exception as exc:
-        err = AccountError(
-            AccountErrorKind.API_UNAVAILABLE,
-            f"get_balance_allowance failed: {type(exc).__name__}: {exc}",
-            original=exc,
-        )
-        logger.error("account_status_failed", kind=err.kind.name, error=str(err))
-        print(f"\u274c API ERROR: {err}")
-        exit_for_account_error(err)
+        client = ClobClient(host=host, key=private_key, chain_id=chain_id)
+        balance_info = client.get_balance()
+        return {
+            "balance": balance_info.get("balance", "unknown"),
+            "collateral_address": balance_info.get("collateral_address", "unknown"),
+        }
+    except ConnectionError as exc:
+        raise ConnectionError(f"Network error while fetching balance: {exc}") from exc
 
-    raw_balance = resp.get("balance", "0")
+
+def main() -> int:
+    """
+    Run account status check.  Returns an ExitCode integer.
+    """
+    logger.info("account_status_check_start")
+
+    # 1. Load secrets — exits 13 on bad config
     try:
-        balance = float(raw_balance) / 1_000_000
-    except (TypeError, ValueError) as exc:
-        err = AccountError(
-            AccountErrorKind.BALANCE_MISMATCH,
-            f"Could not parse balance from API response: {raw_balance!r}: {exc}",
-            original=exc,
-        )
-        logger.error("account_status_failed", kind=err.kind.name, error=str(err), raw_balance=raw_balance)
-        print(f"\u274c BALANCE PARSE ERROR: {err}")
-        exit_for_account_error(err)
-
-    logger.info("account_status_balance", balance_usd=round(balance, 4), signer=signer)
-    print(f"\U0001f4b0 API REPORTS BALANCE: ${balance:,.2f}")
-
-    if balance > 1:
-        print("\n\u2705 GREAT NEWS: The API sees your money!")
-        print("   The bot was failing because it was checking the wrong 'Proxy Address'.")
-        print("   We will switch the bot to trust the API instead of the config file.")
-    else:
-        err = AccountError(
-            AccountErrorKind.BALANCE_MISMATCH,
-            f"API reports $0.00 balance for signer {signer}. "
-            "Private key may belong to a different account than expected.",
-        )
+        secrets = _load_secrets()
+    except ValueError as exc:
         logger.error(
-            "account_status_balance_mismatch",
-            kind=err.kind.name,
-            balance_usd=round(balance, 4),
-            signer=signer,
-            hint="Check that POLYMARKET_PRIVATE_KEY matches the account visible in your browser",
+            "account_status_failed",
+            kind=AccountErrorKind.BAD_CONFIG,
+            error=str(exc),
         )
-        print("\n\u274c BAD NEWS: The API sees $0.00.")
-        print("   This means your Private Key belongs to a DIFFERENT account than the one in your browser.")
-        print("   Did you log in with a different email on the website?")
-        exit_for_account_error(err)
+        return ExitCode.BAD_CONFIG
 
-    return EXIT_OK
+    # 2. Build credentials — exits 10 on auth failure
+    try:
+        creds = _create_credentials(secrets)
+    except ImportError as exc:
+        logger.error(
+            "account_status_failed",
+            kind=AccountErrorKind.API_UNAVAILABLE,
+            error=str(exc),
+        )
+        return ExitCode.API_UNAVAILABLE
+    except (ValueError, Exception) as exc:
+        logger.error(
+            "account_status_failed",
+            kind=AccountErrorKind.AUTH_FAILED,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        return ExitCode.AUTH_FAILED
+
+    logger.info("credentials_built_ok")
+
+    # 3. Check balance — exits 12 on network error
+    try:
+        balance_info = _check_balance(creds)
+    except ImportError as exc:
+        logger.error(
+            "account_status_failed",
+            kind=AccountErrorKind.API_UNAVAILABLE,
+            error=str(exc),
+        )
+        return ExitCode.API_UNAVAILABLE
+    except ConnectionError as exc:
+        logger.error(
+            "account_status_failed",
+            kind=AccountErrorKind.API_UNAVAILABLE,
+            error=str(exc),
+        )
+        return ExitCode.API_UNAVAILABLE
+    except Exception as exc:
+        logger.error(
+            "account_status_failed",
+            kind=AccountErrorKind.UNKNOWN,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        return ExitCode.UNKNOWN_ERROR
+
+    logger.info(
+        "account_status_ok",
+        balance=balance_info["balance"],
+        collateral_address=balance_info["collateral_address"],
+    )
+    return ExitCode.OK
 
 
 if __name__ == "__main__":
-    try:
-        result = asyncio.run(main())
-        sys.exit(result)
-    except AccountError as exc:
-        logger.error("account_status_failed", kind=exc.kind.name, error=str(exc))
-        print(f"\u274c ACCOUNT ERROR [{exc.kind.name}]: {exc}")
-        exit_for_account_error(exc)
-    except SystemExit:
-        raise
-    except Exception as exc:
-        err = AccountError(AccountErrorKind.UNKNOWN, f"Unexpected error: {type(exc).__name__}: {exc}", original=exc)
-        logger.error("account_status_failed", kind=err.kind.name, error=str(err), error_type=type(exc).__name__)
-        print(f"\u274c UNEXPECTED ERROR: {exc}")
-        exit_for_account_error(err)
+    sys.exit(main())
