@@ -12,6 +12,17 @@ place a bet.  A bet may only be placed when:
 If any condition fails, ``evaluate_market`` returns ``None`` and ``main.py``
 must not submit an order.
 
+Data contract invariants
+------------------------
+- OFI: when REQUIRE_OFI_FOR_PRODUCTION=true (default False), missing OFI data
+  blocks the trade in production.  Consecutive misses always emit a structured
+  ``ofi_feed_degraded`` event at WARNING level.
+- Binance features: fetch failures emit ``binance_features_degraded`` at WARNING
+  level instead of being silently swallowed.  Charlie continues in degraded mode
+  (synthetic fallback) — this is intentional; the event tells you about it.
+- CharlieContractError: now correctly caught before the generic Exception handler
+  so contract violations are logged at ERROR not WARNING.
+
 Usage::
 
     booster = CharliePredictionGate(kelly_sizer=sizer)
@@ -59,6 +70,12 @@ logger = structlog.get_logger(__name__)
 # worse than no history).
 _ofi_calc = OFICalculator(window_seconds=180)
 
+# OFI feed degraded: track consecutive misses per symbol so we can emit
+# a single structured event after N consecutive misses instead of spamming
+# every evaluation cycle.  Resets to 0 on a successful snapshot.
+_ofi_miss_counts: Dict[str, int] = {}
+_OFI_MISS_LOG_THRESHOLD = 3   # emit WARNING after this many consecutive misses
+
 
 # ---------------------------------------------------------------------------
 # Paper-mode helper
@@ -70,6 +87,17 @@ _PAPER_MODE_TRUTHY = {"1", "true", "yes", "on"}
 def _is_paper_mode() -> bool:
     """Return True when PAPER_TRADING env var is set to a truthy value."""
     return os.getenv("PAPER_TRADING", "").strip().lower() in _PAPER_MODE_TRUTHY
+
+
+def _require_ofi_for_production() -> bool:
+    """
+    Return True when REQUIRE_OFI_FOR_PRODUCTION=true.
+
+    When True and OFI data is missing, trades are BLOCKED in production mode
+    (not silently degraded).  Default is False so the existing behaviour is
+    preserved until the feed is confirmed stable.
+    """
+    return os.getenv("REQUIRE_OFI_FOR_PRODUCTION", "false").strip().lower() in _PAPER_MODE_TRUTHY
 
 
 # ---------------------------------------------------------------------------
@@ -346,16 +374,34 @@ class CharliePredictionGate:
 
         ``market_question`` is used for BTC-relevance guard and log enrichment.
         """
+        # -- Live Binance features for Charlie (injected) ------------------
+        # BUG FIX: was a silent `pass` — now emits binance_features_degraded
+        # so degraded mode is always visible in logs and check_session.
+        if symbol.upper().startswith("BTC") and extra_features is None:
+            try:
+                from integrations.binance_live_features import fetch_btc_features
+                extra_features = await asyncio.wait_for(
+                    fetch_btc_features(timeframe), timeout=5.0)
+            except Exception as _binance_exc:
+                logger.warning(
+                    "binance_features_degraded",
+                    market_id=market_id,
+                    symbol=symbol,
+                    error=str(_binance_exc),
+                    error_type=type(_binance_exc).__name__,
+                    note="Charlie will use synthetic fallback features — signal quality may be reduced",
+                )
+                # extra_features stays None; Charlie continues in degraded mode.
+        # -- end injection ------------------------------------------------
+
+        # BUG FIX: CharlieContractError is a subclass of RuntimeError which is
+        # a subclass of Exception.  The original code caught Exception first,
+        # making the subsequent `except CharlieContractError` unreachable dead
+        # code.  Fixed by splitting into a separate try/except in _evaluate_market_inner
+        # and re-raising CharlieContractError through the outer handler so it
+        # can be logged at ERROR level (not WARNING) and counted separately by
+        # check_session.py.
         try:
-            # -- Live Binance features for Charlie (injected) ------------------
-            if symbol.upper().startswith("BTC") and extra_features is None:
-                try:
-                    from integrations.binance_live_features import fetch_btc_features
-                    extra_features = await asyncio.wait_for(
-                        fetch_btc_features(timeframe), timeout=5.0)
-                except Exception:
-                    pass  # degraded mode — Charlie falls back to synthetic
-            # -- end injection ------------------------------------------------
             return await self._evaluate_market_inner(
                 market_id=market_id,
                 market_price=market_price,
@@ -366,6 +412,15 @@ class CharliePredictionGate:
                 market_question=market_question,
                 override_win_rate=override_win_rate,
             )
+        except CharlieContractError as exc:
+            # Contract violations are programming errors — log at ERROR, not warning.
+            logger.error(
+                "charlie_gate_contract_violation",
+                market_id=market_id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return None
         except Exception as exc:
             logger.error(
                 "charlie_gate_exception",
@@ -449,6 +504,10 @@ class CharliePredictionGate:
                 return _cached_rec
 
         # --- 1. Fetch Charlie signal ----------------------------------------
+        # BUG FIX: CharlieContractError was being caught by `except Exception`
+        # before reaching its own handler (dead code).  Now CharlieContractError
+        # is NOT caught here — it propagates up to evaluate_market's outer handler
+        # which logs it at ERROR level as charlie_gate_contract_violation.
         try:
             signal = await asyncio.wait_for(
                 _request_charlie_signal(
@@ -470,6 +529,9 @@ class CharliePredictionGate:
                 min_win_probability=None,
             )
             return None
+        except CharlieContractError:
+            # Re-raise so the outer handler in evaluate_market can log it at ERROR.
+            raise
         except Exception as exc:
             logger.warning(
                 "charlie_gate_rejected",
@@ -477,14 +539,6 @@ class CharliePredictionGate:
                 market_id=market_id,
                 error=str(exc),
                 p_win=None,
-            )
-            return None
-        except CharlieContractError as exc:
-            logger.error(
-                "charlie_gate_rejected",
-                reason="invalid_signal_contract",
-                market_id=market_id,
-                error=str(exc),
             )
             return None
 
@@ -520,22 +574,6 @@ class CharliePredictionGate:
         edge = gross_edge - _fee  # net edge after fees
 
         # --- 2b. Coin-flip rejection: p_win near 0.5 = no signal -------------
-        # Charlie is operating in degraded/neutral mode when it cannot
-        # distinguish direction.  By default, a p_win of 0.5 ± 0.03 means the
-        # model has zero conviction — hard-block these in production.
-        #
-        # PAPER MODE OVERRIDE
-        # When PAPER_TRADING=true, PAPER_CHARLIE_COIN_FLIP_BAND_ABS overrides
-        # the production band.  Default is '0.0' — fully open — so that the
-        # downstream pipeline (edge filter, confidence, Kelly, execution) can
-        # be validated end-to-end even when the Platt scaler is absent and
-        # Charlie lands at exactly p_win=0.5.
-        #
-        # This override ONLY applies in paper mode.  Production (PAPER_TRADING
-        # not set) always uses the production band from __init__ / env var
-        # CHARLIE_COIN_FLIP_REJECT_BAND_ABS.  The override never touches order
-        # placement — dry_run.py and run_paper_trading.py enforce paper mode
-        # independently of this gate.
         if _is_paper_mode():
             _paper_band_raw = os.getenv("PAPER_CHARLIE_COIN_FLIP_BAND_ABS", "0.0").strip()
             try:
@@ -630,20 +668,15 @@ class CharliePredictionGate:
             )
             return None
 
-        # --- 6. Kelly sizing (smooth multiplier applied to reduce position
-        #       size proportionally as edge approaches the minimum threshold) --
+        # --- 6. Kelly sizing -----------------------------------------------
         size = Decimal("0")
         kelly_fraction = Decimal("0")
 
-        # Smooth ramp so size scales continuously with edge quality rather than
-        # jumping from zero to full-Kelly at the threshold boundary.
         smooth_mult = self._edge_to_kelly_multiplier(
             edge=edge,
             min_edge=float(self._min_edge),
             ramp_width=0.05,
         )
-        # If the ramp gives 0 there is no edge (already caught above, but be
-        # defensive).
         if smooth_mult <= 0.0:
             logger.info(
                 "charlie_gate_rejected",
@@ -658,16 +691,9 @@ class CharliePredictionGate:
             return None
 
         if self._kelly_sizer is not None and bankroll > Decimal("0"):
-            # Guard: override_win_rate is the rolling global win rate across ALL markets.
-            # If it is below implied_prob for THIS market, applying it as p_win in the
-            # Kelly formula produces a negative fraction → size=0, even though Charlie
-            # has genuine market-specific edge.  Drop the override in that case so the
-            # sizing is based on Charlie's p_win, which IS market-specific.
-            # Example failure mode: rolling_win_rate_20=0.45, implied_prob=0.50 →
-            # (0.45-0.50)/(1-0.50) = -0.10 → size=0 with capped_reason=None (silent).
             effective_override = override_win_rate
             if override_win_rate is not None and override_win_rate < implied_prob:
-                effective_override = None  # fall back to Charlie's p_win
+                effective_override = None
 
             kelly_result = self._kelly_sizer.compute_size(
                 p_win=effective_p_win,
@@ -675,7 +701,6 @@ class CharliePredictionGate:
                 bankroll=bankroll,
                 override_win_rate=effective_override,
             )
-            # Scale raw Kelly size by smooth multiplier before applying caps.
             raw_size = kelly_result.size * Decimal(str(round(smooth_mult, 6)))
             size = raw_size
             kelly_fraction = kelly_result.effective_fraction * Decimal(str(round(smooth_mult, 6)))
@@ -702,23 +727,67 @@ class CharliePredictionGate:
         )
 
         # --- 7. OFI confirmation / conflict filter --------------------------
-        # Feed the latest Binance orderbook snapshot (injected by get_all_features
-        # in binance_features.py) into the rolling OFI calculator, then check
-        # whether the book pressure direction confirms or conflicts Charlie's
-        # directional call.  Conflict → halve size (not block — Charlie signal
-        # retains primacy; OFI is secondary confirmation).
+        # DATA CONTRACT: OFI feed health is now tracked per symbol.
+        # - Consecutive misses increment _ofi_miss_counts[symbol].
+        # - After _OFI_MISS_LOG_THRESHOLD consecutive misses, emit
+        #   ofi_feed_degraded at WARNING level.
+        # - A successful snapshot resets the miss counter.
+        # - When REQUIRE_OFI_FOR_PRODUCTION=true and OFI is missing in
+        #   production mode, the trade is BLOCKED (returns None) instead of
+        #   silently degrading.
         _ofi_signal: Optional[str] = None
+        _ofi_data_present = False
+
         if extra_features:
             _ob_bids = extra_features.get("ofi_bids")
             _ob_asks = extra_features.get("ofi_asks")
             if _ob_bids and _ob_asks:
                 _ofi_calc.add_snapshot(symbol, _ob_bids, _ob_asks)
+                _ofi_miss_counts[symbol] = 0  # reset miss counter on success
+                _ofi_data_present = True
+            else:
+                # OFI fields missing from extra_features
+                _ofi_miss_counts[symbol] = _ofi_miss_counts.get(symbol, 0) + 1
+
+        if not _ofi_data_present:
+            # Count miss even when extra_features itself is None
+            if extra_features is not None:
+                # extra_features present but no OFI keys — already incremented above
+                pass
+            else:
+                _ofi_miss_counts[symbol] = _ofi_miss_counts.get(symbol, 0) + 1
+
+            _miss_count = _ofi_miss_counts.get(symbol, 1)
+
+            if _miss_count >= _OFI_MISS_LOG_THRESHOLD:
+                logger.warning(
+                    "ofi_feed_degraded",
+                    symbol=symbol,
+                    market_id=market_id,
+                    consecutive_misses=_miss_count,
+                    note="OFI bids/asks absent from extra_features — OFI confirmation unavailable",
+                )
+
+            # REQUIRE_OFI_FOR_PRODUCTION: block in production when OFI is required
+            if _require_ofi_for_production() and not _is_paper_mode():
+                logger.warning(
+                    "charlie_gate_rejected",
+                    reason="ofi_required_but_missing",
+                    market_id=market_id,
+                    symbol=symbol,
+                    consecutive_misses=_miss_count,
+                    note="REQUIRE_OFI_FOR_PRODUCTION=true — trade blocked until OFI data is available",
+                    p_win=float(p_win),
+                    min_win_probability=None,
+                    confidence=float(confidence),
+                    ensemble_votes=str(model_votes),
+                )
+                return None
+        else:
             _ofi_signal = _ofi_calc.ofi_signal(symbol)
 
         _ofi_conflict_flag: bool = False
         if _ofi_signal is not None:
-            # BUY signal from Charlie but book pressure is SELL → conflict
-            # SELL signal from Charlie but book pressure is BUY → conflict
             _charlie_direction = "BUY" if side == "YES" else "SELL"
             if _ofi_signal != _charlie_direction:
                 size = size * Decimal("0.5")
@@ -797,11 +866,6 @@ class CharliePredictionGate:
 
         fee_bps: taker fee expressed in basis points (100 bps = 1.0%).
         Returns a signed Decimal; negative means no edge after costs.
-
-        Why expose this as a standalone method: callers (e.g. scan loops in
-        LatencyArbitrageEngine) need a cheap pre-filter that never touches the
-        Charlie API.  Run this first; only call ``evaluate_market`` when the
-        result is positive.
         """
         fee_rate = Decimal(str(fee_bps)) / Decimal("10000")
         return Decimal(str(charlie_prob)) - Decimal(str(market_price)) - fee_rate
@@ -815,14 +879,7 @@ class CharliePredictionGate:
         """
         Smooth ramp from 0 → 1 as edge rises above min_edge.
 
-        Replaces a hard step-function (0 / 1) with a linear ramp over
-        ``ramp_width``, so position size grows continuously with edge quality
-        instead of jumping from 0 to full Kelly the moment the threshold is
-        crossed.
-
         ramp_width=0.05 means full Kelly is reached at min_edge + 5 pp.
-        Below min_edge the multiplier is 0 (no bet); above min_edge+ramp it
-        is 1.0 (full Kelly fraction).
         """
         if edge <= min_edge:
             return 0.0
@@ -842,9 +899,6 @@ class CharliePredictionGate:
         """
         Deprecated shim — kept for any existing call-sites.
         Migrate to ``evaluate_market`` for all new code.
-
-        ``extra_features`` is forwarded to ``get_signal_for_market`` so that
-        real Binance indicators are used instead of synthetic fallback values.
         """
         if _get_signal_for_market is None:
             return {"probability": 0.5, "confidence": 0.0, "direction": "NEUTRAL"}
