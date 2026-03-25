@@ -108,6 +108,8 @@ ofi_execution_actions  = Counter(
 # Async task death visibility (Tier 3 supervisor)
 task_died_events = [e for e in events if e.get("event") == "task_died"]
 task_died_count  = len(task_died_events)
+task_restart_exhausted_events = [e for e in events if e.get("event") == "task_restart_exhausted"]
+task_restart_exhausted_count  = len(task_restart_exhausted_events)
 
 # Previously-fixed events (should stay at 0)
 periodic_failed   = count("periodic_check_failed")
@@ -172,7 +174,7 @@ print(f"  Total log lines  : {total_lines}")
 print(f"  strategy_scan_begin: {scans}")
 
 # ============================================================
-# INVARIANT CHECKS (Tier 2 — logic violations between events)
+# INVARIANT CHECKS (Tier 1-3 — logic violations between events)
 # ============================================================
 # These are causal invariants: if A happened, B must also have happened.
 # A violation means the pipeline silently swallowed something.
@@ -257,6 +259,58 @@ if binance_feed_unhealthy > 0 and scans > 5:
         "-- supervisor may not have halted scan loop on feed failure"
     )
 
+# INV-8 (NEW): If task_restart_exhausted fired, a critical task is permanently dead.
+#  Unlike INV-5 (first death), this means restart budget spent — system is degraded
+#  and will NOT self-heal without a manual restart.
+if task_restart_exhausted_count > 0:
+    for _te in task_restart_exhausted_events:
+        violations.append(
+            f"INV-8  task_restart_exhausted: task={_te.get('task_name','?')} "
+            f"restart_count={_te.get('restart_count','?')} "
+            "-- task permanently dead, manual restart required"
+        )
+
+# INV-9 (NEW): If error orders in DB > 0 AND order_error_transitions == 0,
+#  the DB has error rows that were NOT captured in the current log file.
+#  This means either a prior crash left orphan ERROR rows, or the log file
+#  was rotated mid-session — either way needs manual triage.
+if _error_orders_total > 0 and order_error_transitions == 0 and order_submitted > 0:
+    warnings_inv.append(
+        f"INV-9  DB has {_error_orders_total} ERROR order(s) but "
+        "order_state_set_to_error=0 in this log "
+        "-- orphan ERROR rows from prior crash or log rotation"
+    )
+
+# INV-10 (NEW): Balance mismatch between typed error events.
+#  If account_status_failed with kind=balance_mismatch fired, something
+#  in the account health probe saw a discrepancy.  Always a violation.
+balance_mismatch_events = [
+    e for e in events
+    if e.get("event") in ("account_status_failed", "balance_mismatch")
+    and e.get("error_kind") == "balance_mismatch"
+]
+if balance_mismatch_events:
+    for _bm in balance_mismatch_events:
+        violations.append(
+            f"INV-10 balance_mismatch detected: detail={_bm.get('error_detail','?')} "
+            "-- API balance vs internal accounting diverged"
+        )
+
+# INV-11 (NEW): funds_op_failed events (approve/unlock) should NEVER appear in a
+#  healthy session.  Any occurrence is a CRITICAL violation.
+funds_op_failed_events = [
+    e for e in events
+    if e.get("event") in ("approve_funds_failed", "unlock_funds_failed", "funds_op_failed")
+]
+if funds_op_failed_events:
+    for _fo in funds_op_failed_events:
+        violations.append(
+            f"INV-11 funds_op_failed: event={_fo.get('event','?')} "
+            f"kind={_fo.get('error_kind','?')} "
+            f"detail={str(_fo.get('error_detail','?'))[:100]} "
+            "-- on-chain approval/unlock operation failed"
+        )
+
 print(f"\n--- INVARIANT CHECKS ---")
 if violations:
     for v in violations:
@@ -319,6 +373,12 @@ binance_feed_unhealthy_label = (
     _color(str(binance_feed_unhealthy), _RED) if binance_feed_unhealthy > 0 else str(binance_feed_unhealthy)
 )
 print(f"  binance_feed_unhealthy : {binance_feed_unhealthy_label}")
+if task_restart_exhausted_count == 0:
+    print(f"  task_restart_exhausted : {_color('0  OK', _GREEN)}")
+else:
+    print(f"  task_restart_exhausted : {_color(str(task_restart_exhausted_count) + '  CRITICAL -- manual restart required', _RED)}")
+    for _te in task_restart_exhausted_events[:5]:
+        print(f"    task={_te.get('task_name','?')}  restarts={_te.get('restart_count','?')}")
 
 print(f"\n--- ML FEATURE GATES (Sessions 1-4) ---")
 print(f"  meta_gate_approved   : {meta_gate_approved}")

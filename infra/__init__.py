@@ -1,1 +1,1 @@
-# infra package
+# infra package — shared infrastructure primitives

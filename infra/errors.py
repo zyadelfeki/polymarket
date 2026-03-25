@@ -1,130 +1,160 @@
-"""Typed error taxonomy for the Polymarket bot.
-
-Every fund-touching script and the session/account tools import from here.
-This eliminates bare ``except:`` blocks that silently swallow typed errors
-and makes failure kinds machine-readable for session checks and dashboards.
-
-Usage::
-
-    from infra.errors import FundsOpError, AccountError, FundsOpErrorKind, AccountErrorKind
-
-    try:
-        ...
-    except SomeWeb3Exception as exc:
-        raise FundsOpError(FundsOpErrorKind.RPC_ERROR, str(exc)) from exc
 """
+infra/errors.py
 
+Central typed error taxonomy for the trading system.
+
+Every failure surface (account ops, fund ops, feed ops, execution) maps to one
+of the enums here.  Callers catch specific exception types instead of bare
+`except Exception`, log the `kind` field, and exit with the matching non-zero
+code so orchestrators and check_session.py can react correctly.
+
+Usage example
+-------------
+    from infra.errors import AccountError, AccountErrorKind
+    try:
+        creds = create_or_derive_api_creds()
+    except ValueError as exc:
+        raise AccountError(AccountErrorKind.BAD_CONFIG, str(exc)) from exc
+"""
 from __future__ import annotations
 
+import enum
 import sys
-from enum import Enum, auto
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Exit codes — keep in sync with any PowerShell / shell wrappers
+# ---------------------------------------------------------------------------
+EXIT_OK                    = 0
+EXIT_AUTH_FAILED           = 10
+EXIT_BALANCE_MISMATCH      = 11
+EXIT_API_UNAVAILABLE       = 12
+EXIT_BAD_CONFIG            = 13
+EXIT_APPROVAL_TX_FAILED    = 20
+EXIT_RPC_ERROR             = 21
+EXIT_BAD_PRIVATE_KEY       = 22
+EXIT_FEED_DEGRADED         = 30
+EXIT_EXECUTION_FAILED      = 40
+EXIT_UNKNOWN               = 99
 
 
 # ---------------------------------------------------------------------------
 # Error kinds
 # ---------------------------------------------------------------------------
 
-class AccountErrorKind(Enum):
-    """Failure categories for account / auth operations."""
-    AUTH_FAILED        = auto()  # Private key rejected or creds could not be derived
-    BAD_PRIVATE_KEY    = auto()  # Private key missing, None, or obviously malformed
-    API_UNAVAILABLE    = auto()  # Network error or Polymarket CLOB unreachable
-    BALANCE_MISMATCH   = auto()  # API balance disagrees with on-chain balance beyond tolerance
-    BAD_CONFIG         = auto()  # Missing / invalid env vars (PROXY_ADDRESS, chain_id, …)
-    UNKNOWN            = auto()  # Catch-all; always investigate
+class AccountErrorKind(enum.Enum):
+    AUTH_FAILED      = ("auth_failed",       EXIT_AUTH_FAILED)
+    BALANCE_MISMATCH = ("balance_mismatch",   EXIT_BALANCE_MISMATCH)
+    API_UNAVAILABLE  = ("api_unavailable",    EXIT_API_UNAVAILABLE)
+    BAD_CONFIG       = ("bad_config",         EXIT_BAD_CONFIG)
+
+    def __init__(self, label: str, exit_code: int):
+        self.label     = label
+        self.exit_code = exit_code
 
 
-class FundsOpErrorKind(Enum):
-    """Failure categories for fund approval / unlock operations."""
-    APPROVAL_TX_FAILED = auto()  # update_balance_allowance call failed
-    RPC_ERROR          = auto()  # Web3 / Polygon RPC unreachable or returned error
-    BAD_PRIVATE_KEY    = auto()  # Private key missing or wrong format
-    INSUFFICIENT_MATIC = auto()  # Estimated gas exceeds available MATIC balance
-    PROXY_MISMATCH     = auto()  # POLYMARKET_PROXY_ADDRESS does not match derived signer
-    AUTH_FAILED        = auto()  # CLOB client authentication step failed
-    API_UNAVAILABLE    = auto()  # Network error to Polymarket CLOB
-    UNKNOWN            = auto()  # Catch-all; always investigate
+class FundsOpErrorKind(enum.Enum):
+    APPROVAL_TX_FAILED = ("approval_tx_failed", EXIT_APPROVAL_TX_FAILED)
+    RPC_ERROR          = ("rpc_error",          EXIT_RPC_ERROR)
+    BAD_PRIVATE_KEY    = ("bad_private_key",     EXIT_BAD_PRIVATE_KEY)
+
+    def __init__(self, label: str, exit_code: int):
+        self.label     = label
+        self.exit_code = exit_code
+
+
+class FeedErrorKind(enum.Enum):
+    WEBSOCKET_DEAD     = ("websocket_dead",     EXIT_FEED_DEGRADED)
+    STALE_DATA         = ("stale_data",         EXIT_FEED_DEGRADED)
+    SCHEMA_MISMATCH    = ("schema_mismatch",    EXIT_FEED_DEGRADED)
+
+    def __init__(self, label: str, exit_code: int):
+        self.label     = label
+        self.exit_code = exit_code
+
+
+class ExecutionErrorKind(enum.Enum):
+    ORDER_REJECTED     = ("order_rejected",     EXIT_EXECUTION_FAILED)
+    TIMEOUT            = ("timeout",            EXIT_EXECUTION_FAILED)
+    LEDGER_WRITE_FAIL  = ("ledger_write_fail",  EXIT_EXECUTION_FAILED)
+
+    def __init__(self, label: str, exit_code: int):
+        self.label     = label
+        self.exit_code = exit_code
 
 
 # ---------------------------------------------------------------------------
 # Exception classes
 # ---------------------------------------------------------------------------
 
-class PolymarketBotError(RuntimeError):
-    """Base class for all typed bot errors."""
+class _TradingError(Exception):
+    """Base class.  Always carries a typed kind and optional detail string."""
+
+    def __init__(self, kind, detail: str = ""):
+        self.kind   = kind
+        self.detail = detail
+        super().__init__(f"{kind.label}: {detail}" if detail else kind.label)
+
+    @property
+    def exit_code(self) -> int:
+        return self.kind.exit_code
+
+    def log_context(self) -> dict:
+        """Return a dict suitable for structlog event fields."""
+        return {
+            "error_kind":  self.kind.label,
+            "error_detail": self.detail,
+            "exit_code":   self.exit_code,
+        }
 
 
-class AccountError(PolymarketBotError):
-    """Raised for account / authentication failures."""
-
-    def __init__(self, kind: AccountErrorKind, message: str, *, original: Optional[BaseException] = None) -> None:
-        super().__init__(message)
-        self.kind = kind
-        self.original = original
-
-    def __repr__(self) -> str:
-        return f"AccountError(kind={self.kind.name}, message={str(self)!r})"
+class AccountError(_TradingError):
+    """Raised by account-status / credential operations."""
+    def __init__(self, kind: AccountErrorKind, detail: str = ""):
+        super().__init__(kind, detail)
 
 
-class FundsOpError(PolymarketBotError):
-    """Raised for fund approval / unlock failures."""
-
-    def __init__(self, kind: FundsOpErrorKind, message: str, *, original: Optional[BaseException] = None) -> None:
-        super().__init__(message)
-        self.kind = kind
-        self.original = original
-
-    def __repr__(self) -> str:
-        return f"FundsOpError(kind={self.kind.name}, message={str(self)!r})"
+class FundsOpError(_TradingError):
+    """Raised by approve_funds / unlock_funds operations."""
+    def __init__(self, kind: FundsOpErrorKind, detail: str = ""):
+        super().__init__(kind, detail)
 
 
-# ---------------------------------------------------------------------------
-# Exit codes  (used by scripts that call sys.exit())
-# ---------------------------------------------------------------------------
-
-EXIT_OK                 = 0
-EXIT_AUTH_FAILED        = 10
-EXIT_BAD_CONFIG         = 11
-EXIT_API_UNAVAILABLE    = 12
-EXIT_BALANCE_MISMATCH   = 13
-EXIT_TX_FAILED          = 20
-EXIT_RPC_ERROR          = 21
-EXIT_INSUFFICIENT_MATIC = 22
-EXIT_PROXY_MISMATCH     = 23
-EXIT_UNKNOWN            = 99
+class FeedError(_TradingError):
+    """Raised or logged when a data feed fails contract checks."""
+    def __init__(self, kind: FeedErrorKind, detail: str = ""):
+        super().__init__(kind, detail)
 
 
-ACCOUNT_ERROR_EXIT_MAP: dict[AccountErrorKind, int] = {
-    AccountErrorKind.AUTH_FAILED:      EXIT_AUTH_FAILED,
-    AccountErrorKind.BAD_PRIVATE_KEY:  EXIT_AUTH_FAILED,
-    AccountErrorKind.API_UNAVAILABLE:  EXIT_API_UNAVAILABLE,
-    AccountErrorKind.BALANCE_MISMATCH: EXIT_BALANCE_MISMATCH,
-    AccountErrorKind.BAD_CONFIG:       EXIT_BAD_CONFIG,
-    AccountErrorKind.UNKNOWN:          EXIT_UNKNOWN,
-}
-
-FUNDS_ERROR_EXIT_MAP: dict[FundsOpErrorKind, int] = {
-    FundsOpErrorKind.APPROVAL_TX_FAILED: EXIT_TX_FAILED,
-    FundsOpErrorKind.RPC_ERROR:          EXIT_RPC_ERROR,
-    FundsOpErrorKind.BAD_PRIVATE_KEY:    EXIT_AUTH_FAILED,
-    FundsOpErrorKind.INSUFFICIENT_MATIC: EXIT_INSUFFICIENT_MATIC,
-    FundsOpErrorKind.PROXY_MISMATCH:     EXIT_PROXY_MISMATCH,
-    FundsOpErrorKind.AUTH_FAILED:        EXIT_AUTH_FAILED,
-    FundsOpErrorKind.API_UNAVAILABLE:    EXIT_API_UNAVAILABLE,
-    FundsOpErrorKind.UNKNOWN:            EXIT_UNKNOWN,
-}
+class ExecutionError(_TradingError):
+    """Raised by execution-layer operations."""
+    def __init__(self, kind: ExecutionErrorKind, detail: str = ""):
+        super().__init__(kind, detail)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def exit_for_account_error(err: AccountError) -> None:
-    """Call sys.exit() with the correct exit code for an AccountError."""
-    sys.exit(ACCOUNT_ERROR_EXIT_MAP.get(err.kind, EXIT_UNKNOWN))
+def exit_with_error(
+    logger,
+    event: str,
+    error: _TradingError,
+    extra: Optional[dict] = None,
+) -> None:
+    """
+    Emit a structured structlog error event then sys.exit with the typed
+    exit code.  Use this in top-level script entrypoints so orchestrators
+    get a machine-readable exit code rather than a traceback.
 
-
-def exit_for_funds_error(err: FundsOpError) -> None:
-    """Call sys.exit() with the correct exit code for a FundsOpError."""
-    sys.exit(FUNDS_ERROR_EXIT_MAP.get(err.kind, EXIT_UNKNOWN))
+    Parameters
+    ----------
+    logger  : structlog bound logger
+    event   : log event name (e.g. "account_status_failed")
+    error   : the _TradingError instance
+    extra   : optional additional fields to merge into the log event
+    """
+    fields = {**error.log_context(), **(extra or {})}
+    logger.error(event, **fields)
+    sys.exit(error.exit_code)
