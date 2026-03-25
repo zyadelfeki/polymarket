@@ -4,7 +4,7 @@ _looks_like_price_level_market() filter and report every field the expiry
 block reads, so we can see exactly why after_expiry_filter stays 0.
 
 Run:
-    python debug_market.py
+    python scripts/debug/debug_market.py
 """
 import asyncio
 import os
@@ -52,7 +52,6 @@ async def main():
         print(f"  yes_p   = {yes_p}  no_p={no_p}")
         print(f"  q       = {q}")
 
-        # Show every date-ish key present in the raw market dict
         date_keys = [
             "end_date", "endDate", "resolution_date", "resolve_date",
             "closedTime", "end_date_iso", "endDateIso", "endDateISO",

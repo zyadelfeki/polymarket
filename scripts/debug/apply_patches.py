@@ -1,3 +1,8 @@
+"""One-shot patch script — already applied to main.py. Kept for reference only.
+
+Do NOT re-run this. All 5 patches are already committed in main.py.
+See git log for the commit that applied them.
+"""
 with open('main.py', 'r', encoding='utf-8') as f:
     content = f.read()
 

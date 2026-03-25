@@ -4,6 +4,8 @@ The original capital doubler entry point is not present in this branch, but a
 small subset of its interface is still referenced by tests and paper-trading
 helpers. This shim keeps those imports stable without coupling them to the much
 heavier production runtime.
+
+NOTE: Archived — do not add new logic here. The canonical entry point is main.py.
 """
 
 from __future__ import annotations

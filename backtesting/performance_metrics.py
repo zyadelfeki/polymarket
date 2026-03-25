@@ -1,3 +1,4 @@
+"""Performance metrics — moved from backtest/ (now consolidated into backtesting/)."""
 import numpy as np
 from typing import List, Dict
 import logging
