@@ -74,6 +74,7 @@ from services.runtime_guard_evaluator import RuntimeGuardEvaluator
 from database.quarantine_repository import QuarantineRepository
 from services.external_signal_hub import ExternalSignalHub
 from services.pre_trade_admission import PreTradeAdmissionGate
+from infra.supervised_task import supervised_task
 
 # Phase 3-6 features (log-only)
 from data_feeds.arb_scanner import scan_yes_no_arb
@@ -2795,7 +2796,9 @@ class TradingSystem:
             _trade_feed_symbols = self.config.get('markets', {}).get('crypto_symbols', ['BTC', 'ETH'])
             logger.info("component_construct_begin", component="binance_trade_feed")
             self.binance_trade_feed = BinanceTradeFeed(symbols=_trade_feed_symbols)
-            asyncio.get_running_loop().create_task(self.binance_trade_feed.run())
+            asyncio.get_running_loop().create_task(
+                supervised_task("binance_trade_feed", self.binance_trade_feed.run(), logger)
+            )
             logger.info(
                 "component_construct_success",
                 component="binance_trade_feed",
@@ -2844,7 +2847,7 @@ class TradingSystem:
                 from ai.llm_worker import LLMWorker
                 _llm_worker_mod._singleton_worker = LLMWorker()
                 asyncio.get_running_loop().create_task(
-                    _llm_worker_mod._singleton_worker.run()
+                    supervised_task("llm_worker", _llm_worker_mod._singleton_worker.run(), logger)
                 )
                 logger.info("llm_worker_started")
             except Exception as _llm_start_err:
